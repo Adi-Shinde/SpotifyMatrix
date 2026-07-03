@@ -409,8 +409,8 @@ def render_record(art: Image.Image | None, angle: float, size: int) -> Image.Ima
     if art is None:
         return frame.convert("RGB")
 
-    margin = max(2, size // 32)
-    disc_size = size - margin * 2
+    margin = 0
+    disc_size = size
     # The album art is the record surface: rotate it first, then cut it into a circular disk.
     art_square = ImageOps.fit(art, (disc_size, disc_size), method=Image.Resampling.LANCZOS)
     rotated = art_square.rotate(angle, resample=Image.Resampling.BICUBIC)
@@ -422,11 +422,11 @@ def render_record(art: Image.Image | None, angle: float, size: int) -> Image.Ima
 
     draw = ImageDraw.Draw(frame, "RGBA")
     outer = (margin, margin, size - margin - 1, size - margin - 1)
-    draw.ellipse(outer, outline=(6, 6, 6, 255), width=max(1, size // 32))
+    draw.ellipse(outer, outline=(6, 6, 6, 255), width=1)
 
     center = size // 2
-    label_radius = max(5, size // 11)
-    hole_radius = max(2, size // 25)
+    label_radius = max(3, size // 16)
+    hole_radius = max(1, size // 40)
     draw.ellipse(
         (
             center - label_radius,
@@ -452,10 +452,10 @@ def render_record(art: Image.Image | None, angle: float, size: int) -> Image.Ima
 def render_idle(size: int) -> Image.Image:
     frame = Image.new("RGB", (size, size), (0, 0, 0))
     draw = ImageDraw.Draw(frame)
-    margin = max(2, size // 32)
-    draw.ellipse((margin, margin, size - margin - 1, size - margin - 1), outline=(55, 55, 55), width=2)
+    margin = 0
+    draw.ellipse((margin, margin, size - margin - 1, size - margin - 1), outline=(55, 55, 55), width=1)
     center = size // 2
-    radius = max(3, size // 18)
+    radius = max(2, size // 25)
     draw.ellipse((center - radius, center - radius, center + radius, center + radius), fill=(18, 18, 18))
     return frame
 
@@ -503,7 +503,7 @@ def draw_scrolling_text(
     # Center text vertically within the banner
     y_pos = banner_y0 + max(0, (banner_height - text_h) // 2 - bbox[1])
 
-    separator = "   •   "
+    separator = "   -   "
     full_unit = text + separator
     unit_bbox = draw.textbbox((0, 0), full_unit, font=font)
     unit_w = unit_bbox[2] - unit_bbox[0]
@@ -688,7 +688,7 @@ def run(args: argparse.Namespace) -> None:
             display_text = ""
             if not args.no_text:
                 if title and artist:
-                    display_text = f"{title} • {artist}"
+                    display_text = f"{title} - {artist}"
                 elif title or artist:
                     display_text = title or artist
 
@@ -741,7 +741,7 @@ def render_preview_frames(directory: Path) -> None:
     art = demo_album_art(96)
     title = "Blinding Lights"
     artist = "The Weeknd"
-    text_str = f"{title} • {artist}"
+    text_str = f"{title} - {artist}"
     size_x, size_y = 64, 64
     banner_h = 10
     gap = 1
