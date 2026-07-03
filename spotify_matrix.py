@@ -601,6 +601,7 @@ def create_full_frame(
     size_y: int,
     args: argparse.Namespace,
 ) -> Image.Image:
+    import datetime
     has_text = bool(display_text) and not args.no_text
     if has_text:
         text_h = get_text_height(args.text_font_size)
@@ -618,6 +619,29 @@ def create_full_frame(
     cd_x = (size_x - cd_size) // 2
     cd_y = (banner_h + gap) if (has_text and args.text_position == "top") else 0
     frame.paste(cd_img, (cd_x, cd_y))
+
+    now = datetime.datetime.now()
+    clock_str = now.strftime("%I:%M").lstrip("0")
+    clock_font_size = max(6, args.text_font_size - 2)
+    clock_font = get_font(clock_font_size)
+    dummy_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    clock_bbox = dummy_draw.textbbox((0, 0), clock_str, font=clock_font)
+    clock_w = clock_bbox[2] - clock_bbox[0]
+    clock_h = clock_bbox[3] - clock_bbox[1]
+
+    draw = ImageDraw.Draw(frame)
+    if args.text_position == "top":
+        clock_y = size_y - clock_h - 2
+    else:
+        clock_y = 2
+
+    clock_x = size_x - clock_w - 2
+
+    for dx in [-1, 0, 1]:
+        for dy in [-1, 0, 1]:
+            if dx != 0 or dy != 0:
+                draw.text((clock_x + dx, clock_y - clock_bbox[1] + dy), clock_str, fill=(0, 0, 0), font=clock_font)
+    draw.text((clock_x, clock_y - clock_bbox[1]), clock_str, fill=(200, 200, 200), font=clock_font)
 
     if has_text:
         frame = draw_scrolling_text(
