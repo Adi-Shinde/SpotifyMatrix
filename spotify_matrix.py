@@ -460,7 +460,7 @@ def render_idle(size: int) -> Image.Image:
     return frame
 
 
-def get_font(size: int = 9) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
+def get_font(size: int = 8) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
     try:
         return ImageFont.load_default(size=size)
     except TypeError:
@@ -470,38 +470,47 @@ def get_font(size: int = 9) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
             return ImageFont.load_default()
 
 
+def get_text_height(font_size: int = 8) -> int:
+    font = get_font(font_size)
+    draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    bbox = draw.textbbox((0, 0), "Ag - Mj", font=font)
+    return max(1, bbox[3] - bbox[1])
+
+
 def draw_scrolling_text(
     image: Image.Image,
     text: str,
     scroll_x: float,
     position: str = "bottom",
-    banner_height: int = 10,
+    banner_height: int = 0,
     text_color: tuple[int, int, int] = (255, 255, 255),
     bg_color: tuple[int, int, int] = (0, 0, 0),
-    font_size: int = 9,
+    font_size: int = 8,
 ) -> Image.Image:
     if not text.strip():
         return image
 
     size_x, size_y = image.size
     draw = ImageDraw.Draw(image)
+    font = get_font(font_size)
+
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_h = bbox[3] - bbox[1]
+    y_offset = bbox[1]
+
+    actual_banner_h = banner_height if banner_height > 0 else text_h
 
     if position == "top":
         banner_y0 = 0
-        banner_y1 = banner_height - 1
+        banner_y1 = actual_banner_h - 1
+        y_pos = banner_y0 + max(0, (actual_banner_h - text_h) // 2) - y_offset
     else:
-        banner_y0 = size_y - banner_height
+        banner_y0 = size_y - actual_banner_h
         banner_y1 = size_y - 1
+        y_pos = banner_y0 + (actual_banner_h - text_h) - y_offset
 
     # High-contrast solid background banner
     draw.rectangle((0, banner_y0, size_x - 1, banner_y1), fill=bg_color)
-
-    font = get_font(font_size)
-    bbox = draw.textbbox((0, 0), text, font=font)
-    text_h = bbox[3] - bbox[1]
-
-    # Center text vertically within the banner
-    y_pos = banner_y0 + max(0, (banner_height - text_h) // 2 - bbox[1])
 
     separator = "   -   "
     full_unit = text + separator
@@ -693,9 +702,15 @@ def run(args: argparse.Namespace) -> None:
                     display_text = title or artist
 
             has_text = bool(display_text)
-            gap = 1 if has_text else 0
-            banner_h = args.text_banner_height if has_text else 0
-            cd_size = max(1, min(size_x, size_y - banner_h - gap)) if has_text else size
+            if has_text:
+                text_h = get_text_height(args.text_font_size)
+                banner_h = args.text_banner_height if args.text_banner_height > 0 else text_h
+                gap = 1
+                cd_size = max(1, min(size_x, size_y - banner_h - gap))
+            else:
+                banner_h = 0
+                gap = 0
+                cd_size = size
 
             cd_img = render_record(current_art_image, angle, cd_size) if current_art_image else render_idle(cd_size)
 
@@ -710,7 +725,7 @@ def run(args: argparse.Namespace) -> None:
                     text=display_text,
                     scroll_x=scroll_x,
                     position=args.text_position,
-                    banner_height=args.text_banner_height,
+                    banner_height=banner_h,
                     font_size=args.text_font_size,
                 )
 
@@ -743,7 +758,9 @@ def render_preview_frames(directory: Path) -> None:
     artist = "The Weeknd"
     text_str = f"{title} - {artist}"
     size_x, size_y = 64, 64
-    banner_h = 10
+    font_size = 8
+    text_h = get_text_height(font_size)
+    banner_h = text_h
     gap = 1
     cd_size = max(1, min(size_x, size_y - banner_h - gap))
     cd_x = (size_x - cd_size) // 2
@@ -751,7 +768,8 @@ def render_preview_frames(directory: Path) -> None:
         cd_img = render_record(art, angle, cd_size)
         frame = Image.new("RGB", (size_x, size_y), (0, 0, 0))
         frame.paste(cd_img, (cd_x, 0))
-        frame = draw_scrolling_text(frame, text_str, scroll_x=index * 15.0, banner_height=banner_h, font_size=9)
+        frame.save(directory / f"album-disk-{index:02d}.png")
+        frame = draw_scrolling_text(frame, text_str, scroll_x=index * 15.0, banner_height=banner_h, font_size=font_size)
         frame.save(directory / f"album-disk-{index:02d}.png")
 
 
@@ -784,8 +802,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-text", action="store_true", help="Disable scrolling song title and artist text overlay.")
     parser.add_argument("--text-speed", type=positive_float, default=25.0, help="Text scroll speed in pixels per second.")
     parser.add_argument("--text-position", choices=["bottom", "top"], default="bottom", help="Text banner position on matrix.")
-    parser.add_argument("--text-banner-height", type=int, default=10, help="Height in pixels of text banner overlay.")
-    parser.add_argument("--text-font-size", type=int, default=9, help="Font size in points for scrolling text.")
+    parser.add_argument("--text-banner-height", type=int, default=0, help="Height in pixels of text banner overlay (0 for auto-fit to text).")
+    parser.add_argument("--text-font-size", type=int, default=8, help="Font size in points for scrolling text.")
     return parser
 
 
