@@ -624,7 +624,7 @@ def create_full_frame(
     hour_str = now.strftime("%I").lstrip("0")
     minute_str = now.strftime("%M")
     
-    clock_font_size = max(6, args.text_font_size)
+    clock_font_size = max(9, args.text_font_size + 1)
     clock_font = get_font(clock_font_size)
     dummy_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
     
@@ -637,12 +637,12 @@ def create_full_frame(
 
     draw = ImageDraw.Draw(frame)
     if args.text_position == "top":
-        clock_y = size_y - max(hour_h, minute_h)
+        clock_y = size_y - max(hour_h, minute_h) - 1
     else:
-        clock_y = 0
+        clock_y = 1
 
-    hour_x = 0
-    minute_x = size_x - minute_w
+    hour_x = 1
+    minute_x = size_x - minute_w - 1
 
     for dx in [-1, 0, 1]:
         for dy in [-1, 0, 1]:
