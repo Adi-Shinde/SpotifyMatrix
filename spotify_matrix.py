@@ -531,6 +531,74 @@ def draw_scrolling_text(
     return image
 
 
+def create_full_frame(
+    art_image: Image.Image | None,
+    angle: float,
+    scroll_x: float,
+    display_text: str,
+    size_x: int,
+    size_y: int,
+    args: argparse.Namespace,
+) -> Image.Image:
+    has_text = bool(display_text) and not args.no_text
+    if has_text:
+        text_h = get_text_height(args.text_font_size)
+        banner_h = args.text_banner_height if args.text_banner_height > 0 else text_h
+        gap = 1
+        cd_size = max(1, min(size_x, size_y - banner_h - gap))
+    else:
+        banner_h = 0
+        gap = 0
+        cd_size = min(size_x, size_y)
+
+    cd_img = render_record(art_image, angle, cd_size) if art_image else render_idle(cd_size)
+
+    frame = Image.new("RGB", (size_x, size_y), (0, 0, 0))
+    cd_x = (size_x - cd_size) // 2
+    cd_y = (banner_h + gap) if (has_text and args.text_position == "top") else 0
+    frame.paste(cd_img, (cd_x, cd_y))
+
+    if has_text:
+        frame = draw_scrolling_text(
+            frame,
+            text=display_text,
+            scroll_x=scroll_x,
+            position=args.text_position,
+            banner_height=banner_h,
+            font_size=args.text_font_size,
+        )
+
+    return frame
+
+
+def blend_frames(
+    old_frame: Image.Image,
+    new_frame: Image.Image,
+    progress: float,
+    mode: str = "slide",
+) -> Image.Image:
+    size_x, size_y = new_frame.size
+    p = max(0.0, min(1.0, progress))
+    eased_p = 1.0 - (1.0 - p) ** 3
+
+    if mode in ("slide", "slide-left"):
+        offset = int(eased_p * size_x)
+        out_frame = Image.new("RGB", (size_x, size_y), (0, 0, 0))
+        out_frame.paste(old_frame, (-offset, 0))
+        out_frame.paste(new_frame, (size_x - offset, 0))
+        return out_frame
+    elif mode == "slide-right":
+        offset = int(eased_p * size_x)
+        out_frame = Image.new("RGB", (size_x, size_y), (0, 0, 0))
+        out_frame.paste(old_frame, (offset, 0))
+        out_frame.paste(new_frame, (-size_x + offset, 0))
+        return out_frame
+    elif mode == "fade":
+        return Image.blend(old_frame, new_frame, eased_p)
+    else:
+        return new_frame
+
+
 def render_test_pattern(size: int, offset: int) -> Image.Image:
     frame = Image.new("RGB", (size, size), (0, 0, 0))
     draw = ImageDraw.Draw(frame)
@@ -676,11 +744,23 @@ def run(args: argparse.Namespace) -> None:
     scroll_x = 0.0
     last_frame = time.monotonic()
 
+    prev_art_key: str | None = None
+    last_art_image: Image.Image | None = None
+    last_display_text: str = ""
+    old_art_image: Image.Image | None = None
+    old_angle: float = 0.0
+    old_scroll_x: float = 0.0
+    old_display_text: str = ""
+
+    transition_active: bool = False
+    transition_start: float = 0.0
+
     try:
         while True:
             frame_start = time.monotonic()
             with playback_lock:
                 current_art_image = playback_state.image
+                current_art_key = playback_state.art_key
                 is_playing = playback_state.is_playing
                 title = playback_state.title
                 artist = playback_state.artist
@@ -689,11 +769,6 @@ def run(args: argparse.Namespace) -> None:
             delta = now - last_frame
             last_frame = now
 
-            if is_playing and current_art_image is not None:
-                angle = (angle - 360.0 * (args.rpm / 60.0) * delta) % 360.0
-
-            scroll_x += args.text_speed * delta
-
             display_text = ""
             if not args.no_text:
                 if title and artist:
@@ -701,33 +776,59 @@ def run(args: argparse.Namespace) -> None:
                 elif title or artist:
                     display_text = title or artist
 
-            has_text = bool(display_text)
-            if has_text:
-                text_h = get_text_height(args.text_font_size)
-                banner_h = args.text_banner_height if args.text_banner_height > 0 else text_h
-                gap = 1
-                cd_size = max(1, min(size_x, size_y - banner_h - gap))
+            # Detect track change
+            if prev_art_key is not None and current_art_key != prev_art_key and args.transition != "none":
+                old_art_image = last_art_image
+                old_angle = angle
+                old_scroll_x = scroll_x
+                old_display_text = last_display_text
+                scroll_x = 0.0
+                transition_active = True
+                transition_start = now
+
+            prev_art_key = current_art_key
+            last_art_image = current_art_image
+            last_display_text = display_text
+
+            if is_playing and current_art_image is not None:
+                angle = (angle - 360.0 * (args.rpm / 60.0) * delta) % 360.0
+            scroll_x += args.text_speed * delta
+
+            new_frame = create_full_frame(
+                current_art_image,
+                angle,
+                scroll_x,
+                display_text,
+                size_x,
+                size_y,
+                args,
+            )
+
+            if transition_active and args.transition != "none":
+                elapsed = now - transition_start
+                duration = max(0.1, args.transition_duration)
+                progress = elapsed / duration
+
+                if progress >= 1.0:
+                    transition_active = False
+                    frame = new_frame
+                else:
+                    if is_playing:
+                        old_angle = (old_angle - 360.0 * (args.rpm / 60.0) * delta) % 360.0
+                    old_scroll_x += args.text_speed * delta
+
+                    old_frame = create_full_frame(
+                        old_art_image,
+                        old_angle,
+                        old_scroll_x,
+                        old_display_text,
+                        size_x,
+                        size_y,
+                        args,
+                    )
+                    frame = blend_frames(old_frame, new_frame, progress, mode=args.transition)
             else:
-                banner_h = 0
-                gap = 0
-                cd_size = size
-
-            cd_img = render_record(current_art_image, angle, cd_size) if current_art_image else render_idle(cd_size)
-
-            frame = Image.new("RGB", (size_x, size_y), (0, 0, 0))
-            cd_x = (size_x - cd_size) // 2
-            cd_y = (banner_h + gap) if (has_text and args.text_position == "top") else 0
-            frame.paste(cd_img, (cd_x, cd_y))
-
-            if has_text:
-                frame = draw_scrolling_text(
-                    frame,
-                    text=display_text,
-                    scroll_x=scroll_x,
-                    position=args.text_position,
-                    banner_height=banner_h,
-                    font_size=args.text_font_size,
-                )
+                frame = new_frame
 
             display.show(frame)
 
@@ -803,6 +904,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-position", choices=["bottom", "top"], default="bottom", help="Text banner position on matrix.")
     parser.add_argument("--text-banner-height", type=int, default=0, help="Height in pixels of text banner overlay (0 for auto-fit to text).")
     parser.add_argument("--text-font-size", type=int, default=9, help="Font size in points for scrolling text.")
+    parser.add_argument(
+        "--transition",
+        choices=["slide", "slide-right", "fade", "none"],
+        default="slide",
+        help="Transition animation style when changing tracks.",
+    )
+    parser.add_argument(
+        "--transition-duration",
+        type=positive_float,
+        default=0.6,
+        help="Duration in seconds for track change transition animation.",
+    )
     return parser
 
 
