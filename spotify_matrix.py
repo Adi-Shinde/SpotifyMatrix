@@ -422,11 +422,21 @@ def render_record(art: Image.Image | None, angle: float, size: int) -> Image.Ima
 
     draw = ImageDraw.Draw(frame, "RGBA")
     outer = (margin, margin, size - margin - 1, size - margin - 1)
-    draw.ellipse(outer, outline=(220, 220, 220, 200), width=1)
+    draw.ellipse(outer, outline=(150, 150, 150, 220), width=1)
+
+    # Vinyl grooves (faint concentric circles)
+    for g in range(max(2, size // 12), size // 2 - max(3, size // 16), max(2, size // 12)):
+        draw.ellipse(
+            (margin + g, margin + g, size - margin - g - 1, size - margin - g - 1),
+            outline=(255, 255, 255, 25),
+            width=1
+        )
 
     center = size // 2
     label_radius = max(3, size // 16)
     hole_radius = max(1, size // 40)
+    
+    # Label and center hole
     draw.ellipse(
         (
             center - label_radius,
@@ -572,6 +582,9 @@ def draw_scrolling_text(
 
     # High-contrast solid background banner
     draw.rectangle((0, banner_y0, size_x - 1, banner_y1), fill=bg_color)
+    
+    # Slick top border line
+    draw.line((0, banner_y0, size_x - 1, banner_y0), fill=(40, 40, 60))
 
     separator = "   -   "
     full_unit = text + separator
@@ -628,6 +641,20 @@ def create_full_frame(
             banner_height=banner_h,
             font_size=args.text_font_size,
         )
+
+    # Add small time in top corner
+    import datetime
+    now = datetime.datetime.now()
+    time_str = now.strftime("%I:%M").lstrip("0")
+    
+    mini_font = get_font(6)
+    draw = ImageDraw.Draw(frame)
+    bbox = draw.textbbox((0, 0), time_str, font=mini_font)
+    time_w = bbox[2] - bbox[0]
+    
+    margin_x = size_x - time_w - 1
+    margin_y = 1
+    draw.text((margin_x, margin_y), time_str, fill=(150, 150, 170), font=mini_font)
 
     return frame
 
