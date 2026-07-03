@@ -477,6 +477,38 @@ def get_text_height(font_size: int = 9) -> int:
     return max(1, bbox[3] - bbox[1])
 
 
+def render_clock(size: int) -> Image.Image:
+    import datetime
+    import math
+    frame = Image.new("RGB", (size, size), (0, 0, 0))
+    draw = ImageDraw.Draw(frame)
+    now = datetime.datetime.now()
+    time_str = now.strftime("%H:%M")
+    
+    font = get_font(max(10, size // 3))
+    bbox = draw.textbbox((0, 0), time_str, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    
+    x = (size - text_w) // 2
+    y = (size - text_h) // 2 - bbox[1]
+    draw.text((x, y), time_str, fill=(255, 255, 255), font=font)
+    
+    margin = 2
+    draw.ellipse((margin, margin, size - margin - 1, size - margin - 1), outline=(80, 80, 100), width=2)
+    
+    second_angle = (now.second / 60.0) * 360 - 90
+    rad = math.radians(second_angle)
+    cx = size / 2.0
+    cy = size / 2.0
+    radius = (size - margin * 2) / 2.0
+    sx = cx + math.cos(rad) * radius
+    sy = cy + math.sin(rad) * radius
+    draw.ellipse((sx - 2, sy - 2, sx + 2, sy + 2), fill=(200, 50, 50))
+    
+    return frame
+
+
 def draw_scrolling_text(
     image: Image.Image,
     text: str,
@@ -592,6 +624,18 @@ def blend_frames(
         out_frame = Image.new("RGB", (size_x, size_y), (0, 0, 0))
         out_frame.paste(old_frame, (offset, 0))
         out_frame.paste(new_frame, (-size_x + offset, 0))
+        return out_frame
+    elif mode == "slide-up":
+        offset = int(eased_p * size_y)
+        out_frame = Image.new("RGB", (size_x, size_y), (0, 0, 0))
+        out_frame.paste(old_frame, (0, -offset))
+        out_frame.paste(new_frame, (0, size_y - offset))
+        return out_frame
+    elif mode == "slide-down":
+        offset = int(eased_p * size_y)
+        out_frame = Image.new("RGB", (size_x, size_y), (0, 0, 0))
+        out_frame.paste(old_frame, (0, offset))
+        out_frame.paste(new_frame, (0, -size_y + offset))
         return out_frame
     elif mode == "fade":
         return Image.blend(old_frame, new_frame, eased_p)
@@ -751,6 +795,11 @@ def run(args: argparse.Namespace) -> None:
     old_angle: float = 0.0
     old_scroll_x: float = 0.0
     old_display_text: str = ""
+    old_is_idle: bool = False
+
+    is_idle_state: bool = False
+    idle_since: float | None = None
+    current_transition_mode = args.transition
 
     transition_active: bool = False
     transition_start: float = 0.0
@@ -782,29 +831,64 @@ def run(args: argparse.Namespace) -> None:
                 old_angle = angle
                 old_scroll_x = scroll_x
                 old_display_text = last_display_text
+                old_is_idle = is_idle_state
                 scroll_x = 0.0
                 transition_active = True
                 transition_start = now
+                current_transition_mode = args.transition
+
+            # Detect idle state
+            if not is_playing or current_art_key is None:
+                if idle_since is None:
+                    idle_since = now
+                elif now - idle_since >= 5.0 and not is_idle_state:
+                    old_art_image = last_art_image
+                    old_angle = angle
+                    old_scroll_x = scroll_x
+                    old_display_text = last_display_text
+                    old_is_idle = is_idle_state
+                    is_idle_state = True
+                    transition_active = True
+                    transition_start = now
+                    current_transition_mode = "slide-down"
+            else:
+                idle_since = None
+                if is_idle_state:
+                    old_art_image = last_art_image
+                    old_angle = angle
+                    old_scroll_x = scroll_x
+                    old_display_text = last_display_text
+                    old_is_idle = is_idle_state
+                    is_idle_state = False
+                    transition_active = True
+                    transition_start = now
+                    current_transition_mode = "slide-up"
+                    scroll_x = 0.0
 
             prev_art_key = current_art_key
             last_art_image = current_art_image
             last_display_text = display_text
 
-            if is_playing and current_art_image is not None:
+            if not is_idle_state and is_playing and current_art_image is not None:
                 angle = (angle - 360.0 * (args.rpm / 60.0) * delta) % 360.0
-            scroll_x += args.text_speed * delta
+            
+            if not is_idle_state:
+                scroll_x += args.text_speed * delta
 
-            new_frame = create_full_frame(
-                current_art_image,
-                angle,
-                scroll_x,
-                display_text,
-                size_x,
-                size_y,
-                args,
-            )
+            if is_idle_state:
+                new_frame = render_clock(size)
+            else:
+                new_frame = create_full_frame(
+                    current_art_image,
+                    angle,
+                    scroll_x,
+                    display_text,
+                    size_x,
+                    size_y,
+                    args,
+                )
 
-            if transition_active and args.transition != "none":
+            if transition_active and current_transition_mode != "none":
                 elapsed = now - transition_start
                 duration = max(0.1, args.transition_duration)
                 progress = elapsed / duration
@@ -813,20 +897,23 @@ def run(args: argparse.Namespace) -> None:
                     transition_active = False
                     frame = new_frame
                 else:
-                    if is_playing:
-                        old_angle = (old_angle - 360.0 * (args.rpm / 60.0) * delta) % 360.0
-                    old_scroll_x += args.text_speed * delta
+                    if old_is_idle:
+                        old_frame = render_clock(size)
+                    else:
+                        if is_playing and not is_idle_state:
+                            old_angle = (old_angle - 360.0 * (args.rpm / 60.0) * delta) % 360.0
+                        old_scroll_x += args.text_speed * delta
 
-                    old_frame = create_full_frame(
-                        old_art_image,
-                        old_angle,
-                        old_scroll_x,
-                        old_display_text,
-                        size_x,
-                        size_y,
-                        args,
-                    )
-                    frame = blend_frames(old_frame, new_frame, progress, mode=args.transition)
+                        old_frame = create_full_frame(
+                            old_art_image,
+                            old_angle,
+                            old_scroll_x,
+                            old_display_text,
+                            size_x,
+                            size_y,
+                            args,
+                        )
+                    frame = blend_frames(old_frame, new_frame, progress, mode=current_transition_mode)
             else:
                 frame = new_frame
 
@@ -913,7 +1000,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--transition-duration",
         type=positive_float,
-        default=0.6,
+        default=1.5,
         help="Duration in seconds for track change transition animation.",
     )
     return parser
