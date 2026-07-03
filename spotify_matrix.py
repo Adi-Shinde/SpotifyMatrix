@@ -483,20 +483,49 @@ def render_clock(size: int) -> Image.Image:
     frame = Image.new("RGB", (size, size), (0, 0, 0))
     draw = ImageDraw.Draw(frame)
     now = datetime.datetime.now()
-    time_str = now.strftime("%H:%M")
     
-    font = get_font(max(10, size // 3))
-    bbox = draw.textbbox((0, 0), time_str, font=font)
-    text_w = bbox[2] - bbox[0]
-    text_h = bbox[3] - bbox[1]
+    # Text content
+    day_str = now.strftime("%a").upper()               # e.g., "FRI"
+    time_str = now.strftime("%I:%M %p").lstrip("0")    # e.g., "4:05 PM"
+    date_str = now.strftime("%b %d").upper()           # e.g., "OCT 25"
     
-    x = (size - text_w) // 2
-    y = (size - text_h) // 2 - bbox[1]
-    draw.text((x, y), time_str, fill=(255, 255, 255), font=font)
+    # Make fonts a bit smaller
+    small_font = get_font(max(8, size // 8))
+    time_font = get_font(max(10, size // 5))
     
-    margin = 2
-    draw.ellipse((margin, margin, size - margin - 1, size - margin - 1), outline=(80, 80, 100), width=2)
+    # Calculate bounding boxes
+    day_bbox = draw.textbbox((0, 0), day_str, font=small_font)
+    time_bbox = draw.textbbox((0, 0), time_str, font=time_font)
+    date_bbox = draw.textbbox((0, 0), date_str, font=small_font)
     
+    day_h = day_bbox[3] - day_bbox[1]
+    time_h = time_bbox[3] - time_bbox[1]
+    date_h = date_bbox[3] - date_bbox[1]
+    
+    # Layout gap and total height
+    gap = 2
+    total_h = day_h + gap + time_h + gap + date_h
+    start_y = (size - total_h) // 2
+    
+    # Draw Day
+    day_x = (size - (day_bbox[2] - day_bbox[0])) // 2
+    draw.text((day_x, start_y - day_bbox[1]), day_str, fill=(130, 170, 255), font=small_font)
+    
+    # Draw Time (AM/PM)
+    time_y = start_y + day_h + gap
+    time_x = (size - (time_bbox[2] - time_bbox[0])) // 2
+    draw.text((time_x, time_y - time_bbox[1]), time_str, fill=(255, 255, 255), font=time_font)
+    
+    # Draw Date
+    date_y = time_y + time_h + gap
+    date_x = (size - (date_bbox[2] - date_bbox[0])) // 2
+    draw.text((date_x, date_y - date_bbox[1]), date_str, fill=(180, 180, 180), font=small_font)
+    
+    # Thin outer circle
+    margin = 1
+    draw.ellipse((margin, margin, size - margin - 1, size - margin - 1), outline=(60, 60, 90), width=1)
+    
+    # Sweeping seconds red dot
     second_angle = (now.second / 60.0) * 360 - 90
     rad = math.radians(second_angle)
     cx = size / 2.0
@@ -504,7 +533,7 @@ def render_clock(size: int) -> Image.Image:
     radius = (size - margin * 2) / 2.0
     sx = cx + math.cos(rad) * radius
     sy = cy + math.sin(rad) * radius
-    draw.ellipse((sx - 2, sy - 2, sx + 2, sy + 2), fill=(200, 50, 50))
+    draw.ellipse((sx - 1.5, sy - 1.5, sx + 1.5, sy + 1.5), fill=(230, 40, 40))
     
     return frame
 
