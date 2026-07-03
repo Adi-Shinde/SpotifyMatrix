@@ -483,12 +483,7 @@ def render_clock(size: int) -> Image.Image:
     frame = Image.new("RGB", (size, size), (0, 0, 0))
     draw = ImageDraw.Draw(frame)
     now = datetime.datetime.now()
-    time_str = now.strftime("%H:%M")
-
-    font = get_font(max(10, size // 3))
-    bbox = draw.textbbox((0, 0), time_str, font=font)
-    text_w = bbox[2] - bbox[0]
-    text_h = bbox[3] - bbox[1]
+    
     # Text content
     day_str = now.strftime("%a").upper()               # e.g., "FRI"
     time_str = now.strftime("%I:%M %p").lstrip("0")    # e.g., "4:05 PM"
@@ -520,21 +515,16 @@ def render_clock(size: int) -> Image.Image:
     time_y = start_y + day_h + gap
     time_x = (size - (time_bbox[2] - time_bbox[0])) // 2
     draw.text((time_x, time_y - time_bbox[1]), time_str, fill=(255, 255, 255), font=time_font)
-
-    x = (size - text_w) // 2
-    y = (size - text_h) // 2 - bbox[1]
-    draw.text((x, y), time_str, fill=(255, 255, 255), font=font)
+    
     # Draw Date
     date_y = time_y + time_h + gap
     date_x = (size - (date_bbox[2] - date_bbox[0])) // 2
     draw.text((date_x, date_y - date_bbox[1]), date_str, fill=(180, 180, 180), font=small_font)
-
-    margin = 2
-    draw.ellipse((margin, margin, size - margin - 1, size - margin - 1), outline=(80, 80, 100), width=2)
+    
     # Thin outer circle
     margin = 1
     draw.ellipse((margin, margin, size - margin - 1, size - margin - 1), outline=(60, 60, 90), width=1)
-
+    
     # Sweeping seconds red dot
     second_angle = (now.second / 60.0) * 360 - 90
     rad = math.radians(second_angle)
@@ -543,9 +533,8 @@ def render_clock(size: int) -> Image.Image:
     radius = (size - margin * 2) / 2.0
     sx = cx + math.cos(rad) * radius
     sy = cy + math.sin(rad) * radius
-    draw.ellipse((sx - 2, sy - 2, sx + 2, sy + 2), fill=(200, 50, 50))
     draw.ellipse((sx - 1.5, sy - 1.5, sx + 1.5, sy + 1.5), fill=(230, 40, 40))
-
+    
     return frame
 
 
@@ -911,7 +900,7 @@ def run(args: argparse.Namespace) -> None:
 
             if not is_idle_state and is_playing and current_art_image is not None:
                 angle = (angle - 360.0 * (args.rpm / 60.0) * delta) % 360.0
-
+            
             if not is_idle_state:
                 scroll_x += args.text_speed * delta
 
