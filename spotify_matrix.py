@@ -460,14 +460,25 @@ def render_idle(size: int) -> Image.Image:
     return frame
 
 
+def get_font(size: int = 9) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        try:
+            return ImageFont.truetype("arial.ttf", size)
+        except OSError:
+            return ImageFont.load_default()
+
+
 def draw_scrolling_text(
     image: Image.Image,
     text: str,
     scroll_x: float,
     position: str = "bottom",
-    banner_height: int = 13,
+    banner_height: int = 10,
     text_color: tuple[int, int, int] = (255, 255, 255),
     bg_color: tuple[int, int, int] = (0, 0, 0),
+    font_size: int = 9,
 ) -> Image.Image:
     if not text.strip():
         return image
@@ -485,7 +496,7 @@ def draw_scrolling_text(
     # High-contrast solid background banner
     draw.rectangle((0, banner_y0, size_x - 1, banner_y1), fill=bg_color)
 
-    font = ImageFont.load_default()
+    font = get_font(font_size)
     bbox = draw.textbbox((0, 0), text, font=font)
     text_h = bbox[3] - bbox[1]
 
@@ -625,7 +636,9 @@ def run(args: argparse.Namespace) -> None:
     else:
         display = MatrixDisplay(args)
 
-    size = min(args.rows, args.cols)
+    size_x = args.cols
+    size_y = args.rows
+    size = min(size_x, size_y)
 
     if args.test_pattern:
         try:
@@ -640,7 +653,6 @@ def run(args: argparse.Namespace) -> None:
             display.clear()
         return
 
-    idle = render_idle(size)
     playback_state = SharedPlaybackState()
     playback_lock = threading.Lock()
     stop_event = threading.Event()
@@ -673,26 +685,36 @@ def run(args: argparse.Namespace) -> None:
 
             scroll_x += args.text_speed * delta
 
-            image = render_record(current_art_image, angle, size) if current_art_image else idle
-
+            display_text = ""
             if not args.no_text:
                 if title and artist:
                     display_text = f"{title} • {artist}"
                 elif title or artist:
                     display_text = title or artist
-                else:
-                    display_text = ""
 
-                if display_text:
-                    image = draw_scrolling_text(
-                        image,
-                        text=display_text,
-                        scroll_x=scroll_x,
-                        position=args.text_position,
-                        banner_height=args.text_banner_height,
-                    )
+            has_text = bool(display_text)
+            gap = 1 if has_text else 0
+            banner_h = args.text_banner_height if has_text else 0
+            cd_size = max(1, min(size_x, size_y - banner_h - gap)) if has_text else size
 
-            display.show(image)
+            cd_img = render_record(current_art_image, angle, cd_size) if current_art_image else render_idle(cd_size)
+
+            frame = Image.new("RGB", (size_x, size_y), (0, 0, 0))
+            cd_x = (size_x - cd_size) // 2
+            cd_y = (banner_h + gap) if (has_text and args.text_position == "top") else 0
+            frame.paste(cd_img, (cd_x, cd_y))
+
+            if has_text:
+                frame = draw_scrolling_text(
+                    frame,
+                    text=display_text,
+                    scroll_x=scroll_x,
+                    position=args.text_position,
+                    banner_height=args.text_banner_height,
+                    font_size=args.text_font_size,
+                )
+
+            display.show(frame)
 
             if args.once:
                 break
@@ -720,9 +742,16 @@ def render_preview_frames(directory: Path) -> None:
     title = "Blinding Lights"
     artist = "The Weeknd"
     text_str = f"{title} • {artist}"
+    size_x, size_y = 64, 64
+    banner_h = 10
+    gap = 1
+    cd_size = max(1, min(size_x, size_y - banner_h - gap))
+    cd_x = (size_x - cd_size) // 2
     for index, angle in enumerate((0, 45, 90, 135)):
-        frame = render_record(art, angle, 64)
-        frame = draw_scrolling_text(frame, text_str, scroll_x=index * 15.0)
+        cd_img = render_record(art, angle, cd_size)
+        frame = Image.new("RGB", (size_x, size_y), (0, 0, 0))
+        frame.paste(cd_img, (cd_x, 0))
+        frame = draw_scrolling_text(frame, text_str, scroll_x=index * 15.0, banner_height=banner_h, font_size=9)
         frame.save(directory / f"album-disk-{index:02d}.png")
 
 
@@ -755,7 +784,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-text", action="store_true", help="Disable scrolling song title and artist text overlay.")
     parser.add_argument("--text-speed", type=positive_float, default=25.0, help="Text scroll speed in pixels per second.")
     parser.add_argument("--text-position", choices=["bottom", "top"], default="bottom", help="Text banner position on matrix.")
-    parser.add_argument("--text-banner-height", type=int, default=13, help="Height in pixels of text banner overlay.")
+    parser.add_argument("--text-banner-height", type=int, default=10, help="Height in pixels of text banner overlay.")
+    parser.add_argument("--text-font-size", type=int, default=9, help="Font size in points for scrolling text.")
     return parser
 
 
