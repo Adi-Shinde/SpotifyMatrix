@@ -602,24 +602,7 @@ def create_full_frame(
     args: argparse.Namespace,
 ) -> Image.Image:
     import datetime
-    has_text = bool(display_text) and not args.no_text
-    if has_text:
-        text_h = get_text_height(args.text_font_size)
-        banner_h = args.text_banner_height if args.text_banner_height > 0 else text_h
-        gap = 1
-        cd_size = max(1, min(size_x, size_y - banner_h - gap))
-    else:
-        banner_h = 0
-        gap = 0
-        cd_size = min(size_x, size_y)
-
-    cd_img = render_record(art_image, angle, cd_size) if art_image else render_idle(cd_size)
-
-    frame = Image.new("RGB", (size_x, size_y), (0, 0, 0))
-    cd_x = (size_x - cd_size) // 2
-    cd_y = (banner_h + gap) if (has_text and args.text_position == "top") else 0
-    frame.paste(cd_img, (cd_x, cd_y))
-
+    
     now = datetime.datetime.now()
     hour_str = now.strftime("%I").lstrip("0")
     minute_str = now.strftime("%M")
@@ -634,22 +617,38 @@ def create_full_frame(
     hour_h = hour_bbox[3] - hour_bbox[1]
     minute_w = minute_bbox[2] - minute_bbox[0]
     minute_h = minute_bbox[3] - minute_bbox[1]
+    clock_h = max(hour_h, minute_h)
+    
+    has_text = bool(display_text) and not args.no_text
+    if has_text:
+        text_h = get_text_height(args.text_font_size)
+        banner_h = args.text_banner_height if args.text_banner_height > 0 else text_h
+        gap = 1
+        cd_size = max(1, min(size_x, size_y - banner_h - clock_h - gap * 2))
+    else:
+        banner_h = 0
+        gap = 1
+        cd_size = max(1, min(size_x, size_y - clock_h - gap * 2))
+
+    cd_img = render_record(art_image, angle, cd_size) if art_image else render_idle(cd_size)
+
+    frame = Image.new("RGB", (size_x, size_y), (0, 0, 0))
+    cd_x = (size_x - cd_size) // 2
+    
+    if args.text_position == "top":
+        cd_y = banner_h + gap + clock_h + gap if has_text else clock_h + gap
+        clock_y = banner_h + gap if has_text else 1
+    else:
+        clock_y = 1
+        cd_y = clock_h + gap
+        
+    frame.paste(cd_img, (cd_x, cd_y))
 
     draw = ImageDraw.Draw(frame)
-    if args.text_position == "top":
-        clock_y = size_y - max(hour_h, minute_h) - 2
-    else:
-        clock_y = 2
-
     hour_x = 2
     minute_x = size_x - minute_w - 2
 
-    for dx in [-1, 0, 1]:
-        for dy in [-1, 0, 1]:
-            if dx != 0 or dy != 0:
-                draw.text((hour_x + dx, clock_y - hour_bbox[1] + dy), hour_str, fill=(0, 0, 0), font=clock_font)
-                draw.text((minute_x + dx, clock_y - minute_bbox[1] + dy), minute_str, fill=(0, 0, 0), font=clock_font)
-                
+    # Draw text cleanly without outline since it no longer overlaps
     draw.text((hour_x, clock_y - hour_bbox[1]), hour_str, fill=(200, 200, 200), font=clock_font)
     draw.text((minute_x, clock_y - minute_bbox[1]), minute_str, fill=(200, 200, 200), font=clock_font)
 
