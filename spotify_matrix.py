@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 try:
     from dotenv import load_dotenv
@@ -39,6 +39,8 @@ class PlaybackArt:
     key: str
     image_url: str
     is_playing: bool
+    title: str = ""
+    artist: str = ""
 
 
 @dataclass
@@ -47,6 +49,8 @@ class SharedPlaybackState:
     image_url: str | None = None
     image: Image.Image | None = None
     is_playing: bool = False
+    title: str = ""
+    artist: str = ""
 
 
 @dataclass
@@ -369,8 +373,14 @@ def playback_art_from_response(playback: dict[str, Any] | None) -> PlaybackArt |
     item_type = item.get("type")
     if item_type == "track":
         images = item.get("album", {}).get("images", [])
+        title = item.get("name") or ""
+        artists = item.get("artists", [])
+        artist_name = ", ".join(a.get("name") for a in artists if a.get("name"))
     else:
         images = item.get("images", [])
+        title = item.get("name") or ""
+        show = item.get("show") or {}
+        artist_name = show.get("name") or ""
 
     if not images:
         return None
@@ -381,6 +391,8 @@ def playback_art_from_response(playback: dict[str, Any] | None) -> PlaybackArt |
         key=str(item_id),
         image_url=image["url"],
         is_playing=bool(playback.get("is_playing")),
+        title=title,
+        artist=artist_name,
     )
 
 
@@ -448,6 +460,57 @@ def render_idle(size: int) -> Image.Image:
     return frame
 
 
+def draw_scrolling_text(
+    image: Image.Image,
+    text: str,
+    scroll_x: float,
+    position: str = "bottom",
+    banner_height: int = 13,
+    text_color: tuple[int, int, int] = (255, 255, 255),
+    bg_color: tuple[int, int, int] = (0, 0, 0),
+) -> Image.Image:
+    if not text.strip():
+        return image
+
+    size_x, size_y = image.size
+    draw = ImageDraw.Draw(image)
+
+    if position == "top":
+        banner_y0 = 0
+        banner_y1 = banner_height - 1
+    else:
+        banner_y0 = size_y - banner_height
+        banner_y1 = size_y - 1
+
+    # High-contrast solid background banner
+    draw.rectangle((0, banner_y0, size_x - 1, banner_y1), fill=bg_color)
+
+    font = ImageFont.load_default()
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_h = bbox[3] - bbox[1]
+
+    # Center text vertically within the banner
+    y_pos = banner_y0 + max(0, (banner_height - text_h) // 2 - bbox[1])
+
+    separator = "   •   "
+    full_unit = text + separator
+    unit_bbox = draw.textbbox((0, 0), full_unit, font=font)
+    unit_w = unit_bbox[2] - unit_bbox[0]
+
+    if unit_w <= 0:
+        return image
+
+    offset_x = - (scroll_x % unit_w)
+    cur_x = offset_x
+
+    while cur_x < size_x:
+        if cur_x + unit_w > 0:
+            draw.text((cur_x, y_pos), full_unit, fill=text_color, font=font)
+        cur_x += unit_w
+
+    return image
+
+
 def render_test_pattern(size: int, offset: int) -> Image.Image:
     frame = Image.new("RGB", (size, size), (0, 0, 0))
     draw = ImageDraw.Draw(frame)
@@ -495,16 +558,20 @@ def poll_spotify(
                     state.art_key = art.key
                     state.image_url = art.image_url
                     state.is_playing = art.is_playing
+                    state.title = art.title
+                    state.artist = art.artist
                     if image is not None:
                         state.image = image
 
-                status = f"art found, is_playing={art.is_playing}"
+                status = f"art found, is_playing={art.is_playing}, title={art.title!r}"
             else:
                 with state_lock:
                     state.art_key = None
                     state.image_url = None
                     state.image = None
                     state.is_playing = False
+                    state.title = ""
+                    state.artist = ""
                 status = "no currently playing item"
 
             if status != last_status:
@@ -585,6 +652,7 @@ def run(args: argparse.Namespace) -> None:
     poll_thread.start()
 
     angle = 0.0
+    scroll_x = 0.0
     last_frame = time.monotonic()
 
     try:
@@ -593,6 +661,8 @@ def run(args: argparse.Namespace) -> None:
             with playback_lock:
                 current_art_image = playback_state.image
                 is_playing = playback_state.is_playing
+                title = playback_state.title
+                artist = playback_state.artist
 
             now = time.monotonic()
             delta = now - last_frame
@@ -601,7 +671,27 @@ def run(args: argparse.Namespace) -> None:
             if is_playing and current_art_image is not None:
                 angle = (angle - 360.0 * (args.rpm / 60.0) * delta) % 360.0
 
+            scroll_x += args.text_speed * delta
+
             image = render_record(current_art_image, angle, size) if current_art_image else idle
+
+            if not args.no_text:
+                if title and artist:
+                    display_text = f"{title} • {artist}"
+                elif title or artist:
+                    display_text = title or artist
+                else:
+                    display_text = ""
+
+                if display_text:
+                    image = draw_scrolling_text(
+                        image,
+                        text=display_text,
+                        scroll_x=scroll_x,
+                        position=args.text_position,
+                        banner_height=args.text_banner_height,
+                    )
+
             display.show(image)
 
             if args.once:
@@ -627,8 +717,13 @@ def positive_float(value: str) -> float:
 def render_preview_frames(directory: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     art = demo_album_art(96)
+    title = "Blinding Lights"
+    artist = "The Weeknd"
+    text_str = f"{title} • {artist}"
     for index, angle in enumerate((0, 45, 90, 135)):
-        render_record(art, angle, 64).save(directory / f"album-disk-{index:02d}.png")
+        frame = render_record(art, angle, 64)
+        frame = draw_scrolling_text(frame, text_str, scroll_x=index * 15.0)
+        frame.save(directory / f"album-disk-{index:02d}.png")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -657,6 +752,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-pattern", action="store_true", help="Show a bright moving color test pattern without using Spotify.")
     parser.add_argument("--once", action="store_true", help="Render one frame and exit.")
     parser.add_argument("--no-browser", action="store_true", help="Print the Spotify auth URL without trying to open a browser.")
+    parser.add_argument("--no-text", action="store_true", help="Disable scrolling song title and artist text overlay.")
+    parser.add_argument("--text-speed", type=positive_float, default=25.0, help="Text scroll speed in pixels per second.")
+    parser.add_argument("--text-position", choices=["bottom", "top"], default="bottom", help="Text banner position on matrix.")
+    parser.add_argument("--text-banner-height", type=int, default=13, help="Height in pixels of text banner overlay.")
     return parser
 
 
