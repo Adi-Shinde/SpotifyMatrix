@@ -422,7 +422,7 @@ def render_record(art: Image.Image | None, angle: float, size: int) -> Image.Ima
 
     draw = ImageDraw.Draw(frame, "RGBA")
     outer = (margin, margin, size - margin - 1, size - margin - 1)
-    draw.ellipse(outer, outline=(6, 6, 6, 255), width=1)
+    draw.ellipse(outer, outline=(220, 220, 220, 200), width=1)
 
     center = size // 2
     label_radius = max(3, size // 16)
@@ -453,14 +453,14 @@ def render_idle(size: int) -> Image.Image:
     frame = Image.new("RGB", (size, size), (0, 0, 0))
     draw = ImageDraw.Draw(frame)
     margin = 0
-    draw.ellipse((margin, margin, size - margin - 1, size - margin - 1), outline=(55, 55, 55), width=1)
+    draw.ellipse((margin, margin, size - margin - 1, size - margin - 1), outline=(220, 220, 220), width=1)
     center = size // 2
     radius = max(2, size // 25)
     draw.ellipse((center - radius, center - radius, center + radius, center + radius), fill=(18, 18, 18))
     return frame
 
 
-def get_font(size: int = 8) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
+def get_font(size: int = 9) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
     try:
         return ImageFont.load_default(size=size)
     except TypeError:
@@ -470,7 +470,7 @@ def get_font(size: int = 8) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
             return ImageFont.load_default()
 
 
-def get_text_height(font_size: int = 8) -> int:
+def get_text_height(font_size: int = 9) -> int:
     font = get_font(font_size)
     draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
     bbox = draw.textbbox((0, 0), "Ag - Mj", font=font)
@@ -485,7 +485,7 @@ def draw_scrolling_text(
     banner_height: int = 0,
     text_color: tuple[int, int, int] = (255, 255, 255),
     bg_color: tuple[int, int, int] = (0, 0, 0),
-    font_size: int = 8,
+    font_size: int = 9,
 ) -> Image.Image:
     if not text.strip():
         return image
@@ -758,7 +758,7 @@ def render_preview_frames(directory: Path) -> None:
     artist = "The Weeknd"
     text_str = f"{title} - {artist}"
     size_x, size_y = 64, 64
-    font_size = 8
+    font_size = 9
     text_h = get_text_height(font_size)
     banner_h = text_h
     gap = 1
@@ -768,7 +768,6 @@ def render_preview_frames(directory: Path) -> None:
         cd_img = render_record(art, angle, cd_size)
         frame = Image.new("RGB", (size_x, size_y), (0, 0, 0))
         frame.paste(cd_img, (cd_x, 0))
-        frame.save(directory / f"album-disk-{index:02d}.png")
         frame = draw_scrolling_text(frame, text_str, scroll_x=index * 15.0, banner_height=banner_h, font_size=font_size)
         frame.save(directory / f"album-disk-{index:02d}.png")
 
@@ -800,10 +799,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--once", action="store_true", help="Render one frame and exit.")
     parser.add_argument("--no-browser", action="store_true", help="Print the Spotify auth URL without trying to open a browser.")
     parser.add_argument("--no-text", action="store_true", help="Disable scrolling song title and artist text overlay.")
-    parser.add_argument("--text-speed", type=positive_float, default=25.0, help="Text scroll speed in pixels per second.")
+    parser.add_argument("--text-speed", type=positive_float, default=12.0, help="Text scroll speed in pixels per second.")
     parser.add_argument("--text-position", choices=["bottom", "top"], default="bottom", help="Text banner position on matrix.")
     parser.add_argument("--text-banner-height", type=int, default=0, help="Height in pixels of text banner overlay (0 for auto-fit to text).")
-    parser.add_argument("--text-font-size", type=int, default=8, help="Font size in points for scrolling text.")
+    parser.add_argument("--text-font-size", type=int, default=9, help="Font size in points for scrolling text.")
     return parser
 
 
