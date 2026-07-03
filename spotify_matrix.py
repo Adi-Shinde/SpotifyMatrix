@@ -621,27 +621,37 @@ def create_full_frame(
     frame.paste(cd_img, (cd_x, cd_y))
 
     now = datetime.datetime.now()
-    clock_str = now.strftime("%I:%M").lstrip("0")
-    clock_font_size = max(6, args.text_font_size - 2)
+    hour_str = now.strftime("%I").lstrip("0")
+    minute_str = now.strftime("%M")
+    
+    clock_font_size = max(10, args.text_font_size + 2)
     clock_font = get_font(clock_font_size)
     dummy_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    clock_bbox = dummy_draw.textbbox((0, 0), clock_str, font=clock_font)
-    clock_w = clock_bbox[2] - clock_bbox[0]
-    clock_h = clock_bbox[3] - clock_bbox[1]
+    
+    hour_bbox = dummy_draw.textbbox((0, 0), hour_str, font=clock_font)
+    minute_bbox = dummy_draw.textbbox((0, 0), minute_str, font=clock_font)
+    
+    hour_h = hour_bbox[3] - hour_bbox[1]
+    minute_w = minute_bbox[2] - minute_bbox[0]
+    minute_h = minute_bbox[3] - minute_bbox[1]
 
     draw = ImageDraw.Draw(frame)
     if args.text_position == "top":
-        clock_y = size_y - clock_h - 2
+        clock_y = size_y - max(hour_h, minute_h) - 2
     else:
         clock_y = 2
 
-    clock_x = size_x - clock_w - 2
+    hour_x = 2
+    minute_x = size_x - minute_w - 2
 
     for dx in [-1, 0, 1]:
         for dy in [-1, 0, 1]:
             if dx != 0 or dy != 0:
-                draw.text((clock_x + dx, clock_y - clock_bbox[1] + dy), clock_str, fill=(0, 0, 0), font=clock_font)
-    draw.text((clock_x, clock_y - clock_bbox[1]), clock_str, fill=(200, 200, 200), font=clock_font)
+                draw.text((hour_x + dx, clock_y - hour_bbox[1] + dy), hour_str, fill=(0, 0, 0), font=clock_font)
+                draw.text((minute_x + dx, clock_y - minute_bbox[1] + dy), minute_str, fill=(0, 0, 0), font=clock_font)
+                
+    draw.text((hour_x, clock_y - hour_bbox[1]), hour_str, fill=(200, 200, 200), font=clock_font)
+    draw.text((minute_x, clock_y - minute_bbox[1]), minute_str, fill=(200, 200, 200), font=clock_font)
 
     if has_text:
         frame = draw_scrolling_text(
