@@ -123,12 +123,14 @@ class SpotifyClient:
             CURRENTLY_PLAYING_URL,
             params={"additional_types": "track,episode"},
             headers={"Authorization": f"Bearer {token}"},
-            timeout=10,
+            timeout=5,
         )
+        print(f"Spotify API: Received HTTP {response.status}", flush=True)
 
         if response.status == 204:
             return None
         if response.status == 401:
+            print("Spotify API: Token expired or invalid (401), attempting refresh...", flush=True)
             self._refresh_access_token()
             return self.get_currently_playing()
         if response.status == 429:
