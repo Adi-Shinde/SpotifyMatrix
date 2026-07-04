@@ -580,7 +580,7 @@ def draw_scrolling_text(
     # High-contrast solid background banner
     draw.rectangle((0, banner_y0, size_x - 1, banner_y1), fill=bg_color)
 
-    separator = "   -   "
+    separator = "   - - -   "
     full_unit = text + separator
     unit_bbox = draw.textbbox((0, 0), full_unit, font=font)
     unit_w = unit_bbox[2] - unit_bbox[0]
@@ -891,7 +891,7 @@ def run(args: argparse.Namespace) -> None:
             display_text = ""
             if not args.no_text:
                 if title and artist:
-                    display_text = f"{title} - {artist}"
+                    display_text = f"{title} · {artist}"
                 elif title or artist:
                     display_text = title or artist
 
@@ -1014,7 +1014,7 @@ def render_preview_frames(directory: Path) -> None:
     art = demo_album_art(96)
     title = "Blinding Lights"
     artist = "The Weeknd"
-    text_str = f"{title} - {artist}"
+    text_str = f"{title} · {artist}"
     size_x, size_y = 64, 64
     font_size = 9
     text_h = get_text_height(font_size)
