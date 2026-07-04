@@ -171,7 +171,36 @@ sudo -E .venv/bin/python3 spotify_matrix.py --rows 64 --cols 64 --chain-length 1
 ```
 
 ```
+## PHASE 4: THE 6-MONTH RE-AUTHORIZATION (MAINTENANCE)
 
+Spotify's security policy forces "Refresh Tokens" to expire every 6 months. When this happens, your matrix will stop showing music and stay on the idle clock, and the background logs will show an `invalid_grant` error. 
+
+To fix this and get another 6 months of automation, you just need to clear the old cache and re-authenticate:
+
+1. **Stop the Background Service:**
+   Open PowerShell, SSH into the Pi (`ssh adi@matrixspot.local`), and stop the service:
+   `sudo systemctl stop spotifymatrix.service`
+
+2. **Delete the Expired Token:**
+   `rm ~/Documents/SpotifyMatrix/.cache/spotify_token.json`
+
+3. **Open the Network Bridge:**
+   Open a SECOND PowerShell window on your laptop and run:
+   `ssh -L 8888:127.0.0.1:8888 adi@matrixspot.local`
+
+4. **Run the Authenticator:**
+   Go back to your FIRST terminal window and run:
+   `cd ~/Documents/SpotifyMatrix`
+   `.venv/bin/python3 spotify_matrix.py --auth-only --no-browser`
+
+5. **Authorize in Browser:**
+   Copy the URL printed in the terminal, paste it into your laptop's browser, and click "Agree". 
+
+6. **Restart the Automation:**
+   Once the terminal confirms the token is saved, close the browser and the second terminal, and start the service back up:
+   `sudo systemctl start spotifymatrix.service`
+
+You are now good for another 6 months!
 
 4. **Restart automation when done:** `sudo systemctl start spotifymatrix.service`
 
