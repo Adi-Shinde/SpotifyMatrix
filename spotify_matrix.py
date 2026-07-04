@@ -166,6 +166,12 @@ class SpotifyClient:
         with self.token_cache.open("w", encoding="utf-8") as token_file:
             json.dump(token, token_file, indent=2)
 
+        try:
+            os.chmod(self.token_cache, 0o666)
+            os.chmod(self.token_cache.parent, 0o777)
+        except OSError:
+            pass
+
         self.token = token
 
     def _authorize(self) -> dict[str, Any]:
@@ -326,6 +332,7 @@ class MatrixDisplay:
         options.pwm_bits = args.pwm_bits
         options.limit_refresh_rate_hz = args.limit_refresh_rate_hz
         options.disable_hardware_pulsing = args.no_hardware_pulse
+        options.drop_privileges = False
 
         self.matrix = RGBMatrix(options=options)
         self.canvas = self.matrix.CreateFrameCanvas()
