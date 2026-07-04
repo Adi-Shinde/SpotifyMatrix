@@ -204,7 +204,28 @@ To fix this and get another 6 months of automation, you just need to clear the o
 You are now good for another 6 months!
 
 4. **Restart automation when done:** `sudo systemctl start spotifymatrix.service`
+Updating Auto Mode (systemd Service)
+To make this brightness change permanent for when the Pi boots up, you need to edit the background service file.
 
+Step 1: Open the service file
+
+Bash
+sudo nano /etc/systemd/system/spotifymatrix.service
+Step 2: Edit the ExecStart line
+Find the ExecStart= line and add --brightness 60 to the very end of it. It should look exactly like this:
+
+Ini, TOML
+ExecStart=/home/adi/Documents/SpotifyMatrix/.venv/bin/python3 spotify_matrix.py --rows 64 --cols 64 --chain-length 1 --parallel 1 --gpio-slowdown 5 --no-hardware-pulse --hardware-mapping adafruit-hat-pwm --brightness 60
+Step 3: Save and exit
+Press Ctrl+O, hit Enter to save, then press Ctrl+X to exit nano.
+
+Step 4: Reload and restart the service
+Run these commands to apply the changes to the background service:
+
+Bash
+sudo systemctl daemon-reload
+sudo systemctl restart spotifymatrix.service
+Your matrix will now automatically boot up at a much more comfortable 6/10 brightness!
 ```
 
 ```
