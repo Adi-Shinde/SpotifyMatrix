@@ -111,6 +111,10 @@ class SpotifyClient:
         self.token_cache = token_cache
         self.open_browser = open_browser
         self.token = self._load_token()
+        if self.token:
+            print(f"Spotify: Token loaded from {token_cache}", flush=True)
+        else:
+            print("Spotify: No token found in cache", flush=True)
 
     def get_currently_playing(self) -> dict[str, Any] | None:
         token = self._valid_access_token()
@@ -215,6 +219,7 @@ class SpotifyClient:
         return token
 
     def _refresh_access_token(self) -> None:
+        print("Spotify: Refreshing access token...", flush=True)
         refresh_token = self.token.get("refresh_token") if self.token else None
         if not refresh_token:
             self.token = self._authorize()
@@ -744,9 +749,15 @@ def poll_spotify(
     poll_seconds: float,
 ) -> None:
     last_status: str | None = None
+    first_poll = True
+    print("Spotify: Background polling thread started.", flush=True)
 
     while not stop_event.is_set():
         try:
+            if first_poll:
+                print("Spotify: Making initial API connection...", flush=True)
+                first_poll = False
+                
             playback = spotify.get_currently_playing()
             art = playback_art_from_response(playback)
 
@@ -823,9 +834,12 @@ def run(args: argparse.Namespace) -> None:
 
     display: MatrixDisplay | MockDisplay
     if args.mock_output:
+        print("Matrix: Initializing Mock Display...", flush=True)
         display = MockDisplay(args.mock_output)
     else:
+        print("Matrix: Initializing hardware RGB Matrix... (this may take a few seconds)", flush=True)
         display = MatrixDisplay(args)
+    print("Matrix: Initialization complete.", flush=True)
 
     size_x = args.cols
     size_y = args.rows
