@@ -108,7 +108,8 @@ sudo -E .venv/bin/python3 spotify_matrix.py \
   --parallel 1 \
   --gpio-slowdown 5 \
   --no-hardware-pulse \
-  --hardware-mapping adafruit-hat-pwm
+  --hardware-mapping adafruit-hat-pwm \
+  --brightness 60
 
 ```
 
