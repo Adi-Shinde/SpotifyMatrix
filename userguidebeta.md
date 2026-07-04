@@ -227,5 +227,41 @@ sudo systemctl daemon-reload
 sudo systemctl restart spotifymatrix.service
 Your matrix will now automatically boot up at a much more comfortable 6/10 brightness!
 ```
+. Updating Manual Mode
+When running the matrix directly from your terminal via SSH, just append --brightness 60 to the end of your command.
 
+Bash
+sudo -E .venv/bin/python3 spotify_matrix.py \
+  --rows 64 \
+  --cols 64 \
+  --chain-length 1 \
+  --parallel 1 \
+  --gpio-slowdown 5 \
+  --no-hardware-pulse \
+  --hardware-mapping adafruit-hat-pwm \
+  --brightness 60
+(Note: If you get an "unrecognized argument" error, change it to --led-brightness 60).
+
+2. Updating Auto Mode (systemd Service)
+To make this brightness change permanent for when the Pi boots up, you need to edit the background service file.
+
+Step 1: Open the service file
+
+Bash
+sudo nano /etc/systemd/system/spotifymatrix.service
+Step 2: Edit the ExecStart line
+Find the ExecStart= line and add --brightness 60 to the very end of it. It should look exactly like this:
+
+Ini, TOML
+ExecStart=/home/adi/Documents/SpotifyMatrix/.venv/bin/python3 spotify_matrix.py --rows 64 --cols 64 --chain-length 1 --parallel 1 --gpio-slowdown 5 --no-hardware-pulse --hardware-mapping adafruit-hat-pwm --brightness 60
+Step 3: Save and exit
+Press Ctrl+O, hit Enter to save, then press Ctrl+X to exit nano.
+
+Step 4: Reload and restart the service
+Run these commands to apply the changes to the background service:
+
+Bash
+sudo systemctl daemon-reload
+sudo systemctl restart spotifymatrix.service
+Your matrix will now automatically boot up at a much more comfortable 6/10 brightness!
 ```
