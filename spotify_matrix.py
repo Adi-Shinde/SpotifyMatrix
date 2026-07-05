@@ -95,6 +95,11 @@ def raise_http_error(response: HttpResponse, context: str) -> None:
     body = response.body.decode("utf-8", errors="replace")
     raise RuntimeError(f"{context} failed with HTTP {response.status}: {body}")
 
+class RateLimitException(Exception):
+    def __init__(self, retry_after: int) -> None:
+        super().__init__(f"Spotify API rate limited. Retry after {retry_after}s.")
+        self.retry_after = retry_after
+
 
 class SpotifyClient:
     def __init__(
@@ -134,9 +139,9 @@ class SpotifyClient:
             self._refresh_access_token()
             return self.get_currently_playing()
         if response.status == 429:
-            retry_after = int(response.headers.get("Retry-After", "5"))
-            time.sleep(max(retry_after, 1))
-            return None
+            retry_after = int(response.headers.get("Retry-After", "0"))
+            print(f"Spotify API: Rate limited (429)! Server requested wait of {retry_after} seconds.", flush=True)
+            raise RateLimitException(retry_after)
         if response.status != 200:
             raise_http_error(response, "Spotify currently-playing request")
 
@@ -754,6 +759,12 @@ def poll_spotify(
     first_poll = True
     print("Spotify: Background polling thread started.", flush=True)
 
+    idle_seconds = 20.0
+    active_seconds = 5.0
+    last_playing_time = time.time()
+    current_wait = active_seconds
+    backoff_multiplier = 1
+
     while not stop_event.is_set():
         try:
             if first_poll:
@@ -763,7 +774,16 @@ def poll_spotify(
             playback = spotify.get_currently_playing()
             art = playback_art_from_response(playback)
 
+            # Reset backoff on successful API call
+            backoff_multiplier = 1
+
             if art:
+                # Active playback detected
+                last_playing_time = time.time()
+                if current_wait != active_seconds:
+                    print(f"Spotify: Playback detected. Switching to active polling ({active_seconds}s).", flush=True)
+                current_wait = active_seconds
+
                 with state_lock:
                     needs_download = art.key != state.art_key or art.image_url != state.image_url
 
@@ -780,6 +800,12 @@ def poll_spotify(
 
                 status = f"art found, is_playing={art.is_playing}, title={art.title!r}"
             else:
+                # No playback detected
+                time_since_played = time.time() - last_playing_time
+                if time_since_played > 60.0 and current_wait != idle_seconds:
+                    print(f"Spotify: Idle for 1 minute. Switching to idle polling ({idle_seconds}s) to save quota.", flush=True)
+                    current_wait = idle_seconds
+
                 with state_lock:
                     state.art_key = None
                     state.image_url = None
@@ -792,10 +818,24 @@ def poll_spotify(
             if status != last_status:
                 print(f"Spotify: {status}", flush=True)
                 last_status = status
+
+            stop_event.wait(current_wait)
+
+        except RateLimitException as exc:
+            wait_time = exc.retry_after
+            if wait_time <= 0:
+                wait_time = active_seconds * backoff_multiplier
+                print(f"Spotify API: Rate limited without Retry-After header. Exponential backoff: {wait_time}s...", flush=True)
+                backoff_multiplier = min(backoff_multiplier * 2, 64) # Cap backoff
+            
+            stop_event.wait(wait_time)
+
         except Exception as exc:
             print(f"Spotify poll failed: {exc}", flush=True)
-
-        stop_event.wait(poll_seconds)
+            wait_time = active_seconds * backoff_multiplier
+            print(f"Spotify API: Connection error. Exponential backoff: {wait_time}s...", flush=True)
+            backoff_multiplier = min(backoff_multiplier * 2, 64)
+            stop_event.wait(wait_time)
 
 
 def run(args: argparse.Namespace) -> None:
