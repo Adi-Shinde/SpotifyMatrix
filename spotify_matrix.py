@@ -876,20 +876,21 @@ def poll_spotify(
                     state.artist = ""
                 status = "no currently playing item"
 
-            # Prepend active/idle polling state to the status log
-            if current_wait == active_seconds:
-                time_until_idle = max(0, int(60.0 - (time.time() - last_playing_time)))
-                prefix = f"[Active | {time_until_idle}s to idle]"
-            else:
-                prefix = "[Idle]"
-            
-            full_status = f"{prefix} {status}"
-
-            if full_status != last_status:
+            # Wait in 1-second intervals to print the live countdown
+            for _ in range(int(current_wait)):
+                if stop_event.is_set():
+                    break
+                
+                if current_wait == active_seconds:
+                    time_until_idle = max(0, int(60.0 - (time.time() - last_playing_time)))
+                    prefix = f"[Active | {time_until_idle}s to idle]"
+                else:
+                    prefix = "[Idle]"
+                
+                full_status = f"{prefix} {status}"
                 print(f"Spotify: {full_status}", flush=True)
-                last_status = full_status
-
-            stop_event.wait(current_wait)
+                
+                stop_event.wait(1.0)
 
         except RateLimitException as exc:
             wait_time = exc.retry_after
