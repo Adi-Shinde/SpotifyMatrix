@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
+import functools
 from io import BytesIO
 import json
+import math
 import os
 import secrets
 import threading
@@ -416,11 +419,21 @@ def playback_art_from_response(playback: dict[str, Any] | None) -> PlaybackArt |
 
 
 def download_image(url: str) -> Image.Image:
-    import requests
+    request = urllib.request.Request(url)
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return Image.open(BytesIO(response.read())).convert("RGB")
 
-    response = requests.get(url, timeout=15)
-    response.raise_for_status()
-    return Image.open(BytesIO(response.content)).convert("RGB")
+
+_disc_mask_cache: dict[int, Image.Image] = {}
+
+
+def _get_disc_mask(size: int) -> Image.Image:
+    """Return a cached circular mask for the given size."""
+    if size not in _disc_mask_cache:
+        mask = Image.new("L", (size, size), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
+        _disc_mask_cache[size] = mask
+    return _disc_mask_cache[size]
 
 
 def render_record(art: Image.Image | None, angle: float, size: int) -> Image.Image:
@@ -428,24 +441,33 @@ def render_record(art: Image.Image | None, angle: float, size: int) -> Image.Ima
     if art is None:
         return frame.convert("RGB")
 
-    margin = 0
     disc_size = size
     # The album art is the record surface: rotate it first, then cut it into a circular disk.
     art_square = ImageOps.fit(art, (disc_size, disc_size), method=Image.Resampling.LANCZOS)
     rotated = art_square.rotate(angle, resample=Image.Resampling.BICUBIC)
 
-    disc_mask = Image.new("L", (disc_size, disc_size), 0)
-    mask_draw = ImageDraw.Draw(disc_mask)
-    mask_draw.ellipse((0, 0, disc_size - 1, disc_size - 1), fill=255)
-    frame.paste(rotated.convert("RGBA"), (margin, margin), disc_mask)
+    disc_mask = _get_disc_mask(disc_size)
+    frame.paste(rotated.convert("RGBA"), (0, 0), disc_mask)
 
     draw = ImageDraw.Draw(frame, "RGBA")
-    outer = (margin, margin, size - margin - 1, size - margin - 1)
-    draw.ellipse(outer, outline=(220, 220, 220, 200), width=1)
+    draw.ellipse((0, 0, size - 1, size - 1), outline=(220, 220, 220, 200), width=1)
 
     center = size // 2
     label_radius = max(3, size // 16)
     hole_radius = max(1, size // 40)
+
+    # Vinyl groove rings — subtle concentric arcs between label and outer edge
+    groove_start = label_radius + 2
+    groove_end = (size // 2) - 2
+    groove_step = max(3, size // 16)
+    for r in range(groove_start, groove_end, groove_step):
+        draw.ellipse(
+            (center - r, center - r, center + r, center + r),
+            outline=(0, 0, 0, 35),
+            width=1,
+        )
+
+    # Center label
     draw.ellipse(
         (
             center - label_radius,
@@ -456,6 +478,7 @@ def render_record(art: Image.Image | None, angle: float, size: int) -> Image.Ima
         fill=(16, 16, 16, 210),
         outline=(220, 220, 220, 90),
     )
+    # Spindle hole
     draw.ellipse(
         (
             center - hole_radius,
@@ -479,6 +502,7 @@ def render_idle(size: int) -> Image.Image:
     return frame
 
 
+@functools.lru_cache(maxsize=16)
 def get_font(size: int = 9) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
     try:
         return ImageFont.load_default(size=size)
@@ -489,6 +513,7 @@ def get_font(size: int = 9) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
             return ImageFont.load_default()
 
 
+@functools.lru_cache(maxsize=16)
 def get_text_height(font_size: int = 9) -> int:
     font = get_font(font_size)
     draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
@@ -497,63 +522,83 @@ def get_text_height(font_size: int = 9) -> int:
 
 
 def render_clock(size: int) -> Image.Image:
-    import datetime
-    import math
     frame = Image.new("RGB", (size, size), (0, 0, 0))
     draw = ImageDraw.Draw(frame)
     now = datetime.datetime.now()
-    
+
+    # Spotify brand green
+    SPOTIFY_GREEN = (30, 215, 96)
+
     # Text content
     day_str = now.strftime("%a").upper()               # e.g., "FRI"
     time_str = now.strftime("%I:%M %p").lstrip("0")    # e.g., "4:05 PM"
     date_str = now.strftime("%b %d").upper()           # e.g., "OCT 25"
-    
-    # Make fonts a bit smaller
+
     small_font = get_font(max(8, size // 8))
     time_font = get_font(max(10, size // 5))
-    
+
     # Calculate bounding boxes
     day_bbox = draw.textbbox((0, 0), day_str, font=small_font)
     time_bbox = draw.textbbox((0, 0), time_str, font=time_font)
     date_bbox = draw.textbbox((0, 0), date_str, font=small_font)
-    
+
     day_h = day_bbox[3] - day_bbox[1]
     time_h = time_bbox[3] - time_bbox[1]
     date_h = date_bbox[3] - date_bbox[1]
-    
+
     # Layout gap and total height
     gap = 2
     total_h = day_h + gap + time_h + gap + date_h
     start_y = (size - total_h) // 2
-    
-    # Draw Day
+
+    # Draw Day — dim Spotify green
     day_x = (size - (day_bbox[2] - day_bbox[0])) // 2
-    draw.text((day_x, start_y - day_bbox[1]), day_str, fill=(130, 170, 255), font=small_font)
-    
+    draw.text((day_x, start_y - day_bbox[1]), day_str, fill=SPOTIFY_GREEN, font=small_font)
+
     # Draw Time (AM/PM)
     time_y = start_y + day_h + gap
     time_x = (size - (time_bbox[2] - time_bbox[0])) // 2
     draw.text((time_x, time_y - time_bbox[1]), time_str, fill=(255, 255, 255), font=time_font)
-    
+
     # Draw Date
     date_y = time_y + time_h + gap
     date_x = (size - (date_bbox[2] - date_bbox[0])) // 2
     draw.text((date_x, date_y - date_bbox[1]), date_str, fill=(180, 180, 180), font=small_font)
-    
-    # Thin outer circle
+
+    # Outer circle ring
     margin = 1
-    draw.ellipse((margin, margin, size - margin - 1, size - margin - 1), outline=(60, 60, 90), width=1)
-    
-    # Sweeping seconds red dot
-    second_angle = (now.second / 60.0) * 360 - 90
-    rad = math.radians(second_angle)
+    draw.ellipse((margin, margin, size - margin - 1, size - margin - 1), outline=(50, 50, 70), width=1)
+
+    # Hour tick marks around the ring
     cx = size / 2.0
     cy = size / 2.0
-    radius = (size - margin * 2) / 2.0
-    sx = cx + math.cos(rad) * radius
-    sy = cy + math.sin(rad) * radius
-    draw.ellipse((sx - 1.5, sy - 1.5, sx + 1.5, sy + 1.5), fill=(230, 40, 40))
-    
+    outer_r = (size - margin * 2) / 2.0
+    inner_r = outer_r - max(2, size // 20)
+    for hour in range(12):
+        tick_angle = math.radians(hour * 30 - 90)
+        x1 = cx + math.cos(tick_angle) * outer_r
+        y1 = cy + math.sin(tick_angle) * outer_r
+        x2 = cx + math.cos(tick_angle) * inner_r
+        y2 = cy + math.sin(tick_angle) * inner_r
+        tick_color = (100, 100, 120) if hour % 3 != 0 else (160, 160, 180)
+        draw.line((x1, y1, x2, y2), fill=tick_color, width=1)
+
+    # Sweeping seconds dot — Spotify green
+    second_frac = now.second + now.microsecond / 1_000_000.0
+    second_angle = (second_frac / 60.0) * 360 - 90
+    rad = math.radians(second_angle)
+    dot_r = outer_r - 1
+    sx = cx + math.cos(rad) * dot_r
+    sy = cy + math.sin(rad) * dot_r
+    draw.ellipse((sx - 1.5, sy - 1.5, sx + 1.5, sy + 1.5), fill=SPOTIFY_GREEN)
+
+    # Breathing pulse dot (bottom center) — slow fade in/out to show script is alive
+    pulse = (math.sin(time.time() * 2.0) + 1.0) / 2.0  # 0.0 to 1.0
+    pulse_brightness = int(40 + pulse * 80)
+    pulse_color = (0, pulse_brightness, int(pulse_brightness * 0.45))
+    pulse_y = size - margin - 3
+    draw.ellipse((cx - 1, pulse_y - 1, cx + 1, pulse_y + 1), fill=pulse_color)
+
     return frame
 
 
@@ -608,6 +653,24 @@ def draw_scrolling_text(
             draw.text((cur_x, y_pos), full_unit, fill=text_color, font=font)
         cur_x += unit_w
 
+    # Gradient fade edges — text smoothly emerges from / fades into black
+    fade_width = min(6, size_x // 10)
+    for i in range(fade_width):
+        alpha = int(255 * (i / fade_width))
+        fade_color = tuple(int(c * alpha / 255) for c in bg_color) or (0, 0, 0)
+        # Left edge fade (opaque → transparent)
+        left_x = i
+        for y in range(banner_y0, banner_y1 + 1):
+            orig = image.getpixel((left_x, y))
+            blended = tuple(int(orig[c] * i / fade_width) for c in range(3))
+            image.putpixel((left_x, y), blended)
+        # Right edge fade (transparent → opaque)
+        right_x = size_x - 1 - i
+        for y in range(banner_y0, banner_y1 + 1):
+            orig = image.getpixel((right_x, y))
+            blended = tuple(int(orig[c] * i / fade_width) for c in range(3))
+            image.putpixel((right_x, y), blended)
+
     return image
 
 
@@ -620,7 +683,6 @@ def create_full_frame(
     size_y: int,
     args: argparse.Namespace,
 ) -> Image.Image:
-    import datetime
     has_text = bool(display_text) and not args.no_text
     if has_text:
         text_h = get_text_height(args.text_font_size)
@@ -753,7 +815,6 @@ def poll_spotify(
     state: SharedPlaybackState,
     state_lock: threading.Lock,
     stop_event: threading.Event,
-    poll_seconds: float,
 ) -> None:
     last_status: str | None = None
     first_poll = True
@@ -881,7 +942,16 @@ def run(args: argparse.Namespace) -> None:
     else:
         print("Matrix: Initializing hardware RGB Matrix... (this may take a few seconds)", flush=True)
         display = MatrixDisplay(args)
-    print("Matrix: Initialization complete.", flush=True)
+
+    # Startup info banner
+    print("\n" + "=" * 48, flush=True)
+    print("  Spotify Matrix — Ready", flush=True)
+    print("=" * 48, flush=True)
+    print(f"  Display:    {args.cols}x{args.rows}  brightness={args.brightness}", flush=True)
+    print(f"  Hardware:   {args.hardware_mapping}  gpio-slowdown={args.gpio_slowdown}", flush=True)
+    print(f"  Animation:  {args.fps} FPS  {args.rpm} RPM  transition={args.transition}", flush=True)
+    print(f"  Polling:    5s active / 20s idle (dynamic)", flush=True)
+    print("=" * 48 + "\n", flush=True)
 
     size_x = args.cols
     size_y = args.rows
@@ -905,7 +975,7 @@ def run(args: argparse.Namespace) -> None:
     stop_event = threading.Event()
     poll_thread = threading.Thread(
         target=poll_spotify,
-        args=(spotify, playback_state, playback_lock, stop_event, args.poll_seconds),
+        args=(spotify, playback_state, playback_lock, stop_event),
         daemon=True,
     )
     poll_thread.start()
@@ -929,6 +999,13 @@ def run(args: argparse.Namespace) -> None:
 
     transition_active: bool = False
     transition_start: float = 0.0
+
+    # Spin easing state
+    SPIN_EASE_DURATION = 1.0  # seconds to ramp up/down
+    current_rpm: float = 0.0
+    was_playing: bool = False
+    spin_transition_start: float = 0.0
+    spin_from_rpm: float = 0.0
 
     try:
         while True:
@@ -995,8 +1072,23 @@ def run(args: argparse.Namespace) -> None:
             last_art_image = current_art_image
             last_display_text = display_text
 
-            if not is_idle_state and is_playing and current_art_image is not None:
-                angle = (angle - 360.0 * (args.rpm / 60.0) * delta) % 360.0
+            # Spin easing — smoothly ramp RPM up or down
+            target_rpm = args.rpm if (not is_idle_state and is_playing and current_art_image is not None) else 0.0
+            if (is_playing and not was_playing) or (not is_playing and was_playing):
+                spin_from_rpm = current_rpm
+                spin_transition_start = now
+            was_playing = is_playing
+
+            spin_elapsed = now - spin_transition_start
+            if spin_elapsed < SPIN_EASE_DURATION:
+                t = spin_elapsed / SPIN_EASE_DURATION
+                eased_t = t * t * (3.0 - 2.0 * t)  # smoothstep
+                current_rpm = spin_from_rpm + (target_rpm - spin_from_rpm) * eased_t
+            else:
+                current_rpm = target_rpm
+
+            if current_rpm > 0.01:
+                angle = (angle - 360.0 * (current_rpm / 60.0) * delta) % 360.0
             
             if not is_idle_state:
                 scroll_x += args.text_speed * delta
@@ -1102,7 +1194,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Avoid Pi onboard sound conflict at the cost of more possible flicker.",
     )
-    parser.add_argument("--poll-seconds", type=positive_float, default=2.0)
     parser.add_argument("--fps", type=positive_float, default=20.0)
     parser.add_argument("--rpm", type=positive_float, default=20.0)
     parser.add_argument("--token-cache", type=Path, default=Path(".cache/spotify_token.json"))
