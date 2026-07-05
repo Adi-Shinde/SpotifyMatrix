@@ -697,6 +697,41 @@ def create_full_frame(
     cd_y = (banner_h + gap) if (has_text and args.text_position == "top") else 0
     frame.paste(cd_img, (cd_x, cd_y))
 
+    # Draw clock overlay
+    now = datetime.datetime.now()
+    hour_str = now.strftime("%I").lstrip("0")
+    minute_str = now.strftime("%M")
+    
+    clock_font_size = max(9, args.text_font_size + 1)
+    clock_font = get_font(clock_font_size)
+    dummy_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    
+    hour_bbox = dummy_draw.textbbox((0, 0), hour_str, font=clock_font)
+    minute_bbox = dummy_draw.textbbox((0, 0), minute_str, font=clock_font)
+    
+    hour_h = hour_bbox[3] - hour_bbox[1]
+    minute_w = minute_bbox[2] - minute_bbox[0]
+    minute_h = minute_bbox[3] - minute_bbox[1]
+
+    draw = ImageDraw.Draw(frame)
+    if args.text_position == "top":
+        clock_y = size_y - max(hour_h, minute_h) - 1
+    else:
+        clock_y = 1
+
+    hour_x = 1
+    minute_x = size_x - minute_w - 1
+
+    # Text outline for visibility
+    for dx in [-1, 0, 1]:
+        for dy in [-1, 0, 1]:
+            if dx != 0 or dy != 0:
+                draw.text((hour_x + dx, clock_y - hour_bbox[1] + dy), hour_str, fill=(0, 0, 0), font=clock_font)
+                draw.text((minute_x + dx, clock_y - minute_bbox[1] + dy), minute_str, fill=(0, 0, 0), font=clock_font)
+
+    draw.text((hour_x, clock_y - hour_bbox[1]), hour_str, fill=(200, 200, 200), font=clock_font)
+    draw.text((minute_x, clock_y - minute_bbox[1]), minute_str, fill=(200, 200, 200), font=clock_font)
+
     if has_text:
         frame = draw_scrolling_text(
             frame,
@@ -841,9 +876,18 @@ def poll_spotify(
                     state.artist = ""
                 status = "no currently playing item"
 
-            if status != last_status:
-                print(f"Spotify: {status}", flush=True)
-                last_status = status
+            # Prepend active/idle polling state to the status log
+            if current_wait == active_seconds:
+                time_until_idle = max(0, int(60.0 - (time.time() - last_playing_time)))
+                prefix = f"[Active | {time_until_idle}s to idle]"
+            else:
+                prefix = "[Idle]"
+            
+            full_status = f"{prefix} {status}"
+
+            if full_status != last_status:
+                print(f"Spotify: {full_status}", flush=True)
+                last_status = full_status
 
             stop_event.wait(current_wait)
 
@@ -921,7 +965,7 @@ def run(args: argparse.Namespace) -> None:
     print(f"  Display:    {args.cols}x{args.rows}  brightness={args.brightness}", flush=True)
     print(f"  Hardware:   {args.hardware_mapping}  gpio-slowdown={args.gpio_slowdown}", flush=True)
     print(f"  Animation:  {args.fps} FPS  {args.rpm} RPM  transition={args.transition}", flush=True)
-    print(f"  Polling:    5s active / 20s idle (dynamic)", flush=True)
+    print(f"  Polling:    5s active / 30s idle (dynamic)", flush=True)
     print("=" * 48 + "\n", flush=True)
 
     size_x = args.cols
