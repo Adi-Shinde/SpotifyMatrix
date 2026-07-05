@@ -10,6 +10,7 @@ import json
 import math
 import os
 import secrets
+import sys
 import threading
 import time
 import urllib.parse
@@ -134,7 +135,8 @@ class SpotifyClient:
             headers={"Authorization": f"Bearer {token}"},
             timeout=5,
         )
-        print(f"Spotify API: Received HTTP {response.status}", flush=True)
+        if sys.stdout.isatty() or response.status != 200:
+            print(f"Spotify API: Received HTTP {response.status}", flush=True)
 
         if response.status == 204:
             return None
@@ -876,21 +878,34 @@ def poll_spotify(
                     state.artist = ""
                 status = "no currently playing item"
 
-            # Wait in 1-second intervals to print the live countdown
-            for _ in range(int(current_wait)):
-                if stop_event.is_set():
-                    break
-                
-                if current_wait == active_seconds:
-                    time_until_idle = max(0, int(60.0 - (time.time() - last_playing_time)))
-                    prefix = f"[Active | {time_until_idle}s to idle]"
-                else:
-                    prefix = "[Idle]"
-                
-                full_status = f"{prefix} {status}"
-                print(f"Spotify: {full_status}", flush=True)
-                
-                stop_event.wait(1.0)
+            # Prepend active/idle polling state to the status log
+            if current_wait == active_seconds:
+                time_until_idle = max(0, int(60.0 - (time.time() - last_playing_time)))
+                prefix = f"[Active | {time_until_idle}s to idle]"
+            else:
+                prefix = "[Idle]"
+            
+            is_interactive = sys.stdout.isatty()
+
+            if is_interactive:
+                # Verbose mode for manual terminal usage: tick every second
+                for _ in range(int(current_wait)):
+                    if stop_event.is_set():
+                        break
+                    
+                    if current_wait == active_seconds:
+                        time_until_idle = max(0, int(60.0 - (time.time() - last_playing_time)))
+                        prefix = f"[Active | {time_until_idle}s to idle]"
+                    else:
+                        prefix = "[Idle]"
+                    
+                    tick_status = f"{prefix} {status}"
+                    print(f"Spotify: {tick_status}", flush=True)
+                    stop_event.wait(1.0)
+            else:
+                # Silent mode for systemd/auto usage: save CPU and SD card.
+                # No periodic status printing is done in the background to prevent journal bloat.
+                stop_event.wait(current_wait)
 
         except RateLimitException as exc:
             wait_time = exc.retry_after
