@@ -838,13 +838,19 @@ def poll_spotify(
             with state_lock:
                 state.is_connected = True
 
-            if art:
+            if art and art.is_playing:
                 # Active playback detected
                 last_playing_time = time.time()
                 if current_wait != active_seconds:
-                    print(f"Spotify: Playback detected. Switching to active polling ({active_seconds}s).", flush=True)
+                    print(f"Spotify: Playback resumed. Switching to active polling ({active_seconds}s).", flush=True)
                 current_wait = active_seconds
 
+            time_since_played = time.time() - last_playing_time
+            if time_since_played > 60.0 and current_wait != idle_seconds:
+                print(f"Spotify: Idle for 1 minute. Switching to idle polling ({idle_seconds}s) to save quota.", flush=True)
+                current_wait = idle_seconds
+
+            if art:
                 with state_lock:
                     needs_download = art.key != state.art_key or art.image_url != state.image_url
 
@@ -861,12 +867,6 @@ def poll_spotify(
 
                 status = f"art found, is_playing={art.is_playing}, title={art.title!r}"
             else:
-                # No playback detected
-                time_since_played = time.time() - last_playing_time
-                if time_since_played > 60.0 and current_wait != idle_seconds:
-                    print(f"Spotify: Idle for 1 minute. Switching to idle polling ({idle_seconds}s) to save quota.", flush=True)
-                    current_wait = idle_seconds
-
                 with state_lock:
                     state.art_key = None
                     state.image_url = None
