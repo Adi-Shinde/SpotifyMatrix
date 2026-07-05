@@ -54,6 +54,7 @@ class SharedPlaybackState:
     is_playing: bool = False
     title: str = ""
     artist: str = ""
+    is_connected: bool = True
 
 
 @dataclass
@@ -456,17 +457,6 @@ def render_record(art: Image.Image | None, angle: float, size: int) -> Image.Ima
     label_radius = max(3, size // 16)
     hole_radius = max(1, size // 40)
 
-    # Vinyl groove rings — subtle concentric arcs between label and outer edge
-    groove_start = label_radius + 2
-    groove_end = (size // 2) - 2
-    groove_step = max(3, size // 16)
-    for r in range(groove_start, groove_end, groove_step):
-        draw.ellipse(
-            (center - r, center - r, center + r, center + r),
-            outline=(0, 0, 0, 35),
-            width=1,
-        )
-
     # Center label
     draw.ellipse(
         (
@@ -521,7 +511,7 @@ def get_text_height(font_size: int = 9) -> int:
     return max(1, bbox[3] - bbox[1])
 
 
-def render_clock(size: int) -> Image.Image:
+def render_clock(size: int, is_connected: bool = True) -> Image.Image:
     frame = Image.new("RGB", (size, size), (0, 0, 0))
     draw = ImageDraw.Draw(frame)
     now = datetime.datetime.now()
@@ -583,21 +573,27 @@ def render_clock(size: int) -> Image.Image:
         tick_color = (100, 100, 120) if hour % 3 != 0 else (160, 160, 180)
         draw.line((x1, y1, x2, y2), fill=tick_color, width=1)
 
-    # Sweeping seconds dot — Spotify green
-    second_frac = now.second + now.microsecond / 1_000_000.0
-    second_angle = (second_frac / 60.0) * 360 - 90
+    # Sweeping seconds dot — tick once per second
+    second_angle = (now.second / 60.0) * 360 - 90
     rad = math.radians(second_angle)
     dot_r = outer_r - 1
     sx = cx + math.cos(rad) * dot_r
     sy = cy + math.sin(rad) * dot_r
     draw.ellipse((sx - 1.5, sy - 1.5, sx + 1.5, sy + 1.5), fill=SPOTIFY_GREEN)
 
-    # Breathing pulse dot (bottom center) — slow fade in/out to show script is alive
+    # Connection status pulse dot (bottom right corner, with margins)
     pulse = (math.sin(time.time() * 2.0) + 1.0) / 2.0  # 0.0 to 1.0
-    pulse_brightness = int(40 + pulse * 80)
-    pulse_color = (0, pulse_brightness, int(pulse_brightness * 0.45))
-    pulse_y = size - margin - 3
-    draw.ellipse((cx - 1, pulse_y - 1, cx + 1, pulse_y + 1), fill=pulse_color)
+    pulse_brightness = int(50 + pulse * 150)
+    if is_connected:
+        pulse_color = (0, pulse_brightness, int(pulse_brightness * 0.3)) # Green
+    else:
+        pulse_color = (pulse_brightness, 0, 0) # Red
+    
+    pulse_margin = max(4, size // 12)
+    pulse_x = size - pulse_margin
+    pulse_y = size - pulse_margin
+    pulse_r = 2 # slightly bigger than 1
+    draw.ellipse((pulse_x - pulse_r, pulse_y - pulse_r, pulse_x + pulse_r, pulse_y + pulse_r), fill=pulse_color)
 
     return frame
 
@@ -701,39 +697,6 @@ def create_full_frame(
     cd_y = (banner_h + gap) if (has_text and args.text_position == "top") else 0
     frame.paste(cd_img, (cd_x, cd_y))
 
-    now = datetime.datetime.now()
-    hour_str = now.strftime("%I").lstrip("0")
-    minute_str = now.strftime("%M")
-    
-    clock_font_size = max(9, args.text_font_size + 1)
-    clock_font = get_font(clock_font_size)
-    dummy_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    
-    hour_bbox = dummy_draw.textbbox((0, 0), hour_str, font=clock_font)
-    minute_bbox = dummy_draw.textbbox((0, 0), minute_str, font=clock_font)
-    
-    hour_h = hour_bbox[3] - hour_bbox[1]
-    minute_w = minute_bbox[2] - minute_bbox[0]
-    minute_h = minute_bbox[3] - minute_bbox[1]
-
-    draw = ImageDraw.Draw(frame)
-    if args.text_position == "top":
-        clock_y = size_y - max(hour_h, minute_h) - 1
-    else:
-        clock_y = 1
-
-    hour_x = 1
-    minute_x = size_x - minute_w - 1
-
-    for dx in [-1, 0, 1]:
-        for dy in [-1, 0, 1]:
-            if dx != 0 or dy != 0:
-                draw.text((hour_x + dx, clock_y - hour_bbox[1] + dy), hour_str, fill=(0, 0, 0), font=clock_font)
-                draw.text((minute_x + dx, clock_y - minute_bbox[1] + dy), minute_str, fill=(0, 0, 0), font=clock_font)
-
-    draw.text((hour_x, clock_y - hour_bbox[1]), hour_str, fill=(200, 200, 200), font=clock_font)
-    draw.text((minute_x, clock_y - minute_bbox[1]), minute_str, fill=(200, 200, 200), font=clock_font)
-
     if has_text:
         frame = draw_scrolling_text(
             frame,
@@ -820,7 +783,7 @@ def poll_spotify(
     first_poll = True
     print("Spotify: Background polling thread started.", flush=True)
 
-    idle_seconds = 20.0
+    idle_seconds = 30.0
     active_seconds = 5.0
     last_playing_time = time.time()
     current_wait = active_seconds
@@ -835,8 +798,10 @@ def poll_spotify(
             playback = spotify.get_currently_playing()
             art = playback_art_from_response(playback)
 
-            # Reset backoff on successful API call
+            # Reset backoff and mark connected on successful API call
             backoff_multiplier = 1
+            with state_lock:
+                state.is_connected = True
 
             if art:
                 # Active playback detected
@@ -888,7 +853,11 @@ def poll_spotify(
                 wait_time = active_seconds * backoff_multiplier
                 print(f"Spotify API: Rate limited without Retry-After header. Exponential backoff: {wait_time}s...", flush=True)
                 backoff_multiplier = min(backoff_multiplier * 2, 64) # Cap backoff
+            else:
+                print(f"Spotify API: Rate limited. Retrying after {wait_time}s...", flush=True)
             
+            with state_lock:
+                state.is_connected = False
             stop_event.wait(wait_time)
 
         except Exception as exc:
@@ -896,6 +865,8 @@ def poll_spotify(
             wait_time = active_seconds * backoff_multiplier
             print(f"Spotify API: Connection error. Exponential backoff: {wait_time}s...", flush=True)
             backoff_multiplier = min(backoff_multiplier * 2, 64)
+            with state_lock:
+                state.is_connected = False
             stop_event.wait(wait_time)
 
 
@@ -1093,8 +1064,11 @@ def run(args: argparse.Namespace) -> None:
             if not is_idle_state:
                 scroll_x += args.text_speed * delta
 
+            with playback_lock:
+                is_connected = playback_state.is_connected
+
             if is_idle_state:
-                new_frame = render_clock(size)
+                new_frame = render_clock(size, is_connected)
             else:
                 new_frame = create_full_frame(
                     current_art_image,
