@@ -1005,7 +1005,7 @@ def render_lyrics(
     """Render lyrics as a smooth vertically-scrolling column or popping lines."""
     frame = Image.new("RGB", (size, size), (0, 0, 0))
     draw = ImageDraw.Draw(frame)
-    font = get_font(LYRICS_FONT_SIZE)
+    font = get_font(LYRICS_FONT_SIZE if style == "scroll" else 8)
 
     # Calculate estimated progress
     if is_playing and fetch_time > 0:
