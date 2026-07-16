@@ -132,6 +132,9 @@ class SharedPlaybackState:
     display_mode: str = "default"  # "default", "cd", "lyrics", "clock"
     effective_mode: str = "cd"  # what is actually rendering right now
     lyrics_style: str = "scroll"  # "scroll" or "pop"
+    smart_scroll: bool = True  # time-proportional horizontal scrolling
+    scroll_font_size: int = 9  # font size for scroll mode
+    pop_font_size: int = 8  # font size for pop mode
     spin_speed: float = 20.0  # RPM
     text_scroll_speed: float = 12.0  # px/s
     poll_interval: float = 5.0  # seconds (active polling)
@@ -141,6 +144,8 @@ class SharedPlaybackState:
     _default_spin_speed: float = 20.0
     _default_text_scroll_speed: float = 12.0
     _default_lyrics_style: str = "scroll"
+    _default_scroll_font_size: int = 9
+    _default_pop_font_size: int = 8
 
 
 @dataclass
@@ -993,6 +998,81 @@ LYRICS_SCROLL_DURATION = 0.4  # seconds for smooth scroll animation
 LYRICS_H_SCROLL_SPEED = 15.0  # px/s for horizontal overflow scroll
 
 
+def _get_line_duration_ms(lyrics: list[tuple[int, str]], idx: int, total_duration_ms: int) -> int:
+    """How long a lyric line is displayed before the next one starts."""
+    if idx < 0 or idx >= len(lyrics):
+        return 3000  # fallback
+    start = lyrics[idx][0]
+    if idx + 1 < len(lyrics):
+        end = lyrics[idx + 1][0]
+    else:
+        end = total_duration_ms if total_duration_ms > 0 else start + 5000
+    return max(200, end - start)  # at least 200ms
+
+
+def _smart_h_scroll_x(
+    text_w: int, size: int, time_on_screen_ms: int, line_duration_ms: int,
+) -> int:
+    """Calculate x offset for smart time-proportional horizontal scroll.
+
+    Always starts at x=2 (first word visible).  Scrolls left proportionally
+    so the end of the text is reached right as the line finishes.
+    Uses ease-in-out for natural feel.
+    """
+    overflow = text_w - size + 4  # 4px right padding
+    if overflow <= 0:
+        return (size - text_w) // 2  # centered
+
+    # Leave a small margin at start and end of the line duration
+    margin_ms = min(300, line_duration_ms // 6)
+    scroll_window = max(1, line_duration_ms - margin_ms * 2)
+    t_in_scroll = time_on_screen_ms - margin_ms
+
+    if t_in_scroll <= 0:
+        return 2  # first word visible
+    if t_in_scroll >= scroll_window:
+        return 2 - overflow  # last word visible
+
+    # Ease-in-out cubic
+    frac = t_in_scroll / scroll_window
+    if frac < 0.5:
+        eased = 4.0 * frac * frac * frac
+    else:
+        eased = 1.0 - (-2.0 * frac + 2.0) ** 3 / 2.0
+
+    return 2 - int(eased * overflow)
+
+
+def _legacy_h_scroll_x(
+    text_w: int, size: int, now_mono: float, is_active: bool,
+    time_on_screen_ms: int,
+) -> int:
+    """Legacy horizontal scroll (non-smart): ping-pong for active, static for inactive."""
+    overflow = text_w - size + 4
+    if overflow <= 0:
+        return (size - text_w) // 2
+
+    if not is_active:
+        return 2  # non-active lines: show start, no scroll
+
+    # Active line: ping-pong scroll
+    scroll_speed = 15.0  # px/s
+    cycle_duration = overflow / scroll_speed
+    pause = 1.0
+    total_cycle = pause + cycle_duration + pause + cycle_duration
+    t = (time_on_screen_ms / 1000.0) % total_cycle
+    if t < pause:
+        return 2
+    elif t < pause + cycle_duration:
+        frac = (t - pause) / cycle_duration
+        return 2 - int(frac * overflow)
+    elif t < pause * 2 + cycle_duration:
+        return 2 - overflow
+    else:
+        frac = (t - pause * 2 - cycle_duration) / cycle_duration
+        return 2 - overflow + int(frac * overflow)
+
+
 def render_lyrics(
     size: int,
     lyrics: list[tuple[int, str]] | None,
@@ -1001,11 +1081,13 @@ def render_lyrics(
     fetch_time: float,
     stored_progress_ms: int,
     style: str = "scroll",
+    smart_scroll: bool = True,
+    font_size: int = 9,
 ) -> Image.Image:
-    """Render lyrics as a smooth vertically-scrolling column or popping lines."""
+    """Render lyrics with smooth scrolling or 3-line pop, with optional smart scroll."""
     frame = Image.new("RGB", (size, size), (0, 0, 0))
     draw = ImageDraw.Draw(frame)
-    font = get_font(LYRICS_FONT_SIZE if style == "scroll" else 8)
+    font = get_font(font_size)
 
     # Calculate estimated progress
     if is_playing and fetch_time > 0:
@@ -1034,19 +1116,28 @@ def render_lyrics(
         idx = get_current_lyric_index(lyrics, estimated_progress)
         now_mono = time.monotonic()
 
+        # Common: time the current line has been on screen
+        if idx >= 0:
+            time_on_screen_ms = max(0, estimated_progress - lyrics[idx][0])
+            line_dur_ms = _get_line_duration_ms(lyrics, idx, duration_ms)
+        else:
+            time_on_screen_ms = 0
+            line_dur_ms = 3000
+
         if style == "scroll":
-            # Smooth vertical scroll: when the active lyric index changes,
-            # we animate the Y offset over LYRICS_SCROLL_DURATION seconds.
+            # Smooth vertical scroll animation
+            line_height = max(10, font_size + 4)
+            center_y = size // 2 - font_size // 2
+
             if idx != _lyrics_scroll_state["last_idx"]:
                 _lyrics_scroll_state["last_idx"] = idx
-                _lyrics_scroll_state["target_y"] = float(idx * LYRICS_LINE_HEIGHT)
+                _lyrics_scroll_state["target_y"] = float(idx * line_height)
                 _lyrics_scroll_state["transition_start"] = now_mono
 
             target_y = _lyrics_scroll_state["target_y"]
             elapsed = now_mono - _lyrics_scroll_state["transition_start"]
 
             if elapsed < LYRICS_SCROLL_DURATION:
-                # Ease-out cubic
                 t = elapsed / LYRICS_SCROLL_DURATION
                 eased = 1.0 - (1.0 - t) ** 3
                 old_y = _lyrics_scroll_state["scroll_y"]
@@ -1055,15 +1146,11 @@ def render_lyrics(
                 current_y = target_y
                 _lyrics_scroll_state["scroll_y"] = target_y
 
-            # When animation completes, store final position
             if elapsed >= LYRICS_SCROLL_DURATION:
                 _lyrics_scroll_state["scroll_y"] = target_y
 
-            # Render visible lyrics lines as a scrolling column
-            # Active line Y = LYRICS_CENTER_Y, other lines offset by LYRICS_LINE_HEIGHT
-            # The scroll offset determines which line is at center
-            visible_range = 5  # how many lines above/below to render
-            fade_zone = 12  # pixels from top/bottom where text fades
+            visible_range = max(3, (size // line_height) // 2 + 1)
+            fade_zone = 12
 
             for offset in range(-visible_range, visible_range + 1):
                 li = idx + offset
@@ -1074,69 +1161,44 @@ def render_lyrics(
                 if not text.strip():
                     continue
 
-                # Y position: center line is at LYRICS_CENTER_Y
-                # Smooth offset from scroll animation
-                line_target_y = li * LYRICS_LINE_HEIGHT
-                y_pixel = LYRICS_CENTER_Y + (line_target_y - current_y) * 1.0
+                line_target_y = li * line_height
+                y_pixel = center_y + (line_target_y - current_y)
 
-                # Skip if fully off-screen
-                if y_pixel < -10 or y_pixel > size + 10:
+                if y_pixel < -12 or y_pixel > size + 12:
                     continue
 
-                # Color: active line = green, others = dim gray
-                if li == idx:
-                    base_color = SPOTIFY_GREEN
-                else:
-                    base_color = LYRIC_DIM_COLOR
+                is_active_line = (li == idx)
+                base_color = SPOTIFY_GREEN if is_active_line else LYRIC_DIM_COLOR
 
-                # Vertical edge fade: reduce brightness near top/bottom edges
+                # Vertical edge fade
                 fade_factor = 1.0
                 if y_pixel < fade_zone:
                     fade_factor = max(0.0, y_pixel / fade_zone)
-                elif y_pixel > size - fade_zone - LYRICS_LINE_HEIGHT:
-                    fade_factor = max(0.0, (size - y_pixel - LYRICS_LINE_HEIGHT) / fade_zone)
+                elif y_pixel > size - fade_zone - line_height:
+                    fade_factor = max(0.0, (size - y_pixel - line_height) / fade_zone)
                 fade_factor = max(0.0, min(1.0, fade_factor))
-
                 color = tuple(int(c * fade_factor) for c in base_color)
 
-                # Measure text width
                 bbox = draw.textbbox((0, 0), text, font=font)
                 text_w = bbox[2] - bbox[0]
                 y_draw = int(y_pixel) - bbox[1]
 
                 if text_w <= size:
-                    # Fits — center it
                     x = (size - text_w) // 2
-                    draw.text((x, y_draw), text, fill=color, font=font)
+                elif not is_active_line:
+                    # Non-active lines: show start, no scroll
+                    x = 2
+                elif smart_scroll:
+                    x = _smart_h_scroll_x(text_w, size, time_on_screen_ms, line_dur_ms)
                 else:
-                    # Overflow — slow continuous left scroll
-                    overflow = text_w - size + 4  # 4px padding
-                    scroll_cycle = overflow / LYRICS_H_SCROLL_SPEED
-                    pause = 1.0  # 1 second pause at start
-                    total_cycle = pause + scroll_cycle + pause + scroll_cycle
-                    t = (now_mono % total_cycle)
-                    if t < pause:
-                        x = 2  # start with small left margin
-                    elif t < pause + scroll_cycle:
-                        frac = (t - pause) / scroll_cycle
-                        x = 2 - int(frac * overflow)
-                    elif t < pause * 2 + scroll_cycle:
-                        x = 2 - overflow
-                    else:
-                        frac = (t - pause * 2 - scroll_cycle) / scroll_cycle
-                        x = 2 - overflow + int(frac * overflow)
-                    draw.text((x, y_draw), text, fill=color, font=font)
+                    x = _legacy_h_scroll_x(text_w, size, now_mono, True, time_on_screen_ms)
+
+                draw.text((x, y_draw), text, fill=color, font=font)
         else:
-            # Pop mode
+            # Pop mode — 3 fixed lines
             y_positions = [10, 28, 46]
             line_indices = [idx - 1, idx, idx + 1]
             colors = [LYRIC_DIM_COLOR, SPOTIFY_GREEN, LYRIC_DIM_COLOR]
-            
-            if idx >= 0:
-                lyric_start_ms = lyrics[idx][0]
-                time_on_screen_ms = estimated_progress - lyric_start_ms
-            else:
-                time_on_screen_ms = 0
 
             for line_i, (li, y_pos, color) in enumerate(zip(line_indices, y_positions, colors)):
                 if li < 0 or li >= len(lyrics):
@@ -1146,33 +1208,25 @@ def render_lyrics(
                 if not text.strip():
                     continue
 
+                is_active_line = (line_i == 1)
+
                 bbox = draw.textbbox((0, 0), text, font=font)
                 text_w = bbox[2] - bbox[0]
                 y_draw = y_pos - bbox[1]
 
                 if text_w <= size:
                     x = (size - text_w) // 2
-                    draw.text((x, y_draw), text, fill=color, font=font)
+                elif not is_active_line:
+                    # Non-active lines: show start, no scroll
+                    x = 2
+                elif smart_scroll:
+                    li_dur = _get_line_duration_ms(lyrics, li, duration_ms)
+                    li_time = max(0, estimated_progress - lyrics[li][0])
+                    x = _smart_h_scroll_x(text_w, size, li_time, li_dur)
                 else:
-                    overflow = text_w - size
-                    if line_i == 1:
-                        scroll_speed = 20.0
-                        cycle_duration = overflow / scroll_speed
-                        total_cycle = cycle_duration * 2 + 1.0
-                        t = (time_on_screen_ms / 1000.0) % total_cycle
-                        if t < 0.5:
-                            x = 0
-                        elif t < 0.5 + cycle_duration:
-                            x = -int(overflow * ((t - 0.5) / cycle_duration))
-                        elif t < 1.0 + cycle_duration:
-                            x = -overflow
-                        else:
-                            x = -int(overflow * (1.0 - (t - 1.0 - cycle_duration) / cycle_duration))
-                    else:
-                        scroll_time = now_mono * 10.0
-                        x = -int(scroll_time % (overflow + size)) + size // 2
-                        x = max(-overflow, min(0, x))
-                    draw.text((x, y_draw), text, fill=color, font=font)
+                    x = _legacy_h_scroll_x(text_w, size, now_mono, True, time_on_screen_ms)
+
+                draw.text((x, y_draw), text, fill=color, font=font)
 
     # Progress bar at bottom (1px height)
     if duration_ms > 0:
@@ -1232,55 +1286,36 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
     padding: 16px 0 20px;
   }
   .header h1 {
-    font-size: 20px;
-    font-weight: 700;
-    letter-spacing: -0.5px;
+    font-size: 20px; font-weight: 700; letter-spacing: -0.5px;
     background: linear-gradient(135deg, var(--green), #1ed79a);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
   }
   .header .subtitle {
-    font-size: 11px;
-    color: var(--text-dim);
-    margin-top: 4px;
-    text-transform: uppercase;
-    letter-spacing: 1.5px;
+    font-size: 11px; color: var(--text-dim); margin-top: 4px;
+    text-transform: uppercase; letter-spacing: 1.5px;
   }
 
   .status-dot {
-    display: inline-block;
-    width: 6px; height: 6px;
-    border-radius: 50%;
-    margin-right: 4px;
-    vertical-align: middle;
+    display: inline-block; width: 6px; height: 6px;
+    border-radius: 50%; margin-right: 4px; vertical-align: middle;
   }
   .status-dot.connected { background: var(--green); box-shadow: 0 0 6px var(--green-glow); }
   .status-dot.disconnected { background: var(--danger); }
 
   .card {
-    background: var(--card);
-    border: 1px solid var(--card-border);
-    border-radius: var(--radius);
-    padding: 16px;
-    margin-bottom: 12px;
+    background: var(--card); border: 1px solid var(--card-border);
+    border-radius: var(--radius); padding: 16px; margin-bottom: 12px;
   }
   .card-title {
-    font-size: 11px;
-    font-weight: 600;
-    color: var(--text-dim);
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    margin-bottom: 12px;
+    font-size: 11px; font-weight: 600; color: var(--text-dim);
+    text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px;
   }
 
   /* Now Playing */
   .now-playing { display: flex; align-items: center; gap: 12px; }
   .now-playing .album-art {
-    width: 48px; height: 48px;
-    border-radius: 8px;
-    background: #222;
-    flex-shrink: 0;
-    overflow: hidden;
+    width: 48px; height: 48px; border-radius: 8px;
+    background: #222; flex-shrink: 0; overflow: hidden;
   }
   .now-playing .album-art img { width: 100%; height: 100%; object-fit: cover; }
   .now-playing .track-info { flex: 1; min-width: 0; }
@@ -1294,50 +1329,35 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
   }
   .track-info .album-line {
     font-size: 10px; color: #555;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-    margin-top: 1px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px;
   }
   .play-status { font-size: 10px; color: var(--green); margin-top: 2px; }
   .play-status.paused { color: var(--text-dim); }
-  .effective-mode {
-    font-size: 10px; color: var(--gold); margin-top: 1px;
-  }
+  .effective-mode { font-size: 10px; color: var(--gold); margin-top: 1px; }
 
-  /* Mode Selector — 4 columns */
-  .mode-grid {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 6px;
-  }
+  /* Mode Grid */
+  .mode-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
   .mode-btn {
-    background: var(--bg);
-    border: 2px solid var(--card-border);
-    border-radius: 10px;
-    padding: 10px 4px;
-    text-align: center;
-    cursor: pointer;
-    transition: all 0.2s ease;
-    -webkit-user-select: none;
-    user-select: none;
+    background: var(--bg); border: 2px solid var(--card-border);
+    border-radius: 10px; padding: 10px 4px; text-align: center;
+    cursor: pointer; transition: all 0.2s ease;
+    -webkit-user-select: none; user-select: none;
   }
   .mode-btn:active { transform: scale(0.96); }
   .mode-btn.active {
-    border-color: var(--green);
-    background: var(--green-dim);
+    border-color: var(--green); background: var(--green-dim);
     box-shadow: 0 0 10px var(--green-glow);
   }
   .mode-btn.active-default {
-    border-color: var(--gold);
-    background: var(--gold-dim);
+    border-color: var(--gold); background: var(--gold-dim);
     box-shadow: 0 0 10px var(--gold-glow);
   }
   .mode-btn .icon { font-size: 20px; margin-bottom: 2px; }
   .mode-btn .label {
-    font-size: 9px; font-weight: 600;
-    text-transform: uppercase; letter-spacing: 0.3px;
+    font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px;
   }
 
-  /* Sliders */
+  /* Form elements */
   .slider-group { margin-bottom: 14px; }
   .slider-group:last-child { margin-bottom: 0; }
   .slider-label {
@@ -1362,9 +1382,39 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
     width: 20px; height: 20px; border-radius: 50%;
     background: var(--green); cursor: pointer; border: none;
   }
+  select.form-select {
+    width: 100%; padding: 8px; background: #222; color: var(--text);
+    border: 1px solid #333; border-radius: 6px; font-family: inherit;
+    font-size: 12px; font-weight: 500; outline: none; cursor: pointer;
+  }
+
+  /* Toggle switch */
+  .toggle-row {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 14px;
+  }
+  .toggle-row .name { font-size: 12px; font-weight: 500; }
+  .toggle-row .desc { font-size: 10px; color: var(--text-dim); margin-top: 1px; }
+  .switch {
+    position: relative; width: 40px; height: 22px; flex-shrink: 0;
+  }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .slider {
+    position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+    background: #333; border-radius: 22px; transition: 0.3s;
+  }
+  .switch .slider:before {
+    content: ""; position: absolute; height: 16px; width: 16px;
+    left: 3px; bottom: 3px; background: #888; border-radius: 50%; transition: 0.3s;
+  }
+  .switch input:checked + .slider { background: var(--green-dim); }
+  .switch input:checked + .slider:before {
+    transform: translateX(18px); background: var(--green);
+    box-shadow: 0 0 6px var(--green-glow);
+  }
 
   /* Buttons */
-  .btn-row { display: flex; gap: 8px; margin-top: 12px; }
+  .btn-row { display: flex; gap: 8px; }
   .btn {
     flex: 1; padding: 10px; border: none; border-radius: 8px;
     font-family: 'Inter', sans-serif; font-size: 12px; font-weight: 600;
@@ -1372,16 +1422,13 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
     letter-spacing: 0.5px;
   }
   .btn:active { transform: scale(0.97); }
-  .btn-reset {
-    background: #1e1e1e; color: var(--text-dim);
-    border: 1px solid #333;
-  }
+  .btn-reset { background: #1e1e1e; color: var(--text-dim); border: 1px solid #333; }
   .btn-reset:hover { background: #2a2a2a; color: var(--text); }
-  .btn-logs {
-    background: #1e1e1e; color: var(--text-dim);
-    border: 1px solid #333;
-  }
+  .btn-logs { background: #1e1e1e; color: var(--text-dim); border: 1px solid #333; }
   .btn-logs:hover { background: #2a2a2a; color: var(--text); }
+
+  /* Inline row for two sliders side by side */
+  .inline-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 
   .footer {
     text-align: center; padding: 16px 0;
@@ -1399,7 +1446,7 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
-<!-- Now Playing Card -->
+<!-- Now Playing -->
 <div class="card">
   <div class="card-title">Now Playing</div>
   <div class="now-playing">
@@ -1414,32 +1461,76 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
-<!-- Display Mode Card -->
+<!-- Display Mode -->
 <div class="card">
   <div class="card-title">Display Mode</div>
   <div class="mode-grid">
     <div class="mode-btn active-default" data-mode="default" onclick="setMode('default')">
-      <div class="icon">&#10024;</div>
-      <div class="label">Default</div>
+      <div class="icon">&#10024;</div><div class="label">Default</div>
     </div>
     <div class="mode-btn" data-mode="cd" onclick="setMode('cd')">
-      <div class="icon">&#128191;</div>
-      <div class="label">CD</div>
+      <div class="icon">&#128191;</div><div class="label">CD</div>
     </div>
     <div class="mode-btn" data-mode="lyrics" onclick="setMode('lyrics')">
-      <div class="icon">&#127925;</div>
-      <div class="label">Lyrics</div>
+      <div class="icon">&#127925;</div><div class="label">Lyrics</div>
     </div>
     <div class="mode-btn" data-mode="clock" onclick="setMode('clock')">
-      <div class="icon">&#128336;</div>
-      <div class="label">Clock</div>
+      <div class="icon">&#128336;</div><div class="label">Clock</div>
     </div>
   </div>
 </div>
 
-<!-- Settings Card -->
+<!-- Lyrics Settings -->
 <div class="card">
-  <div class="card-title">Settings</div>
+  <div class="card-title">&#127925; Lyrics Settings</div>
+
+  <div class="slider-group">
+    <div class="slider-label">
+      <span class="name">Style</span>
+      <span class="value" id="lyricsStyleVal">Scroll</span>
+    </div>
+    <select id="lyricsStyle" class="form-select" onchange="setSettingString('lyrics-style', this.value)">
+      <option value="scroll">Smooth Scroll</option>
+      <option value="pop">Pop (3-Line)</option>
+    </select>
+  </div>
+
+  <div class="toggle-row">
+    <div>
+      <div class="name">&#9889; Smart Scroll</div>
+      <div class="desc">Scroll speed matches line duration</div>
+    </div>
+    <label class="switch">
+      <input type="checkbox" id="smartScroll" checked onchange="setSettingBool('smart-scroll', this.checked)">
+      <span class="slider"></span>
+    </label>
+  </div>
+
+  <div class="inline-row">
+    <div class="slider-group">
+      <div class="slider-label">
+        <span class="name">Scroll Font</span>
+        <span class="value" id="scrollFontVal">9</span>
+      </div>
+      <input type="range" id="scrollFont" min="6" max="14" value="9"
+             oninput="document.getElementById('scrollFontVal').textContent=this.value"
+             onchange="setSetting('scroll-font-size', this.value)">
+    </div>
+    <div class="slider-group">
+      <div class="slider-label">
+        <span class="name">Pop Font</span>
+        <span class="value" id="popFontVal">8</span>
+      </div>
+      <input type="range" id="popFont" min="6" max="14" value="8"
+             oninput="document.getElementById('popFontVal').textContent=this.value"
+             onchange="setSetting('pop-font-size', this.value)">
+    </div>
+  </div>
+</div>
+
+<!-- General Settings -->
+<div class="card">
+  <div class="card-title">&#9881; General Settings</div>
 
   <div class="slider-group">
     <div class="slider-label">
@@ -1480,18 +1571,10 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
            oninput="document.getElementById('pollVal').textContent=this.value"
            onchange="setSetting('poll-rate', this.value)">
   </div>
+</div>
 
-  <div class="slider-group">
-    <div class="slider-label">
-      <span class="name">&#127901; Lyrics Style</span>
-      <span class="value" id="lyricsStyleVal">Scroll</span>
-    </div>
-    <select id="lyricsStyle" onchange="setSettingString('lyrics-style', this.value)" style="width: 100%; padding: 8px; background: #333; color: var(--text); border: none; border-radius: 6px; font-family: inherit; font-size: 12px; font-weight: 500; outline: none; cursor: pointer;">
-      <option value="scroll">Smooth Scroll</option>
-      <option value="pop">Pop (3-Line)</option>
-    </select>
-  </div>
-
+<!-- Actions -->
+<div class="card">
   <div class="btn-row">
     <button class="btn btn-reset" onclick="resetAll()">&#8635; Reset All</button>
     <button class="btn btn-logs" onclick="window.location='/logs'">&#128196; View Logs</button>
@@ -1530,14 +1613,11 @@ function updateUI(s) {
   if (s.is_playing) { ps.textContent = '\\u25b6 Playing'; ps.className = 'play-status'; }
   else { ps.textContent = '\\u23f8 Paused'; ps.className = 'play-status paused'; }
 
-  // Effective mode display
   const em = document.getElementById('effectiveMode');
   if (s.display_mode === 'default') {
     const modeNames = {cd:'CD', lyrics:'Lyrics', clock:'Clock'};
     em.textContent = '\\u2728 Default \\u2192 ' + (modeNames[s.effective_mode] || s.effective_mode);
-  } else {
-    em.textContent = '';
-  }
+  } else { em.textContent = ''; }
 
   const artDiv = document.getElementById('albumArt');
   if (s.image_url) {
@@ -1549,14 +1629,11 @@ function updateUI(s) {
   // Mode buttons
   document.querySelectorAll('.mode-btn').forEach(btn => {
     const m = btn.dataset.mode;
-    const isActive = m === s.display_mode;
     btn.classList.remove('active', 'active-default');
-    if (isActive) {
-      btn.classList.add(m === 'default' ? 'active-default' : 'active');
-    }
+    if (m === s.display_mode) btn.classList.add(m === 'default' ? 'active-default' : 'active');
   });
 
-  // Sliders
+  // Lyrics settings
   if (document.activeElement?.id !== 'lyricsStyle') {
     const sel = document.getElementById('lyricsStyle');
     if (sel) {
@@ -1564,6 +1641,18 @@ function updateUI(s) {
       document.getElementById('lyricsStyleVal').textContent = s.lyrics_style === 'pop' ? 'Pop' : 'Scroll';
     }
   }
+  const ss = document.getElementById('smartScroll');
+  if (ss && document.activeElement !== ss) ss.checked = s.smart_scroll !== false;
+  if (document.activeElement?.id !== 'scrollFont') {
+    document.getElementById('scrollFont').value = s.scroll_font_size || 9;
+    document.getElementById('scrollFontVal').textContent = s.scroll_font_size || 9;
+  }
+  if (document.activeElement?.id !== 'popFont') {
+    document.getElementById('popFont').value = s.pop_font_size || 8;
+    document.getElementById('popFontVal').textContent = s.pop_font_size || 8;
+  }
+
+  // General settings
   if (document.activeElement?.id !== 'brightness') {
     document.getElementById('brightness').value = s.brightness;
     document.getElementById('brightnessVal').textContent = s.brightness;
@@ -1608,6 +1697,16 @@ async function setSetting(name, value) {
 }
 
 async function setSettingString(name, value) {
+  try {
+    await fetch('/api/' + name, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({value: value})
+    });
+  } catch(e) {}
+}
+
+async function setSettingBool(name, value) {
   try {
     await fetch('/api/' + name, {
       method: 'POST',
@@ -1853,10 +1952,33 @@ def start_control_server(
                 else:
                     self._send_json({"error": "Invalid style"}, 400)
 
+            elif parsed.path == "/api/smart-scroll":
+                val = bool(body.get("value", True))
+                with outer_lock:
+                    outer_state.smart_scroll = val
+                self._send_json({"ok": True, "smart_scroll": val})
+
+            elif parsed.path == "/api/scroll-font-size":
+                val = int(body.get("value", 9))
+                val = max(6, min(14, val))
+                with outer_lock:
+                    outer_state.scroll_font_size = val
+                self._send_json({"ok": True, "scroll_font_size": val})
+
+            elif parsed.path == "/api/pop-font-size":
+                val = int(body.get("value", 8))
+                val = max(6, min(14, val))
+                with outer_lock:
+                    outer_state.pop_font_size = val
+                self._send_json({"ok": True, "pop_font_size": val})
+
             elif parsed.path == "/api/reset":
                 with outer_lock:
                     outer_state.display_mode = "default"
                     outer_state.lyrics_style = outer_state._default_lyrics_style
+                    outer_state.smart_scroll = True
+                    outer_state.scroll_font_size = outer_state._default_scroll_font_size
+                    outer_state.pop_font_size = outer_state._default_pop_font_size
                     outer_state.brightness = outer_state._default_brightness
                     outer_state.spin_speed = outer_state._default_spin_speed
                     outer_state.text_scroll_speed = outer_state._default_text_scroll_speed
@@ -1917,6 +2039,9 @@ def start_control_server(
                     "is_connected": outer_state.is_connected,
                     "image_url": outer_state.image_url,
                     "lyrics_style": outer_state.lyrics_style,
+                    "smart_scroll": outer_state.smart_scroll,
+                    "scroll_font_size": outer_state.scroll_font_size,
+                    "pop_font_size": outer_state.pop_font_size,
                     "has_lyrics": outer_state.lyrics is not None and len(outer_state.lyrics or []) > 0,
                     "progress_ms": outer_state.progress_ms,
                     "duration_ms": outer_state.duration_ms,
@@ -2259,6 +2384,8 @@ def run(args: argparse.Namespace) -> None:
                     size, current_lyrics, stored_duration_ms,
                     is_playing, fetch_time, stored_progress_ms,
                     playback_state.lyrics_style,
+                    playback_state.smart_scroll,
+                    playback_state.scroll_font_size if playback_state.lyrics_style == "scroll" else playback_state.pop_font_size,
                 )
                 display.show(frame)
                 if args.once:
@@ -2300,6 +2427,8 @@ def run(args: argparse.Namespace) -> None:
                         size, current_lyrics, stored_duration_ms,
                         is_playing, fetch_time, stored_progress_ms,
                         playback_state.lyrics_style,
+                        playback_state.smart_scroll,
+                        playback_state.scroll_font_size if playback_state.lyrics_style == "scroll" else playback_state.pop_font_size,
                     )
                     display.show(frame)
                     if args.once:
