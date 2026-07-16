@@ -131,6 +131,7 @@ class SharedPlaybackState:
     # Runtime-adjustable settings
     display_mode: str = "default"  # "default", "cd", "lyrics", "clock"
     effective_mode: str = "cd"  # what is actually rendering right now
+    lyrics_style: str = "scroll"  # "scroll" or "pop"
     spin_speed: float = 20.0  # RPM
     text_scroll_speed: float = 12.0  # px/s
     poll_interval: float = 5.0  # seconds (active polling)
@@ -139,6 +140,7 @@ class SharedPlaybackState:
     _default_brightness: int = 65
     _default_spin_speed: float = 20.0
     _default_text_scroll_speed: float = 12.0
+    _default_lyrics_style: str = "scroll"
 
 
 @dataclass
@@ -998,8 +1000,9 @@ def render_lyrics(
     is_playing: bool,
     fetch_time: float,
     stored_progress_ms: int,
+    style: str = "scroll",
 ) -> Image.Image:
-    """Render lyrics as a smooth vertically-scrolling column."""
+    """Render lyrics as a smooth vertically-scrolling column or popping lines."""
     frame = Image.new("RGB", (size, size), (0, 0, 0))
     draw = ImageDraw.Draw(frame)
     font = get_font(LYRICS_FONT_SIZE)
@@ -1031,97 +1034,145 @@ def render_lyrics(
         idx = get_current_lyric_index(lyrics, estimated_progress)
         now_mono = time.monotonic()
 
-        # Smooth vertical scroll: when the active lyric index changes,
-        # we animate the Y offset over LYRICS_SCROLL_DURATION seconds.
-        if idx != _lyrics_scroll_state["last_idx"]:
-            _lyrics_scroll_state["last_idx"] = idx
-            _lyrics_scroll_state["target_y"] = float(idx * LYRICS_LINE_HEIGHT)
-            _lyrics_scroll_state["transition_start"] = now_mono
+        if style == "scroll":
+            # Smooth vertical scroll: when the active lyric index changes,
+            # we animate the Y offset over LYRICS_SCROLL_DURATION seconds.
+            if idx != _lyrics_scroll_state["last_idx"]:
+                _lyrics_scroll_state["last_idx"] = idx
+                _lyrics_scroll_state["target_y"] = float(idx * LYRICS_LINE_HEIGHT)
+                _lyrics_scroll_state["transition_start"] = now_mono
 
-        target_y = _lyrics_scroll_state["target_y"]
-        elapsed = now_mono - _lyrics_scroll_state["transition_start"]
+            target_y = _lyrics_scroll_state["target_y"]
+            elapsed = now_mono - _lyrics_scroll_state["transition_start"]
 
-        if elapsed < LYRICS_SCROLL_DURATION:
-            # Ease-out cubic
-            t = elapsed / LYRICS_SCROLL_DURATION
-            eased = 1.0 - (1.0 - t) ** 3
-            old_y = _lyrics_scroll_state["scroll_y"]
-            current_y = old_y + (target_y - old_y) * eased
-        else:
-            current_y = target_y
-            _lyrics_scroll_state["scroll_y"] = target_y
-
-        # When animation completes, store final position
-        if elapsed >= LYRICS_SCROLL_DURATION:
-            _lyrics_scroll_state["scroll_y"] = target_y
-
-        # Render visible lyrics lines as a scrolling column
-        # Active line Y = LYRICS_CENTER_Y, other lines offset by LYRICS_LINE_HEIGHT
-        # The scroll offset determines which line is at center
-        visible_range = 5  # how many lines above/below to render
-        fade_zone = 12  # pixels from top/bottom where text fades
-
-        for offset in range(-visible_range, visible_range + 1):
-            li = idx + offset
-            if li < 0 or li >= len(lyrics):
-                continue
-
-            text = lyrics[li][1]
-            if not text.strip():
-                continue
-
-            # Y position: center line is at LYRICS_CENTER_Y
-            # Smooth offset from scroll animation
-            line_target_y = li * LYRICS_LINE_HEIGHT
-            y_pixel = LYRICS_CENTER_Y + (line_target_y - current_y) * 1.0
-
-            # Skip if fully off-screen
-            if y_pixel < -10 or y_pixel > size + 10:
-                continue
-
-            # Color: active line = green, others = dim gray
-            if li == idx:
-                base_color = SPOTIFY_GREEN
+            if elapsed < LYRICS_SCROLL_DURATION:
+                # Ease-out cubic
+                t = elapsed / LYRICS_SCROLL_DURATION
+                eased = 1.0 - (1.0 - t) ** 3
+                old_y = _lyrics_scroll_state["scroll_y"]
+                current_y = old_y + (target_y - old_y) * eased
             else:
-                base_color = LYRIC_DIM_COLOR
+                current_y = target_y
+                _lyrics_scroll_state["scroll_y"] = target_y
 
-            # Vertical edge fade: reduce brightness near top/bottom edges
-            fade_factor = 1.0
-            if y_pixel < fade_zone:
-                fade_factor = max(0.0, y_pixel / fade_zone)
-            elif y_pixel > size - fade_zone - LYRICS_LINE_HEIGHT:
-                fade_factor = max(0.0, (size - y_pixel - LYRICS_LINE_HEIGHT) / fade_zone)
-            fade_factor = max(0.0, min(1.0, fade_factor))
+            # When animation completes, store final position
+            if elapsed >= LYRICS_SCROLL_DURATION:
+                _lyrics_scroll_state["scroll_y"] = target_y
 
-            color = tuple(int(c * fade_factor) for c in base_color)
+            # Render visible lyrics lines as a scrolling column
+            # Active line Y = LYRICS_CENTER_Y, other lines offset by LYRICS_LINE_HEIGHT
+            # The scroll offset determines which line is at center
+            visible_range = 5  # how many lines above/below to render
+            fade_zone = 12  # pixels from top/bottom where text fades
 
-            # Measure text width
-            bbox = draw.textbbox((0, 0), text, font=font)
-            text_w = bbox[2] - bbox[0]
-            y_draw = int(y_pixel) - bbox[1]
+            for offset in range(-visible_range, visible_range + 1):
+                li = idx + offset
+                if li < 0 or li >= len(lyrics):
+                    continue
 
-            if text_w <= size:
-                # Fits — center it
-                x = (size - text_w) // 2
-                draw.text((x, y_draw), text, fill=color, font=font)
-            else:
-                # Overflow — slow continuous left scroll
-                overflow = text_w - size + 4  # 4px padding
-                scroll_cycle = overflow / LYRICS_H_SCROLL_SPEED
-                pause = 1.0  # 1 second pause at start
-                total_cycle = pause + scroll_cycle + pause + scroll_cycle
-                t = (now_mono % total_cycle)
-                if t < pause:
-                    x = 2  # start with small left margin
-                elif t < pause + scroll_cycle:
-                    frac = (t - pause) / scroll_cycle
-                    x = 2 - int(frac * overflow)
-                elif t < pause * 2 + scroll_cycle:
-                    x = 2 - overflow
+                text = lyrics[li][1]
+                if not text.strip():
+                    continue
+
+                # Y position: center line is at LYRICS_CENTER_Y
+                # Smooth offset from scroll animation
+                line_target_y = li * LYRICS_LINE_HEIGHT
+                y_pixel = LYRICS_CENTER_Y + (line_target_y - current_y) * 1.0
+
+                # Skip if fully off-screen
+                if y_pixel < -10 or y_pixel > size + 10:
+                    continue
+
+                # Color: active line = green, others = dim gray
+                if li == idx:
+                    base_color = SPOTIFY_GREEN
                 else:
-                    frac = (t - pause * 2 - scroll_cycle) / scroll_cycle
-                    x = 2 - overflow + int(frac * overflow)
-                draw.text((x, y_draw), text, fill=color, font=font)
+                    base_color = LYRIC_DIM_COLOR
+
+                # Vertical edge fade: reduce brightness near top/bottom edges
+                fade_factor = 1.0
+                if y_pixel < fade_zone:
+                    fade_factor = max(0.0, y_pixel / fade_zone)
+                elif y_pixel > size - fade_zone - LYRICS_LINE_HEIGHT:
+                    fade_factor = max(0.0, (size - y_pixel - LYRICS_LINE_HEIGHT) / fade_zone)
+                fade_factor = max(0.0, min(1.0, fade_factor))
+
+                color = tuple(int(c * fade_factor) for c in base_color)
+
+                # Measure text width
+                bbox = draw.textbbox((0, 0), text, font=font)
+                text_w = bbox[2] - bbox[0]
+                y_draw = int(y_pixel) - bbox[1]
+
+                if text_w <= size:
+                    # Fits — center it
+                    x = (size - text_w) // 2
+                    draw.text((x, y_draw), text, fill=color, font=font)
+                else:
+                    # Overflow — slow continuous left scroll
+                    overflow = text_w - size + 4  # 4px padding
+                    scroll_cycle = overflow / LYRICS_H_SCROLL_SPEED
+                    pause = 1.0  # 1 second pause at start
+                    total_cycle = pause + scroll_cycle + pause + scroll_cycle
+                    t = (now_mono % total_cycle)
+                    if t < pause:
+                        x = 2  # start with small left margin
+                    elif t < pause + scroll_cycle:
+                        frac = (t - pause) / scroll_cycle
+                        x = 2 - int(frac * overflow)
+                    elif t < pause * 2 + scroll_cycle:
+                        x = 2 - overflow
+                    else:
+                        frac = (t - pause * 2 - scroll_cycle) / scroll_cycle
+                        x = 2 - overflow + int(frac * overflow)
+                    draw.text((x, y_draw), text, fill=color, font=font)
+        else:
+            # Pop mode
+            y_positions = [10, 28, 46]
+            line_indices = [idx - 1, idx, idx + 1]
+            colors = [LYRIC_DIM_COLOR, SPOTIFY_GREEN, LYRIC_DIM_COLOR]
+            
+            if idx >= 0:
+                lyric_start_ms = lyrics[idx][0]
+                time_on_screen_ms = estimated_progress - lyric_start_ms
+            else:
+                time_on_screen_ms = 0
+
+            for line_i, (li, y_pos, color) in enumerate(zip(line_indices, y_positions, colors)):
+                if li < 0 or li >= len(lyrics):
+                    continue
+
+                text = lyrics[li][1]
+                if not text.strip():
+                    continue
+
+                bbox = draw.textbbox((0, 0), text, font=font)
+                text_w = bbox[2] - bbox[0]
+                y_draw = y_pos - bbox[1]
+
+                if text_w <= size:
+                    x = (size - text_w) // 2
+                    draw.text((x, y_draw), text, fill=color, font=font)
+                else:
+                    overflow = text_w - size
+                    if line_i == 1:
+                        scroll_speed = 20.0
+                        cycle_duration = overflow / scroll_speed
+                        total_cycle = cycle_duration * 2 + 1.0
+                        t = (time_on_screen_ms / 1000.0) % total_cycle
+                        if t < 0.5:
+                            x = 0
+                        elif t < 0.5 + cycle_duration:
+                            x = -int(overflow * ((t - 0.5) / cycle_duration))
+                        elif t < 1.0 + cycle_duration:
+                            x = -overflow
+                        else:
+                            x = -int(overflow * (1.0 - (t - 1.0 - cycle_duration) / cycle_duration))
+                    else:
+                        scroll_time = now_mono * 10.0
+                        x = -int(scroll_time % (overflow + size)) + size // 2
+                        x = max(-overflow, min(0, x))
+                    draw.text((x, y_draw), text, fill=color, font=font)
 
     # Progress bar at bottom (1px height)
     if duration_ms > 0:
@@ -1430,6 +1481,17 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
            onchange="setSetting('poll-rate', this.value)">
   </div>
 
+  <div class="slider-group">
+    <div class="slider-label">
+      <span class="name">&#127901; Lyrics Style</span>
+      <span class="value" id="lyricsStyleVal">Scroll</span>
+    </div>
+    <select id="lyricsStyle" onchange="setSettingString('lyrics-style', this.value)" style="width: 100%; padding: 8px; background: #333; color: var(--text); border: none; border-radius: 6px; font-family: inherit; font-size: 12px; font-weight: 500; outline: none; cursor: pointer;">
+      <option value="scroll">Smooth Scroll</option>
+      <option value="pop">Pop (3-Line)</option>
+    </select>
+  </div>
+
   <div class="btn-row">
     <button class="btn btn-reset" onclick="resetAll()">&#8635; Reset All</button>
     <button class="btn btn-logs" onclick="window.location='/logs'">&#128196; View Logs</button>
@@ -1495,6 +1557,13 @@ function updateUI(s) {
   });
 
   // Sliders
+  if (document.activeElement?.id !== 'lyricsStyle') {
+    const sel = document.getElementById('lyricsStyle');
+    if (sel) {
+      sel.value = s.lyrics_style || 'scroll';
+      document.getElementById('lyricsStyleVal').textContent = s.lyrics_style === 'pop' ? 'Pop' : 'Scroll';
+    }
+  }
   if (document.activeElement?.id !== 'brightness') {
     document.getElementById('brightness').value = s.brightness;
     document.getElementById('brightnessVal').textContent = s.brightness;
@@ -1534,6 +1603,16 @@ async function setSetting(name, value) {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({value: Number(value)})
+    });
+  } catch(e) {}
+}
+
+async function setSettingString(name, value) {
+  try {
+    await fetch('/api/' + name, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({value: value})
     });
   } catch(e) {}
 }
@@ -1765,9 +1844,19 @@ def start_control_server(
                     outer_state.poll_interval = val
                 self._send_json({"ok": True, "poll_interval": val})
 
+            elif parsed.path == "/api/lyrics-style":
+                style = body.get("value", "scroll")
+                if style in ("scroll", "pop"):
+                    with outer_lock:
+                        outer_state.lyrics_style = style
+                    self._send_json({"ok": True, "lyrics_style": style})
+                else:
+                    self._send_json({"error": "Invalid style"}, 400)
+
             elif parsed.path == "/api/reset":
                 with outer_lock:
                     outer_state.display_mode = "default"
+                    outer_state.lyrics_style = outer_state._default_lyrics_style
                     outer_state.brightness = outer_state._default_brightness
                     outer_state.spin_speed = outer_state._default_spin_speed
                     outer_state.text_scroll_speed = outer_state._default_text_scroll_speed
@@ -1827,6 +1916,7 @@ def start_control_server(
                     "is_playing": outer_state.is_playing,
                     "is_connected": outer_state.is_connected,
                     "image_url": outer_state.image_url,
+                    "lyrics_style": outer_state.lyrics_style,
                     "has_lyrics": outer_state.lyrics is not None and len(outer_state.lyrics or []) > 0,
                     "progress_ms": outer_state.progress_ms,
                     "duration_ms": outer_state.duration_ms,
@@ -2168,6 +2258,7 @@ def run(args: argparse.Namespace) -> None:
                 frame = render_lyrics(
                     size, current_lyrics, stored_duration_ms,
                     is_playing, fetch_time, stored_progress_ms,
+                    playback_state.lyrics_style,
                 )
                 display.show(frame)
                 if args.once:
@@ -2208,6 +2299,7 @@ def run(args: argparse.Namespace) -> None:
                     frame = render_lyrics(
                         size, current_lyrics, stored_duration_ms,
                         is_playing, fetch_time, stored_progress_ms,
+                        playback_state.lyrics_style,
                     )
                     display.show(frame)
                     if args.once:
