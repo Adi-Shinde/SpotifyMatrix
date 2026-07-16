@@ -1,7 +1,3 @@
-Here is the complete, expanded user guide. You can copy this entire block of text and save it as a `.txt` file (for example, `Spotify_Matrix_User_Guide.txt`) on your computer for permanent reference.
-
----
-
 # SPOTIFY MATRIX - COMPLETE USER GUIDE
 
 This guide explains how to operate your Spotify Matrix display. It covers the mandatory first-time authentication, how to set up the automated "Plug & Play" background service, and how to safely override that service to manually tinker with the code.
@@ -77,7 +73,7 @@ sudo pkill -f spotify_matrix.py
 
 ### Step 4: Authorize in Your Browser
 
-1. Terminal #1 will print a link starting with `[https://accounts.spotify.com/authorize](https://accounts.spotify.com/authorize)...`.
+1. Terminal #1 will print a link starting with `https://accounts.spotify.com/authorize...`.
 
 
 2. Highlight and copy that entire link.
@@ -112,7 +108,7 @@ sudo nano /etc/systemd/system/spotifymatrix.service
 ### Step 2: Paste the Configuration
 
 Copy the exact text below and paste it into the nano editor.
-*(Note: This includes the `Environment` line to explicitly define the Python virtual environment paths, and uses your optimized hardware flags like `--gpio-slowdown 5` and `--hardware-mapping adafruit-hat-pwm`)*
+*(Note: This includes the `Environment` line to explicitly define the Python virtual environment paths, uses your optimized hardware flags, and enables the web control panel on port 5000)*
 
 ```ini
 [Unit]
@@ -125,7 +121,7 @@ Type=simple
 User=root
 WorkingDirectory=/home/adi/Documents/SpotifyMatrix
 Environment="PATH=/home/adi/Documents/SpotifyMatrix/.venv/bin:/usr/bin"
-ExecStart=/home/adi/Documents/SpotifyMatrix/.venv/bin/python3 spotify_matrix.py --rows 64 --cols 64 --chain-length 1 --parallel 1 --gpio-slowdown 5 --no-hardware-pulse --hardware-mapping adafruit-hat-pwm
+ExecStart=/home/adi/Documents/SpotifyMatrix/.venv/bin/python3 spotify_matrix.py --rows 64 --cols 64 --chain-length 1 --parallel 1 --gpio-slowdown 5 --no-hardware-pulse --hardware-mapping adafruit-hat-pwm --web-port 5000
 Restart=always
 RestartSec=10
 
@@ -147,13 +143,57 @@ sudo systemctl start spotifymatrix.service
 
 ```
 
-> **Result:** Your matrix should instantly light up. If music is playing, it will spin. If paused, it will show the idle clock.
+> **Result:** Your matrix should instantly light up. If music is playing, it will spin. If paused, it will show the idle clock. The web control panel is now accessible at `http://matrixspot.local:5000`.
 > 
 > 
 
 ---
 
-## PHASE 3: HOW TO LIVE WITH BOTH WORLDS (DUAL-MODE)
+## PHASE 3: CONTROLLING FROM YOUR PHONE (WEB CONTROL PANEL)
+
+*No SSH or terminal needed — just use any web browser.*
+
+Once the matrix is running (either via autoboot service or manual run), a **web control panel** is available on your local network. Open this URL on **any device connected to the same WiFi**:
+
+```
+http://matrixspot.local:5000
+```
+
+**Pro tip:** Bookmark this URL on your phone's home screen for instant access!
+
+### What You Can Do From the Web Panel
+
+| Feature | Description |
+|---------|-------------|
+| **Display Mode** | Tap to switch between 💿 CD (spinning record), 🎵 Lyrics (synced lyrics), or 🕐 Clock |
+| **Brightness** | Drag the slider from 1 to 100. Changes take effect immediately on the matrix. |
+| **Spin Speed** | Adjust the RPM of the spinning CD from 1 to 120. |
+| **Text Speed** | Control how fast the song title/artist scrolls at the bottom (1-100 px/s). |
+| **Poll Rate** | How often the Pi checks Spotify for track changes (1-60 seconds). Default is 5s. |
+| **Now Playing** | See the current track title, artist, and album art at the top. |
+
+### Quick Mode Switching URLs
+
+If you prefer direct links (useful for Shortcuts/automation), these also work:
+
+- **CD mode:** `http://matrixspot.local:5000/mode?set=cd`
+- **Lyrics mode:** `http://matrixspot.local:5000/mode?set=lyrics`
+- **Clock mode:** `http://matrixspot.local:5000/mode?set=clock`
+
+### Lyrics View
+
+When you switch to **Lyrics mode**, the matrix displays synchronized lyrics from the free LRCLIB service:
+- The **current lyric line** is shown in bright **Spotify Green** in the center
+- The **previous** and **next** lines appear in dim gray above and below
+- A tiny **progress bar** at the bottom tracks the song position
+- Long lines automatically **scroll horizontally**
+- If no synced lyrics exist for a track, it shows "♪ No Lyrics ♪"
+
+Lyrics are fetched automatically when a new song starts — no setup required!
+
+---
+
+## PHASE 4: HOW TO LIVE WITH BOTH WORLDS (DUAL-MODE)
 
 *How to handle the system now that it is automated.*
 
@@ -164,6 +204,7 @@ You are completely finished.
 * You can close all terminal windows on your laptop.
 * You can unplug the Raspberry Pi from the wall.
 * Whenever you plug the Pi into power, it will boot up, wait for Wi-Fi, refresh its own Spotify token, and launch the display script entirely on its own. **No laptop or SSH required.**
+* **Control it from your phone** by opening `http://matrixspot.local:5000` in your browser.
 
 ### Scenario B: Manual Override (When you want to tinker or update code)
 
@@ -199,7 +240,7 @@ cd ~/Documents/SpotifyMatrix
 * *Want to update the code?* Run: `git pull`
 * *Want to test a new script command?* Run it normally:
 ```bash
-sudo -E .venv/bin/python3 spotify_matrix.py --rows 64 --cols 64 --chain-length 1 --parallel 1 --gpio-slowdown 5 --no-hardware-pulse --hardware-mapping adafruit-hat-pwm
+sudo -E .venv/bin/python3 spotify_matrix.py --rows 64 --cols 64 --chain-length 1 --parallel 1 --gpio-slowdown 5 --no-hardware-pulse --hardware-mapping adafruit-hat-pwm --web-port 5000
 
 ```
 
@@ -217,6 +258,39 @@ sudo systemctl start spotifymatrix.service
 
 6. **Disconnect:**
 You can now safely close your laptop terminal. The Pi is back in auto-pilot mode.
+
+---
+
+## PHASE 5: THE 6-MONTH RE-AUTHORIZATION (MAINTENANCE)
+
+Spotify's security policy forces "Refresh Tokens" to expire every 6 months. When this happens, your matrix will stop showing music and stay on the idle clock, and the background logs will show an `invalid_grant` error.
+
+To fix this and get another 6 months of automation, you just need to clear the old cache and re-authenticate:
+
+1. **Stop the Background Service:**
+   Open PowerShell, SSH into the Pi (`ssh adi@matrixspot.local`), and stop the service:
+   `sudo systemctl stop spotifymatrix.service`
+
+2. **Delete the Expired Token:**
+   `rm ~/Documents/SpotifyMatrix/.cache/spotify_token.json`
+
+3. **Open the Network Bridge:**
+   Open a SECOND PowerShell window on your laptop and run:
+   `ssh -L 8888:127.0.0.1:8888 adi@matrixspot.local`
+
+4. **Run the Authenticator:**
+   Go back to your FIRST terminal window and run:
+   `cd ~/Documents/SpotifyMatrix`
+   `.venv/bin/python3 spotify_matrix.py --auth-only --no-browser`
+
+5. **Authorize in Browser:**
+   Copy the URL printed in the terminal, paste it into your laptop's browser, and click "Agree".
+
+6. **Restart the Automation:**
+   Once the terminal confirms the token is saved, close the browser and the second terminal, and start the service back up:
+   `sudo systemctl start spotifymatrix.service`
+
+You are now good for another 6 months!
 
 ---
 
@@ -243,4 +317,18 @@ sudo journalctl -u spotifymatrix.service -f
 ```bash
 sudo reboot
 
+```
+
+**Open the web control panel:**
+
+```
+http://matrixspot.local:5000
+```
+
+**Quick mode switch from any browser:**
+
+```
+http://matrixspot.local:5000/mode?set=cd
+http://matrixspot.local:5000/mode?set=lyrics
+http://matrixspot.local:5000/mode?set=clock
 ```
