@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
 import datetime
 import functools
 from io import BytesIO
@@ -45,6 +46,59 @@ SPOTIFY_GREEN = (30, 215, 96)
 LYRIC_DIM_COLOR = (80, 80, 80)
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  LOGGING — In-memory ring buffer + console output
+# ═══════════════════════════════════════════════════════════════════
+
+class LogBuffer:
+    """Thread-safe in-memory ring buffer for log messages."""
+
+    def __init__(self, maxlen: int = 200) -> None:
+        self._buffer: collections.deque[dict[str, str]] = collections.deque(maxlen=maxlen)
+        self._lock = threading.Lock()
+
+    def add(self, msg: str, level: str = "info") -> None:
+        now = datetime.datetime.now().strftime("%H:%M:%S")
+        entry = {"time": now, "msg": msg, "level": level}
+        with self._lock:
+            self._buffer.append(entry)
+
+    def get_all(self) -> list[dict[str, str]]:
+        with self._lock:
+            return list(self._buffer)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._buffer.clear()
+
+
+# Global log buffer instance
+_log_buffer = LogBuffer(maxlen=200)
+_is_interactive = sys.stdout.isatty()
+
+
+def log(msg: str, level: str = "info", *, console: bool = True, verbose: bool = False) -> None:
+    """
+    Log a message to the ring buffer and optionally to console.
+
+    Args:
+        msg: The log message.
+        level: "info", "warn", or "error".
+        console: If True, also print to stdout (always True for important events).
+        verbose: If True, this is a verbose/tick message. Only printed in interactive mode.
+    """
+    _log_buffer.add(msg, level)
+    if console:
+        if verbose and not _is_interactive:
+            # In auto/systemd mode, skip verbose tick messages
+            return
+        print(msg, flush=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  DATA MODELS
+# ═══════════════════════════════════════════════════════════════════
+
 @dataclass
 class PlaybackArt:
     key: str
@@ -75,11 +129,16 @@ class SharedPlaybackState:
     lyrics: list[tuple[int, str]] | None = None  # [(timestamp_ms, text), ...]
     lyrics_track_key: str | None = None
     # Runtime-adjustable settings
-    display_mode: str = "cd"  # "cd", "lyrics", "clock"
+    display_mode: str = "default"  # "default", "cd", "lyrics", "clock"
+    effective_mode: str = "cd"  # what is actually rendering right now
     spin_speed: float = 20.0  # RPM
     text_scroll_speed: float = 12.0  # px/s
     poll_interval: float = 5.0  # seconds (active polling)
     brightness: int = 65  # 1-100
+    # Boot defaults (for reset)
+    _default_brightness: int = 65
+    _default_spin_speed: float = 20.0
+    _default_text_scroll_speed: float = 12.0
 
 
 @dataclass
@@ -91,6 +150,10 @@ class HttpResponse:
     def json(self) -> dict[str, Any]:
         return json.loads(self.body.decode("utf-8"))
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  HTTP UTILITIES
+# ═══════════════════════════════════════════════════════════════════
 
 def http_request(
     method: str,
@@ -124,11 +187,16 @@ def raise_http_error(response: HttpResponse, context: str) -> None:
     body = response.body.decode("utf-8", errors="replace")
     raise RuntimeError(f"{context} failed with HTTP {response.status}: {body}")
 
+
 class RateLimitException(Exception):
     def __init__(self, retry_after: int) -> None:
         super().__init__(f"Spotify API rate limited. Retry after {retry_after}s.")
         self.retry_after = retry_after
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  SPOTIFY CLIENT
+# ═══════════════════════════════════════════════════════════════════
 
 class SpotifyClient:
     def __init__(
@@ -146,9 +214,9 @@ class SpotifyClient:
         self.open_browser = open_browser
         self.token = self._load_token()
         if self.token:
-            print(f"Spotify: Token loaded from {token_cache}", flush=True)
+            log(f"Spotify: Token loaded from {token_cache}")
         else:
-            print("Spotify: No token found in cache", flush=True)
+            log("Spotify: No token found in cache")
 
     def get_currently_playing(self) -> dict[str, Any] | None:
         token = self._valid_access_token()
@@ -159,18 +227,18 @@ class SpotifyClient:
             headers={"Authorization": f"Bearer {token}"},
             timeout=5,
         )
-        if sys.stdout.isatty() or response.status != 200:
-            print(f"Spotify API: Received HTTP {response.status}", flush=True)
+        if _is_interactive or response.status != 200:
+            log(f"Spotify API: HTTP {response.status}", verbose=True)
 
         if response.status == 204:
             return None
         if response.status == 401:
-            print("Spotify API: Token expired or invalid (401), attempting refresh...", flush=True)
+            log("Spotify API: Token expired (401), refreshing...", "warn")
             self._refresh_access_token()
             return self.get_currently_playing()
         if response.status == 429:
             retry_after = int(response.headers.get("Retry-After", "0"))
-            print(f"Spotify API: Rate limited (429)! Server requested wait of {retry_after} seconds.", flush=True)
+            log(f"Spotify API: Rate limited (429)! Wait {retry_after}s.", "error")
             raise RateLimitException(retry_after)
         if response.status != 200:
             raise_http_error(response, "Spotify currently-playing request")
@@ -256,7 +324,7 @@ class SpotifyClient:
         return token
 
     def _refresh_access_token(self) -> None:
-        print("Spotify: Refreshing access token...", flush=True)
+        log("Spotify: Refreshing access token...")
         refresh_token = self.token.get("refresh_token") if self.token else None
         if not refresh_token:
             self.token = self._authorize()
@@ -353,6 +421,10 @@ class LocalCallbackServer:
         return self.code
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  DISPLAY BACKENDS
+# ═══════════════════════════════════════════════════════════════════
+
 class MatrixDisplay:
     def __init__(self, args: argparse.Namespace) -> None:
         try:
@@ -387,7 +459,6 @@ class MatrixDisplay:
         self.matrix.Clear()
 
     def set_brightness(self, value: int) -> None:
-        """Set matrix brightness at runtime (1-100)."""
         self.matrix.brightness = max(1, min(100, value))
 
 
@@ -403,9 +474,12 @@ class MockDisplay:
         return
 
     def set_brightness(self, value: int) -> None:
-        """No-op for mock display."""
         pass
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  IMAGE / FONT HELPERS
+# ═══════════════════════════════════════════════════════════════════
 
 def demo_album_art(size: int) -> Image.Image:
     image = Image.new("RGB", (size, size), (18, 18, 18))
@@ -418,6 +492,29 @@ def demo_album_art(size: int) -> Image.Image:
     draw.line((size, 0, 0, size), fill=(0, 0, 0), width=max(2, size // 22))
     return image
 
+
+@functools.lru_cache(maxsize=16)
+def get_font(size: int = 9) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        try:
+            return ImageFont.truetype("arial.ttf", size)
+        except OSError:
+            return ImageFont.load_default()
+
+
+@functools.lru_cache(maxsize=16)
+def get_text_height(font_size: int = 9) -> int:
+    font = get_font(font_size)
+    draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    bbox = draw.textbbox((0, 0), "Ag - Mj", font=font)
+    return max(1, bbox[3] - bbox[1])
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  PLAYBACK ART EXTRACTION
+# ═══════════════════════════════════════════════════════════════════
 
 def playback_art_from_response(playback: dict[str, Any] | None) -> PlaybackArt | None:
     if not playback:
@@ -447,7 +544,6 @@ def playback_art_from_response(playback: dict[str, Any] | None) -> PlaybackArt |
     image = max(images, key=lambda candidate: candidate.get("width") or 0)
     item_id = item.get("id") or item.get("uri") or image["url"]
 
-    # Extract progress and duration from the playback response
     progress_ms = int(playback.get("progress_ms", 0))
     duration_ms = int(item.get("duration_ms", 0))
 
@@ -469,11 +565,14 @@ def download_image(url: str) -> Image.Image:
         return Image.open(BytesIO(response.read())).convert("RGB")
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  RENDERING — RECORD / IDLE / CLOCK
+# ═══════════════════════════════════════════════════════════════════
+
 _disc_mask_cache: dict[int, Image.Image] = {}
 
 
 def _get_disc_mask(size: int) -> Image.Image:
-    """Return a cached circular mask for the given size."""
     if size not in _disc_mask_cache:
         mask = Image.new("L", (size, size), 0)
         ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
@@ -487,7 +586,6 @@ def render_record(art: Image.Image | None, angle: float, size: int) -> Image.Ima
         return frame.convert("RGB")
 
     disc_size = size
-    # The album art is the record surface: rotate it first, then cut it into a circular disk.
     art_square = ImageOps.fit(art, (disc_size, disc_size), method=Image.Resampling.LANCZOS)
     rotated = art_square.rotate(angle, resample=Image.Resampling.BICUBIC)
 
@@ -501,25 +599,14 @@ def render_record(art: Image.Image | None, angle: float, size: int) -> Image.Ima
     label_radius = max(3, size // 16)
     hole_radius = max(1, size // 40)
 
-    # Center label
     draw.ellipse(
-        (
-            center - label_radius,
-            center - label_radius,
-            center + label_radius,
-            center + label_radius,
-        ),
-        fill=(16, 16, 16, 210),
-        outline=(220, 220, 220, 90),
+        (center - label_radius, center - label_radius,
+         center + label_radius, center + label_radius),
+        fill=(16, 16, 16, 210), outline=(220, 220, 220, 90),
     )
-    # Spindle hole
     draw.ellipse(
-        (
-            center - hole_radius,
-            center - hole_radius,
-            center + hole_radius,
-            center + hole_radius,
-        ),
+        (center - hole_radius, center - hole_radius,
+         center + hole_radius, center + hole_radius),
         fill=(0, 0, 0, 255),
     )
     return frame.convert("RGB")
@@ -528,31 +615,11 @@ def render_record(art: Image.Image | None, angle: float, size: int) -> Image.Ima
 def render_idle(size: int) -> Image.Image:
     frame = Image.new("RGB", (size, size), (0, 0, 0))
     draw = ImageDraw.Draw(frame)
-    margin = 0
-    draw.ellipse((margin, margin, size - margin - 1, size - margin - 1), outline=(220, 220, 220), width=1)
+    draw.ellipse((0, 0, size - 1, size - 1), outline=(220, 220, 220), width=1)
     center = size // 2
     radius = max(2, size // 25)
     draw.ellipse((center - radius, center - radius, center + radius, center + radius), fill=(18, 18, 18))
     return frame
-
-
-@functools.lru_cache(maxsize=16)
-def get_font(size: int = 9) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
-    try:
-        return ImageFont.load_default(size=size)
-    except TypeError:
-        try:
-            return ImageFont.truetype("arial.ttf", size)
-        except OSError:
-            return ImageFont.load_default()
-
-
-@functools.lru_cache(maxsize=16)
-def get_text_height(font_size: int = 9) -> int:
-    font = get_font(font_size)
-    draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    bbox = draw.textbbox((0, 0), "Ag - Mj", font=font)
-    return max(1, bbox[3] - bbox[1])
 
 
 def render_clock(size: int, is_connected: bool = True) -> Image.Image:
@@ -560,15 +627,13 @@ def render_clock(size: int, is_connected: bool = True) -> Image.Image:
     draw = ImageDraw.Draw(frame)
     now = datetime.datetime.now()
 
-    # Text content
-    day_str = now.strftime("%a").upper()               # e.g., "FRI"
-    time_str = now.strftime("%I:%M %p").lstrip("0")    # e.g., "4:05 PM"
-    date_str = now.strftime("%b %d").upper()           # e.g., "OCT 25"
+    day_str = now.strftime("%a").upper()
+    time_str = now.strftime("%I:%M %p").lstrip("0")
+    date_str = now.strftime("%b %d").upper()
 
     small_font = get_font(max(8, size // 8))
     time_font = get_font(max(10, size // 5))
 
-    # Calculate bounding boxes
     day_bbox = draw.textbbox((0, 0), day_str, font=small_font)
     time_bbox = draw.textbbox((0, 0), time_str, font=time_font)
     date_bbox = draw.textbbox((0, 0), date_str, font=small_font)
@@ -577,30 +642,24 @@ def render_clock(size: int, is_connected: bool = True) -> Image.Image:
     time_h = time_bbox[3] - time_bbox[1]
     date_h = date_bbox[3] - date_bbox[1]
 
-    # Layout gap and total height
     gap = 2
     total_h = day_h + gap + time_h + gap + date_h
     start_y = (size - total_h) // 2
 
-    # Draw Day — dim Spotify green
     day_x = (size - (day_bbox[2] - day_bbox[0])) // 2
     draw.text((day_x, start_y - day_bbox[1]), day_str, fill=SPOTIFY_GREEN, font=small_font)
 
-    # Draw Time (AM/PM)
     time_y = start_y + day_h + gap
     time_x = (size - (time_bbox[2] - time_bbox[0])) // 2
     draw.text((time_x, time_y - time_bbox[1]), time_str, fill=(255, 255, 255), font=time_font)
 
-    # Draw Date
     date_y = time_y + time_h + gap
     date_x = (size - (date_bbox[2] - date_bbox[0])) // 2
     draw.text((date_x, date_y - date_bbox[1]), date_str, fill=(180, 180, 180), font=small_font)
 
-    # Outer circle ring
     margin = 1
     draw.ellipse((margin, margin, size - margin - 1, size - margin - 1), outline=(50, 50, 70), width=1)
 
-    # Hour tick marks around the ring
     cx = size / 2.0
     cy = size / 2.0
     outer_r = (size - margin * 2) / 2.0
@@ -614,7 +673,6 @@ def render_clock(size: int, is_connected: bool = True) -> Image.Image:
         tick_color = (100, 100, 120) if hour % 3 != 0 else (160, 160, 180)
         draw.line((x1, y1, x2, y2), fill=tick_color, width=1)
 
-    # Sweeping seconds dot — tick once per second
     second_angle = (now.second / 60.0) * 360 - 90
     rad = math.radians(second_angle)
     dot_r = outer_r - 1
@@ -622,22 +680,25 @@ def render_clock(size: int, is_connected: bool = True) -> Image.Image:
     sy = cy + math.sin(rad) * dot_r
     draw.ellipse((sx - 1.5, sy - 1.5, sx + 1.5, sy + 1.5), fill=SPOTIFY_GREEN)
 
-    # Connection status pulse dot (bottom right corner, with margins)
-    pulse = (math.sin(time.time() * 2.0) + 1.0) / 2.0  # 0.0 to 1.0
+    pulse = (math.sin(time.time() * 2.0) + 1.0) / 2.0
     pulse_brightness = int(50 + pulse * 150)
     if is_connected:
-        pulse_color = (0, pulse_brightness, int(pulse_brightness * 0.3)) # Green
+        pulse_color = (0, pulse_brightness, int(pulse_brightness * 0.3))
     else:
-        pulse_color = (pulse_brightness, 0, 0) # Red
-    
+        pulse_color = (pulse_brightness, 0, 0)
+
     pulse_margin = max(4, size // 12)
     pulse_x = size - pulse_margin
     pulse_y = size - pulse_margin
-    pulse_r = 2 # slightly bigger than 1
+    pulse_r = 2
     draw.ellipse((pulse_x - pulse_r, pulse_y - pulse_r, pulse_x + pulse_r, pulse_y + pulse_r), fill=pulse_color)
 
     return frame
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  RENDERING — SCROLLING TEXT / FULL FRAME / TRANSITIONS
+# ═══════════════════════════════════════════════════════════════════
 
 def draw_scrolling_text(
     image: Image.Image,
@@ -671,7 +732,6 @@ def draw_scrolling_text(
         banner_y1 = size_y - 1
         y_pos = banner_y0 + (actual_banner_h - text_h) - y_offset
 
-    # High-contrast solid background banner
     draw.rectangle((0, banner_y0, size_x - 1, banner_y1), fill=bg_color)
 
     separator = "   - - -   "
@@ -682,7 +742,7 @@ def draw_scrolling_text(
     if unit_w <= 0:
         return image
 
-    offset_x = - (scroll_x % unit_w)
+    offset_x = -(scroll_x % unit_w)
     cur_x = offset_x
 
     while cur_x < size_x:
@@ -690,20 +750,14 @@ def draw_scrolling_text(
             draw.text((cur_x, y_pos), full_unit, fill=text_color, font=font)
         cur_x += unit_w
 
-    # Gradient fade edges — text smoothly emerges from / fades into black
     fade_width = min(6, size_x // 10)
     for i in range(fade_width):
-        alpha = int(255 * (i / fade_width))
-        fade_color = tuple(int(c * alpha / 255) for c in bg_color) or (0, 0, 0)
-        # Left edge fade (opaque → transparent)
         left_x = i
+        right_x = size_x - 1 - i
         for y in range(banner_y0, banner_y1 + 1):
             orig = image.getpixel((left_x, y))
             blended = tuple(int(orig[c] * i / fade_width) for c in range(3))
             image.putpixel((left_x, y), blended)
-        # Right edge fade (transparent → opaque)
-        right_x = size_x - 1 - i
-        for y in range(banner_y0, banner_y1 + 1):
             orig = image.getpixel((right_x, y))
             blended = tuple(int(orig[c] * i / fade_width) for c in range(3))
             image.putpixel((right_x, y), blended)
@@ -738,18 +792,17 @@ def create_full_frame(
     cd_y = (banner_h + gap) if (has_text and args.text_position == "top") else 0
     frame.paste(cd_img, (cd_x, cd_y))
 
-    # Draw clock overlay
     now = datetime.datetime.now()
     hour_str = now.strftime("%I").lstrip("0")
     minute_str = now.strftime("%M")
-    
+
     clock_font_size = max(9, args.text_font_size + 1)
     clock_font = get_font(clock_font_size)
     dummy_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    
+
     hour_bbox = dummy_draw.textbbox((0, 0), hour_str, font=clock_font)
     minute_bbox = dummy_draw.textbbox((0, 0), minute_str, font=clock_font)
-    
+
     hour_h = hour_bbox[3] - hour_bbox[1]
     minute_w = minute_bbox[2] - minute_bbox[0]
     minute_h = minute_bbox[3] - minute_bbox[1]
@@ -763,7 +816,6 @@ def create_full_frame(
     hour_x = 1
     minute_x = size_x - minute_w - 1
 
-    # Text outline for visibility
     for dx in [-1, 0, 1]:
         for dy in [-1, 0, 1]:
             if dx != 0 or dy != 0:
@@ -775,11 +827,8 @@ def create_full_frame(
 
     if has_text:
         frame = draw_scrolling_text(
-            frame,
-            text=display_text,
-            scroll_x=scroll_x,
-            position=args.text_position,
-            banner_height=banner_h,
+            frame, text=display_text, scroll_x=scroll_x,
+            position=args.text_position, banner_height=banner_h,
             font_size=args.text_font_size,
         )
 
@@ -830,14 +879,8 @@ def render_test_pattern(size: int, offset: int) -> Image.Image:
     frame = Image.new("RGB", (size, size), (0, 0, 0))
     draw = ImageDraw.Draw(frame)
     colors = (
-        (255, 0, 0),
-        (255, 160, 0),
-        (255, 255, 0),
-        (0, 255, 0),
-        (0, 120, 255),
-        (80, 0, 255),
-        (255, 255, 255),
-        (0, 0, 0),
+        (255, 0, 0), (255, 160, 0), (255, 255, 0), (0, 255, 0),
+        (0, 120, 255), (80, 0, 255), (255, 255, 255), (0, 0, 0),
     )
     stripe_width = max(1, size // len(colors))
     for index, color in enumerate(colors):
@@ -857,7 +900,6 @@ _LRC_LINE_RE = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)")
 
 
 def parse_lrc(synced_lyrics: str) -> list[tuple[int, str]]:
-    """Parse an LRC synced lyrics string into [(timestamp_ms, text), ...]."""
     result: list[tuple[int, str]] = []
     for line in synced_lyrics.splitlines():
         match = _LRC_LINE_RE.match(line.strip())
@@ -874,7 +916,6 @@ def parse_lrc(synced_lyrics: str) -> list[tuple[int, str]]:
 def fetch_lyrics(
     artist: str, track: str, album: str, duration_s: int
 ) -> list[tuple[int, str]] | None:
-    """Fetch synced lyrics from LRCLIB. Returns parsed list or None."""
     try:
         params = {
             "artist_name": artist,
@@ -896,39 +937,31 @@ def fetch_lyrics(
         parsed = parse_lrc(synced)
         return parsed if parsed else None
     except Exception as exc:
-        print(f"LRCLIB: Failed to fetch lyrics: {exc}", flush=True)
+        log(f"LRCLIB: Failed to fetch lyrics: {exc}", "warn")
         return None
 
 
 def fetch_lyrics_async(
-    artist: str,
-    track: str,
-    album: str,
-    duration_s: int,
-    state: SharedPlaybackState,
-    lock: threading.Lock,
-    track_key: str,
+    artist: str, track: str, album: str, duration_s: int,
+    state: SharedPlaybackState, lock: threading.Lock, track_key: str,
 ) -> None:
-    """Background thread target: fetch lyrics and store in shared state."""
-    print(f"LRCLIB: Fetching lyrics for '{track}' by '{artist}'...", flush=True)
+    log(f"LRCLIB: Fetching lyrics for '{track}' by '{artist}'...")
     lyrics = fetch_lyrics(artist, track, album, duration_s)
     with lock:
-        # Only store if the track hasn't changed while we were fetching
         if state.art_key == track_key:
             state.lyrics = lyrics
             state.lyrics_track_key = track_key
     if lyrics:
-        print(f"LRCLIB: Found {len(lyrics)} synced lyric lines.", flush=True)
+        log(f"LRCLIB: Found {len(lyrics)} synced lyric lines.")
     else:
-        print("LRCLIB: No synced lyrics available for this track.", flush=True)
+        log("LRCLIB: No synced lyrics available for this track.")
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  LYRICS RENDERER
+#  LYRICS RENDERER — Smooth vertical scroll
 # ═══════════════════════════════════════════════════════════════════
 
 def get_current_lyric_index(lyrics: list[tuple[int, str]], progress_ms: int) -> int:
-    """Binary search to find the index of the current lyric line."""
     if not lyrics:
         return -1
     lo, hi = 0, len(lyrics) - 1
@@ -943,102 +976,151 @@ def get_current_lyric_index(lyrics: list[tuple[int, str]], progress_ms: int) -> 
     return result
 
 
+# Persistent state for smooth lyrics scrolling (updated each frame)
+_lyrics_scroll_state = {
+    "last_idx": -1,
+    "scroll_y": 0.0,       # current interpolated Y offset
+    "target_y": 0.0,       # target Y offset
+    "transition_start": 0.0,
+}
+
+LYRICS_FONT_SIZE = 9
+LYRICS_LINE_HEIGHT = 14   # pixels between lines (font 9 ≈ 10px tall + 4px gap)
+LYRICS_CENTER_Y = 28      # vertical center for the active line
+LYRICS_SCROLL_DURATION = 0.4  # seconds for smooth scroll animation
+LYRICS_H_SCROLL_SPEED = 15.0  # px/s for horizontal overflow scroll
+
+
 def render_lyrics(
     size: int,
     lyrics: list[tuple[int, str]] | None,
-    progress_ms: int,
     duration_ms: int,
     is_playing: bool,
     fetch_time: float,
     stored_progress_ms: int,
 ) -> Image.Image:
-    """Render the 3-line lyrics view for the 64x64 matrix."""
+    """Render lyrics as a smooth vertically-scrolling column."""
     frame = Image.new("RGB", (size, size), (0, 0, 0))
     draw = ImageDraw.Draw(frame)
-    font = get_font(8)
+    font = get_font(LYRICS_FONT_SIZE)
 
-    # Calculate estimated progress with local time interpolation
+    # Calculate estimated progress
     if is_playing and fetch_time > 0:
         elapsed_since_fetch = (time.monotonic() - fetch_time) * 1000
         estimated_progress = stored_progress_ms + int(elapsed_since_fetch)
     else:
         estimated_progress = stored_progress_ms
 
-    # Clamp to duration
     if duration_ms > 0:
         estimated_progress = min(estimated_progress, duration_ms)
 
     if not lyrics:
-        # No lyrics available — show placeholder
+        # No lyrics placeholder
         no_lyrics_text = "No Lyrics"
         bbox = draw.textbbox((0, 0), no_lyrics_text, font=font)
         tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
         x = (size - tw) // 2
-        y = (size - th) // 2
+        y = (size - (bbox[3] - bbox[1])) // 2
         draw.text((x, y - bbox[1]), no_lyrics_text, fill=LYRIC_DIM_COLOR, font=font)
-
-        # Music note decorations
-        note = "♪"
-        note_bbox = draw.textbbox((0, 0), note, font=font)
-        nw = note_bbox[2] - note_bbox[0]
-        draw.text((x - nw - 3, y - note_bbox[1]), note, fill=SPOTIFY_GREEN, font=font)
-        draw.text((x + tw + 3, y - note_bbox[1]), note, fill=SPOTIFY_GREEN, font=font)
+        note = "\u266a"
+        nbbox = draw.textbbox((0, 0), note, font=font)
+        nw = nbbox[2] - nbbox[0]
+        draw.text((x - nw - 3, y - nbbox[1]), note, fill=SPOTIFY_GREEN, font=font)
+        draw.text((x + tw + 3, y - nbbox[1]), note, fill=SPOTIFY_GREEN, font=font)
     else:
         idx = get_current_lyric_index(lyrics, estimated_progress)
+        now_mono = time.monotonic()
 
-        # Y positions for 3 lines on 64px display
-        y_positions = [10, 28, 46]
-        line_indices = [idx - 1, idx, idx + 1]
-        colors = [LYRIC_DIM_COLOR, SPOTIFY_GREEN, LYRIC_DIM_COLOR]
+        # Smooth vertical scroll: when the active lyric index changes,
+        # we animate the Y offset over LYRICS_SCROLL_DURATION seconds.
+        if idx != _lyrics_scroll_state["last_idx"]:
+            _lyrics_scroll_state["last_idx"] = idx
+            _lyrics_scroll_state["target_y"] = float(idx * LYRICS_LINE_HEIGHT)
+            _lyrics_scroll_state["transition_start"] = now_mono
 
-        # Calculate how long the current lyric has been active (for scrolling)
-        if idx >= 0:
-            lyric_start_ms = lyrics[idx][0]
-            time_on_screen_ms = estimated_progress - lyric_start_ms
+        target_y = _lyrics_scroll_state["target_y"]
+        elapsed = now_mono - _lyrics_scroll_state["transition_start"]
+
+        if elapsed < LYRICS_SCROLL_DURATION:
+            # Ease-out cubic
+            t = elapsed / LYRICS_SCROLL_DURATION
+            eased = 1.0 - (1.0 - t) ** 3
+            old_y = _lyrics_scroll_state["scroll_y"]
+            current_y = old_y + (target_y - old_y) * eased
         else:
-            time_on_screen_ms = 0
+            current_y = target_y
+            _lyrics_scroll_state["scroll_y"] = target_y
 
-        for line_i, (li, y_pos, color) in enumerate(zip(line_indices, y_positions, colors)):
+        # When animation completes, store final position
+        if elapsed >= LYRICS_SCROLL_DURATION:
+            _lyrics_scroll_state["scroll_y"] = target_y
+
+        # Render visible lyrics lines as a scrolling column
+        # Active line Y = LYRICS_CENTER_Y, other lines offset by LYRICS_LINE_HEIGHT
+        # The scroll offset determines which line is at center
+        visible_range = 5  # how many lines above/below to render
+        fade_zone = 12  # pixels from top/bottom where text fades
+
+        for offset in range(-visible_range, visible_range + 1):
+            li = idx + offset
             if li < 0 or li >= len(lyrics):
                 continue
+
             text = lyrics[li][1]
             if not text.strip():
                 continue
 
+            # Y position: center line is at LYRICS_CENTER_Y
+            # Smooth offset from scroll animation
+            line_target_y = li * LYRICS_LINE_HEIGHT
+            y_pixel = LYRICS_CENTER_Y + (line_target_y - current_y) * 1.0
+
+            # Skip if fully off-screen
+            if y_pixel < -10 or y_pixel > size + 10:
+                continue
+
+            # Color: active line = green, others = dim gray
+            if li == idx:
+                base_color = SPOTIFY_GREEN
+            else:
+                base_color = LYRIC_DIM_COLOR
+
+            # Vertical edge fade: reduce brightness near top/bottom edges
+            fade_factor = 1.0
+            if y_pixel < fade_zone:
+                fade_factor = max(0.0, y_pixel / fade_zone)
+            elif y_pixel > size - fade_zone - LYRICS_LINE_HEIGHT:
+                fade_factor = max(0.0, (size - y_pixel - LYRICS_LINE_HEIGHT) / fade_zone)
+            fade_factor = max(0.0, min(1.0, fade_factor))
+
+            color = tuple(int(c * fade_factor) for c in base_color)
+
+            # Measure text width
             bbox = draw.textbbox((0, 0), text, font=font)
             text_w = bbox[2] - bbox[0]
-            text_h = bbox[3] - bbox[1]
-            y_draw = y_pos - bbox[1]
+            y_draw = int(y_pixel) - bbox[1]
 
             if text_w <= size:
-                # Text fits — center it
+                # Fits — center it
                 x = (size - text_w) // 2
                 draw.text((x, y_draw), text, fill=color, font=font)
             else:
-                # Text overflows — apply horizontal scroll
-                overflow = text_w - size
-                if line_i == 1:
-                    # Current line: scroll based on time on screen
-                    scroll_speed = 20.0  # px/s
-                    scroll_offset = (time_on_screen_ms / 1000.0) * scroll_speed
-                    # Ping-pong: scroll right, pause, scroll left
-                    cycle_duration = overflow / scroll_speed  # time to scroll one direction
-                    total_cycle = cycle_duration * 2 + 1.0  # add 0.5s pause at each end
-                    t = (time_on_screen_ms / 1000.0) % total_cycle
-                    if t < 0.5:
-                        x = 0
-                    elif t < 0.5 + cycle_duration:
-                        x = -int(overflow * ((t - 0.5) / cycle_duration))
-                    elif t < 1.0 + cycle_duration:
-                        x = -overflow
-                    else:
-                        x = -int(overflow * (1.0 - (t - 1.0 - cycle_duration) / cycle_duration))
+                # Overflow — slow continuous left scroll
+                overflow = text_w - size + 4  # 4px padding
+                scroll_cycle = overflow / LYRICS_H_SCROLL_SPEED
+                pause = 1.0  # 1 second pause at start
+                total_cycle = pause + scroll_cycle + pause + scroll_cycle
+                t = (now_mono % total_cycle)
+                if t < pause:
+                    x = 2  # start with small left margin
+                elif t < pause + scroll_cycle:
+                    frac = (t - pause) / scroll_cycle
+                    x = 2 - int(frac * overflow)
+                elif t < pause * 2 + scroll_cycle:
+                    x = 2 - overflow
                 else:
-                    # Context lines: slow constant scroll
-                    scroll_time = time.monotonic() * 10.0  # slow
-                    x = -int(scroll_time % (overflow + size)) + size // 2
-                    x = max(-overflow, min(0, x))
+                    frac = (t - pause * 2 - scroll_cycle) / scroll_cycle
+                    x = 2 - overflow + int(frac * overflow)
                 draw.text((x, y_draw), text, fill=color, font=font)
 
     # Progress bar at bottom (1px height)
@@ -1047,7 +1129,6 @@ def render_lyrics(
         bar_w = int(progress_frac * size)
         if bar_w > 0:
             draw.rectangle((0, size - 1, bar_w - 1, size - 1), fill=SPOTIFY_GREEN)
-        # Dim background for remaining
         if bar_w < size:
             draw.rectangle((bar_w, size - 1, size - 1, size - 1), fill=(30, 30, 30))
 
@@ -1055,7 +1136,7 @@ def render_lyrics(
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  WEB CONTROL PANEL
+#  WEB CONTROL PANEL — HTML
 # ═══════════════════════════════════════════════════════════════════
 
 CONTROL_PANEL_HTML = """<!DOCTYPE html>
@@ -1066,9 +1147,9 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
 <title>SpotifyMatrix Control</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-  
+
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  
+
   :root {
     --bg: #0a0a0a;
     --card: #141414;
@@ -1078,11 +1159,13 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
     --green: #1ed760;
     --green-dim: rgba(30, 215, 96, 0.15);
     --green-glow: rgba(30, 215, 96, 0.3);
-    --accent: #1db954;
+    --gold: #f59e0b;
+    --gold-dim: rgba(245, 158, 11, 0.15);
+    --gold-glow: rgba(245, 158, 11, 0.3);
     --danger: #ef4444;
     --radius: 12px;
   }
-  
+
   body {
     font-family: 'Inter', -apple-system, sans-serif;
     background: var(--bg);
@@ -1092,10 +1175,10 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
     padding-bottom: 40px;
     -webkit-tap-highlight-color: transparent;
   }
-  
+
   .header {
     text-align: center;
-    padding: 20px 0 24px;
+    padding: 16px 0 20px;
   }
   .header h1 {
     font-size: 20px;
@@ -1112,7 +1195,7 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
     text-transform: uppercase;
     letter-spacing: 1.5px;
   }
-  
+
   .status-dot {
     display: inline-block;
     width: 6px; height: 6px;
@@ -1122,7 +1205,7 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
   }
   .status-dot.connected { background: var(--green); box-shadow: 0 0 6px var(--green-glow); }
   .status-dot.disconnected { background: var(--danger); }
-  
+
   .card {
     background: var(--card);
     border: 1px solid var(--card-border);
@@ -1138,13 +1221,9 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
     letter-spacing: 1px;
     margin-bottom: 12px;
   }
-  
+
   /* Now Playing */
-  .now-playing {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-  }
+  .now-playing { display: flex; align-items: center; gap: 12px; }
   .now-playing .album-art {
     width: 48px; height: 48px;
     border-radius: 8px;
@@ -1152,46 +1231,38 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
     flex-shrink: 0;
     overflow: hidden;
   }
-  .now-playing .album-art img {
-    width: 100%; height: 100%;
-    object-fit: cover;
-  }
-  .now-playing .track-info {
-    flex: 1;
-    min-width: 0;
-  }
+  .now-playing .album-art img { width: 100%; height: 100%; object-fit: cover; }
+  .now-playing .track-info { flex: 1; min-width: 0; }
   .track-info .title {
-    font-size: 14px;
-    font-weight: 600;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    font-size: 14px; font-weight: 600;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .track-info .artist {
-    font-size: 12px;
-    color: var(--text-dim);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    font-size: 12px; color: var(--text-dim);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
-  .play-status {
-    font-size: 10px;
-    color: var(--green);
-    margin-top: 2px;
+  .track-info .album-line {
+    font-size: 10px; color: #555;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    margin-top: 1px;
   }
+  .play-status { font-size: 10px; color: var(--green); margin-top: 2px; }
   .play-status.paused { color: var(--text-dim); }
-  
-  /* Mode Selector */
+  .effective-mode {
+    font-size: 10px; color: var(--gold); margin-top: 1px;
+  }
+
+  /* Mode Selector — 4 columns */
   .mode-grid {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 8px;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
   }
   .mode-btn {
     background: var(--bg);
     border: 2px solid var(--card-border);
     border-radius: 10px;
-    padding: 14px 8px;
+    padding: 10px 4px;
     text-align: center;
     cursor: pointer;
     transition: all 0.2s ease;
@@ -1202,67 +1273,68 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
   .mode-btn.active {
     border-color: var(--green);
     background: var(--green-dim);
-    box-shadow: 0 0 12px var(--green-glow);
+    box-shadow: 0 0 10px var(--green-glow);
   }
-  .mode-btn .icon { font-size: 24px; margin-bottom: 4px; }
+  .mode-btn.active-default {
+    border-color: var(--gold);
+    background: var(--gold-dim);
+    box-shadow: 0 0 10px var(--gold-glow);
+  }
+  .mode-btn .icon { font-size: 20px; margin-bottom: 2px; }
   .mode-btn .label {
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
+    font-size: 9px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.3px;
   }
-  
+
   /* Sliders */
-  .slider-group {
-    margin-bottom: 16px;
-  }
+  .slider-group { margin-bottom: 14px; }
   .slider-group:last-child { margin-bottom: 0; }
   .slider-label {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 8px;
+    display: flex; justify-content: space-between;
+    align-items: center; margin-bottom: 6px;
   }
-  .slider-label .name {
-    font-size: 13px;
-    font-weight: 500;
-  }
+  .slider-label .name { font-size: 12px; font-weight: 500; }
   .slider-label .value {
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--green);
-    min-width: 40px;
-    text-align: right;
+    font-size: 12px; font-weight: 600; color: var(--green);
+    min-width: 36px; text-align: right;
   }
   input[type="range"] {
-    -webkit-appearance: none;
-    width: 100%;
-    height: 6px;
-    border-radius: 3px;
-    background: #333;
-    outline: none;
+    -webkit-appearance: none; width: 100%;
+    height: 6px; border-radius: 3px; background: #333; outline: none;
   }
   input[type="range"]::-webkit-slider-thumb {
-    -webkit-appearance: none;
-    width: 20px; height: 20px;
-    border-radius: 50%;
-    background: var(--green);
-    cursor: pointer;
+    -webkit-appearance: none; width: 20px; height: 20px;
+    border-radius: 50%; background: var(--green); cursor: pointer;
     box-shadow: 0 0 8px var(--green-glow);
   }
   input[type="range"]::-moz-range-thumb {
-    width: 20px; height: 20px;
-    border-radius: 50%;
-    background: var(--green);
-    cursor: pointer;
-    border: none;
+    width: 20px; height: 20px; border-radius: 50%;
+    background: var(--green); cursor: pointer; border: none;
   }
-  
+
+  /* Buttons */
+  .btn-row { display: flex; gap: 8px; margin-top: 12px; }
+  .btn {
+    flex: 1; padding: 10px; border: none; border-radius: 8px;
+    font-family: 'Inter', sans-serif; font-size: 12px; font-weight: 600;
+    cursor: pointer; transition: all 0.2s; text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .btn:active { transform: scale(0.97); }
+  .btn-reset {
+    background: #1e1e1e; color: var(--text-dim);
+    border: 1px solid #333;
+  }
+  .btn-reset:hover { background: #2a2a2a; color: var(--text); }
+  .btn-logs {
+    background: #1e1e1e; color: var(--text-dim);
+    border: 1px solid #333;
+  }
+  .btn-logs:hover { background: #2a2a2a; color: var(--text); }
+
   .footer {
-    text-align: center;
-    padding: 20px 0;
-    font-size: 10px;
-    color: var(--text-dim);
+    text-align: center; padding: 16px 0;
+    font-size: 10px; color: var(--text-dim);
   }
 </style>
 </head>
@@ -1282,9 +1354,11 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
   <div class="now-playing">
     <div class="album-art" id="albumArt"></div>
     <div class="track-info">
-      <div class="title" id="trackTitle">—</div>
+      <div class="title" id="trackTitle">&mdash;</div>
       <div class="artist" id="trackArtist">Waiting for Spotify...</div>
-      <div class="play-status" id="playStatus">⏸ Paused</div>
+      <div class="album-line" id="albumName"></div>
+      <div class="play-status" id="playStatus">&#9208; Paused</div>
+      <div class="effective-mode" id="effectiveMode"></div>
     </div>
   </div>
 </div>
@@ -1293,16 +1367,20 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
 <div class="card">
   <div class="card-title">Display Mode</div>
   <div class="mode-grid">
-    <div class="mode-btn active" data-mode="cd" onclick="setMode('cd')">
-      <div class="icon">💿</div>
+    <div class="mode-btn active-default" data-mode="default" onclick="setMode('default')">
+      <div class="icon">&#10024;</div>
+      <div class="label">Default</div>
+    </div>
+    <div class="mode-btn" data-mode="cd" onclick="setMode('cd')">
+      <div class="icon">&#128191;</div>
       <div class="label">CD</div>
     </div>
     <div class="mode-btn" data-mode="lyrics" onclick="setMode('lyrics')">
-      <div class="icon">🎵</div>
+      <div class="icon">&#127925;</div>
       <div class="label">Lyrics</div>
     </div>
     <div class="mode-btn" data-mode="clock" onclick="setMode('clock')">
-      <div class="icon">🕐</div>
+      <div class="icon">&#128336;</div>
       <div class="label">Clock</div>
     </div>
   </div>
@@ -1311,49 +1389,54 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
 <!-- Settings Card -->
 <div class="card">
   <div class="card-title">Settings</div>
-  
+
   <div class="slider-group">
     <div class="slider-label">
-      <span class="name">☀ Brightness</span>
+      <span class="name">&#9728; Brightness</span>
       <span class="value" id="brightnessVal">65</span>
     </div>
     <input type="range" id="brightness" min="1" max="100" value="65"
            oninput="document.getElementById('brightnessVal').textContent=this.value"
            onchange="setSetting('brightness', this.value)">
   </div>
-  
+
   <div class="slider-group">
     <div class="slider-label">
-      <span class="name">💫 Spin Speed (RPM)</span>
+      <span class="name">&#128171; Spin Speed</span>
       <span class="value" id="spinVal">20</span>
     </div>
     <input type="range" id="spinSpeed" min="1" max="120" value="20"
            oninput="document.getElementById('spinVal').textContent=this.value"
            onchange="setSetting('spin-speed', this.value)">
   </div>
-  
+
   <div class="slider-group">
     <div class="slider-label">
-      <span class="name">📜 Text Speed (px/s)</span>
+      <span class="name">&#128220; Text Speed</span>
       <span class="value" id="textVal">12</span>
     </div>
     <input type="range" id="textSpeed" min="1" max="100" value="12"
            oninput="document.getElementById('textVal').textContent=this.value"
            onchange="setSetting('text-speed', this.value)">
   </div>
-  
+
   <div class="slider-group">
     <div class="slider-label">
-      <span class="name">📡 Poll Rate (seconds)</span>
+      <span class="name">&#128225; Poll Rate (sec)</span>
       <span class="value" id="pollVal">5</span>
     </div>
     <input type="range" id="pollRate" min="1" max="60" value="5"
            oninput="document.getElementById('pollVal').textContent=this.value"
            onchange="setSetting('poll-rate', this.value)">
   </div>
+
+  <div class="btn-row">
+    <button class="btn btn-reset" onclick="resetAll()">&#8635; Reset All</button>
+    <button class="btn btn-logs" onclick="window.location='/logs'">&#128196; View Logs</button>
+  </div>
 </div>
 
-<div class="footer">SpotifyMatrix · matrixspot.local</div>
+<div class="footer">SpotifyMatrix &middot; matrixspot.local</div>
 
 <script>
 let currentState = {};
@@ -1372,41 +1455,46 @@ async function fetchState() {
 }
 
 function updateUI(s) {
-  // Status
   const dot = document.getElementById('statusDot');
   const stxt = document.getElementById('statusText');
   dot.className = 'status-dot ' + (s.is_connected ? 'connected' : 'disconnected');
   stxt.textContent = s.is_connected ? 'Connected' : 'Disconnected';
-  
-  // Now Playing
-  document.getElementById('trackTitle').textContent = s.title || '—';
+
+  document.getElementById('trackTitle').textContent = s.title || '\\u2014';
   document.getElementById('trackArtist').textContent = s.artist || 'Waiting for Spotify...';
-  
+  document.getElementById('albumName').textContent = s.album_name || '';
+
   const ps = document.getElementById('playStatus');
-  if (s.is_playing) {
-    ps.textContent = '▶ Playing';
-    ps.className = 'play-status';
+  if (s.is_playing) { ps.textContent = '\\u25b6 Playing'; ps.className = 'play-status'; }
+  else { ps.textContent = '\\u23f8 Paused'; ps.className = 'play-status paused'; }
+
+  // Effective mode display
+  const em = document.getElementById('effectiveMode');
+  if (s.display_mode === 'default') {
+    const modeNames = {cd:'CD', lyrics:'Lyrics', clock:'Clock'};
+    em.textContent = '\\u2728 Default \\u2192 ' + (modeNames[s.effective_mode] || s.effective_mode);
   } else {
-    ps.textContent = '⏸ Paused';
-    ps.className = 'play-status paused';
+    em.textContent = '';
   }
-  
-  // Album art
+
   const artDiv = document.getElementById('albumArt');
   if (s.image_url) {
     if (!artDiv.querySelector('img') || artDiv.querySelector('img').src !== s.image_url) {
-      artDiv.innerHTML = '<img src="' + s.image_url + '" alt="Album Art">';
+      artDiv.innerHTML = '<img src="' + s.image_url + '" alt="Art">';
     }
-  } else {
-    artDiv.innerHTML = '';
-  }
-  
+  } else { artDiv.innerHTML = ''; }
+
   // Mode buttons
   document.querySelectorAll('.mode-btn').forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.mode === s.display_mode);
+    const m = btn.dataset.mode;
+    const isActive = m === s.display_mode;
+    btn.classList.remove('active', 'active-default');
+    if (isActive) {
+      btn.classList.add(m === 'default' ? 'active-default' : 'active');
+    }
   });
-  
-  // Sliders — only update if user is not actively dragging
+
+  // Sliders
   if (document.activeElement?.id !== 'brightness') {
     document.getElementById('brightness').value = s.brightness;
     document.getElementById('brightnessVal').textContent = s.brightness;
@@ -1426,9 +1514,10 @@ function updateUI(s) {
 }
 
 async function setMode(mode) {
-  // Optimistic UI update
   document.querySelectorAll('.mode-btn').forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.mode === mode);
+    const m = btn.dataset.mode;
+    btn.classList.remove('active', 'active-default');
+    if (m === mode) btn.classList.add(mode === 'default' ? 'active-default' : 'active');
   });
   try {
     await fetch('/api/mode', {
@@ -1449,28 +1538,158 @@ async function setSetting(name, value) {
   } catch(e) {}
 }
 
-// Poll state every 2 seconds
+async function resetAll() {
+  if (!confirm('Reset all settings to defaults?')) return;
+  try {
+    await fetch('/api/reset', { method: 'POST' });
+    setTimeout(fetchState, 300);
+  } catch(e) {}
+}
+
 fetchState();
 setInterval(fetchState, 2000);
 </script>
-
 </body>
 </html>"""
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  WEB LOGS PAGE — HTML
+# ═══════════════════════════════════════════════════════════════════
+
+LOGS_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SpotifyMatrix Logs</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'JetBrains Mono', monospace;
+    background: #0a0a0a;
+    color: #a1a1aa;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+    background: #141414;
+    border-bottom: 1px solid #1e1e1e;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  .toolbar a {
+    color: #1ed760;
+    text-decoration: none;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .toolbar .title {
+    font-size: 13px;
+    font-weight: 600;
+    color: #e4e4e7;
+  }
+  .toolbar button {
+    background: #1e1e1e;
+    border: 1px solid #333;
+    color: #a1a1aa;
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-family: inherit;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .toolbar button:hover { background: #2a2a2a; color: #e4e4e7; }
+
+  .log-container {
+    flex: 1;
+    padding: 8px 12px;
+    overflow-y: auto;
+    font-size: 11px;
+    line-height: 1.6;
+  }
+
+  .log-line { white-space: pre-wrap; word-break: break-all; }
+  .log-line .ts { color: #555; }
+  .log-line.info .msg { color: #a1a1aa; }
+  .log-line.warn .msg { color: #f59e0b; }
+  .log-line.error .msg { color: #ef4444; }
+</style>
+</head>
+<body>
+<div class="toolbar">
+  <a href="/">&larr; Control Panel</a>
+  <span class="title">Logs</span>
+  <button onclick="clearLogs()">Clear</button>
+</div>
+<div class="log-container" id="logContainer"></div>
+<script>
+const container = document.getElementById('logContainer');
+let autoScroll = true;
+
+container.addEventListener('scroll', () => {
+  const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 40;
+  autoScroll = atBottom;
+});
+
+async function fetchLogs() {
+  try {
+    const res = await fetch('/api/logs');
+    if (!res.ok) return;
+    const logs = await res.json();
+    container.innerHTML = logs.map(l =>
+      '<div class="log-line ' + l.level + '">' +
+      '<span class="ts">[' + l.time + ']</span> ' +
+      '<span class="msg">' + escapeHtml(l.msg) + '</span></div>'
+    ).join('');
+    if (autoScroll) container.scrollTop = container.scrollHeight;
+  } catch(e) {}
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+async function clearLogs() {
+  try { await fetch('/api/logs/clear', { method: 'POST' }); } catch(e) {}
+  container.innerHTML = '';
+}
+
+fetchLogs();
+setInterval(fetchLogs, 2000);
+</script>
+</body>
+</html>"""
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  WEB CONTROL PANEL — SERVER
+# ═══════════════════════════════════════════════════════════════════
 
 def start_control_server(
     port: int,
     state: SharedPlaybackState,
     lock: threading.Lock,
     display: MatrixDisplay | MockDisplay,
+    args: argparse.Namespace,
 ) -> HTTPServer | None:
-    """Start the web control panel HTTP server on a background thread."""
     if port <= 0:
         return None
 
     outer_state = state
     outer_lock = lock
     outer_display = display
+    outer_args = args
 
     class ControlPanelHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -1478,18 +1697,22 @@ def start_control_server(
 
             if parsed.path == "/" or parsed.path == "":
                 self._send_html(CONTROL_PANEL_HTML)
+            elif parsed.path == "/logs":
+                self._send_html(LOGS_PAGE_HTML)
             elif parsed.path == "/api/state":
                 self._send_state()
-            # Legacy simple endpoint for compatibility
+            elif parsed.path == "/api/logs":
+                self._send_json(_log_buffer.get_all())
             elif parsed.path == "/mode":
                 params = urllib.parse.parse_qs(parsed.query)
                 mode = params.get("set", [""])[0]
-                if mode in ("cd", "lyrics", "clock"):
+                if mode in ("default", "cd", "lyrics", "clock"):
                     with outer_lock:
                         outer_state.display_mode = mode
+                    log(f"Mode changed to '{mode}' via URL")
                     self._send_json({"ok": True, "mode": mode})
                 else:
-                    self._send_json({"error": "Invalid mode. Use: cd, lyrics, clock"}, 400)
+                    self._send_json({"error": "Invalid mode. Use: default, cd, lyrics, clock"}, 400)
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -1501,9 +1724,10 @@ def start_control_server(
 
             if parsed.path == "/api/mode":
                 mode = body.get("mode", "")
-                if mode in ("cd", "lyrics", "clock"):
+                if mode in ("default", "cd", "lyrics", "clock"):
                     with outer_lock:
                         outer_state.display_mode = mode
+                    log(f"Mode changed to '{mode}' via web panel")
                     self._send_json({"ok": True, "mode": mode})
                 else:
                     self._send_json({"error": "Invalid mode"}, 400)
@@ -1517,6 +1741,7 @@ def start_control_server(
                     outer_display.set_brightness(val)
                 except Exception:
                     pass
+                log(f"Brightness set to {val}")
                 self._send_json({"ok": True, "brightness": val})
 
             elif parsed.path == "/api/spin-speed":
@@ -1540,6 +1765,24 @@ def start_control_server(
                     outer_state.poll_interval = val
                 self._send_json({"ok": True, "poll_interval": val})
 
+            elif parsed.path == "/api/reset":
+                with outer_lock:
+                    outer_state.display_mode = "default"
+                    outer_state.brightness = outer_state._default_brightness
+                    outer_state.spin_speed = outer_state._default_spin_speed
+                    outer_state.text_scroll_speed = outer_state._default_text_scroll_speed
+                    outer_state.poll_interval = 5.0
+                try:
+                    outer_display.set_brightness(outer_state._default_brightness)
+                except Exception:
+                    pass
+                log("Settings reset to defaults")
+                self._send_json({"ok": True})
+
+            elif parsed.path == "/api/logs/clear":
+                _log_buffer.clear()
+                self._send_json({"ok": True})
+
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -1562,7 +1805,7 @@ def start_control_server(
             self.end_headers()
             self.wfile.write(html.encode("utf-8"))
 
-        def _send_json(self, data: dict, status: int = 200) -> None:
+        def _send_json(self, data: Any, status: int = 200) -> None:
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-cache")
@@ -1573,6 +1816,7 @@ def start_control_server(
             with outer_lock:
                 data = {
                     "display_mode": outer_state.display_mode,
+                    "effective_mode": outer_state.effective_mode,
                     "brightness": outer_state.brightness,
                     "spin_speed": outer_state.spin_speed,
                     "text_scroll_speed": outer_state.text_scroll_speed,
@@ -1590,17 +1834,16 @@ def start_control_server(
             self._send_json(data)
 
         def log_message(self, format: str, *args: Any) -> None:
-            # Suppress HTTP access logs to avoid journal bloat
             return
 
     try:
         server = HTTPServer(("0.0.0.0", port), ControlPanelHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        print(f"Web Control Panel: http://0.0.0.0:{port}/", flush=True)
+        log(f"Web Control Panel: http://0.0.0.0:{port}/")
         return server
     except OSError as exc:
-        print(f"Web Control Panel: Failed to start on port {port}: {exc}", flush=True)
+        log(f"Web Control Panel: Failed to start on port {port}: {exc}", "error")
         return None
 
 
@@ -1614,9 +1857,8 @@ def poll_spotify(
     state_lock: threading.Lock,
     stop_event: threading.Event,
 ) -> None:
-    last_status: str | None = None
     first_poll = True
-    print("Spotify: Background polling thread started.", flush=True)
+    log("Spotify: Background polling thread started.")
 
     idle_seconds = 30.0
     last_playing_time = time.time()
@@ -1625,31 +1867,25 @@ def poll_spotify(
 
     while not stop_event.is_set():
         try:
-            # Read current poll interval from shared state
             with state_lock:
                 active_seconds = state.poll_interval
             current_wait = active_seconds
 
             if first_poll:
-                print("Spotify: Making initial API connection...", flush=True)
+                log("Spotify: Making initial API connection...")
                 first_poll = False
-                
+
             playback = spotify.get_currently_playing()
             art = playback_art_from_response(playback)
 
-            # Record fetch time for local time interpolation
             fetch_time = time.monotonic()
 
-            # Reset backoff and mark connected on successful API call
             backoff_multiplier = 1
             with state_lock:
                 state.is_connected = True
 
             if art and art.is_playing:
-                # Active playback detected
                 last_playing_time = time.time()
-                if current_wait != active_seconds:
-                    print(f"Spotify: Playback resumed. Switching to active polling ({active_seconds}s).", flush=True)
                 current_wait = active_seconds
 
             time_since_played = time.time() - last_playing_time
@@ -1670,21 +1906,18 @@ def poll_spotify(
                     state.title = art.title
                     state.artist = art.artist
                     state.album_name = art.album_name
-                    # Time sync: store progress and fetch time
                     state.progress_ms = art.progress_ms
                     state.duration_ms = art.duration_ms
                     state.fetch_time = fetch_time
                     if image is not None:
                         state.image = image
 
-                # Fire lyrics fetch on new track
                 if is_new_track and art.key:
                     last_track_key = art.key
-                    # Clear old lyrics immediately
+                    log(f"Track: {art.title} — {art.artist}")
                     with state_lock:
                         state.lyrics = None
                         state.lyrics_track_key = None
-                    # Fetch new lyrics in background
                     duration_s = max(1, art.duration_ms // 1000)
                     lyrics_thread = threading.Thread(
                         target=fetch_lyrics_async,
@@ -1693,7 +1926,7 @@ def poll_spotify(
                     )
                     lyrics_thread.start()
 
-                status = f"art found, is_playing={art.is_playing}, title={art.title!r}"
+                status = f"is_playing={art.is_playing}, title={art.title!r}"
             else:
                 with state_lock:
                     state.art_key = None
@@ -1709,52 +1942,44 @@ def poll_spotify(
                 last_track_key = None
                 status = "no currently playing item"
 
-            # Prepend active/idle polling state to the status log
+            # Verbose logging (interactive only — skipped in auto/systemd)
             if current_wait == active_seconds:
                 time_until_idle = max(0, int(60.0 - (time.time() - last_playing_time)))
                 prefix = f"[Active | {time_until_idle}s to idle]"
             else:
                 prefix = "[Idle]"
-            
-            is_interactive = sys.stdout.isatty()
 
-            if is_interactive:
-                # Verbose mode for manual terminal usage: tick every second
+            if _is_interactive:
                 for _ in range(int(current_wait)):
                     if stop_event.is_set():
                         break
-                    
                     if current_wait == active_seconds:
                         time_until_idle = max(0, int(60.0 - (time.time() - last_playing_time)))
                         prefix = f"[Active | {time_until_idle}s to idle]"
                     else:
                         prefix = "[Idle]"
-                    
-                    tick_status = f"{prefix} {status}"
-                    print(f"Spotify: {tick_status}", flush=True)
+                    log(f"Spotify: {prefix} {status}", verbose=True)
                     stop_event.wait(1.0)
             else:
-                # Silent mode for systemd/auto usage: save CPU and SD card.
-                # No periodic status printing is done in the background to prevent journal bloat.
                 stop_event.wait(current_wait)
 
         except RateLimitException as exc:
             wait_time = exc.retry_after
             if wait_time <= 0:
                 wait_time = active_seconds * backoff_multiplier
-                print(f"Spotify API: Rate limited without Retry-After header. Exponential backoff: {wait_time}s...", flush=True)
-                backoff_multiplier = min(backoff_multiplier * 2, 64) # Cap backoff
+                log(f"Spotify API: Rate limited. Backoff: {wait_time}s", "warn")
+                backoff_multiplier = min(backoff_multiplier * 2, 64)
             else:
-                print(f"Spotify API: Rate limited. Retrying after {wait_time}s...", flush=True)
-            
+                log(f"Spotify API: Rate limited. Retry after {wait_time}s", "warn")
+
             with state_lock:
                 state.is_connected = False
             stop_event.wait(wait_time)
 
         except Exception as exc:
-            print(f"Spotify poll failed: {exc}", flush=True)
+            log(f"Spotify poll failed: {exc}", "error")
             wait_time = active_seconds * backoff_multiplier
-            print(f"Spotify API: Connection error. Exponential backoff: {wait_time}s...", flush=True)
+            log(f"Spotify API: Backoff: {wait_time}s", "warn")
             backoff_multiplier = min(backoff_multiplier * 2, 64)
             with state_lock:
                 state.is_connected = False
@@ -1777,13 +2002,11 @@ def run(args: argparse.Namespace) -> None:
     redirect_uri = os.environ.get("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
 
     missing = [
-        name
-        for name, value in (
+        name for name, value in (
             ("SPOTIFY_CLIENT_ID", client_id),
             ("SPOTIFY_CLIENT_SECRET", client_secret),
             ("SPOTIFY_REDIRECT_URI", redirect_uri),
-        )
-        if not value
+        ) if not value
     ]
     if missing:
         raise SystemExit(f"Missing required environment values: {', '.join(missing)}")
@@ -1803,23 +2026,22 @@ def run(args: argparse.Namespace) -> None:
 
     display: MatrixDisplay | MockDisplay
     if args.mock_output:
-        print("Matrix: Initializing Mock Display...", flush=True)
+        log("Matrix: Initializing Mock Display...")
         display = MockDisplay(args.mock_output)
     else:
-        print("Matrix: Initializing hardware RGB Matrix... (this may take a few seconds)", flush=True)
+        log("Matrix: Initializing hardware RGB Matrix...")
         display = MatrixDisplay(args)
 
-    # Startup info banner
-    print("\n" + "=" * 48, flush=True)
-    print("  Spotify Matrix — Ready", flush=True)
-    print("=" * 48, flush=True)
-    print(f"  Display:    {args.cols}x{args.rows}  brightness={args.brightness}", flush=True)
-    print(f"  Hardware:   {args.hardware_mapping}  gpio-slowdown={args.gpio_slowdown}", flush=True)
-    print(f"  Animation:  {args.fps} FPS  {args.rpm} RPM  transition={args.transition}", flush=True)
-    print(f"  Polling:    5s active / 30s idle (dynamic)", flush=True)
+    log("=" * 48)
+    log("  Spotify Matrix — Ready")
+    log("=" * 48)
+    log(f"  Display:    {args.cols}x{args.rows}  brightness={args.brightness}")
+    log(f"  Hardware:   {args.hardware_mapping}  gpio-slowdown={args.gpio_slowdown}")
+    log(f"  Animation:  {args.fps} FPS  {args.rpm} RPM  transition={args.transition}")
+    log(f"  Polling:    5s active / 30s idle (dynamic)")
     if args.web_port > 0:
-        print(f"  Web Panel:  http://0.0.0.0:{args.web_port}/", flush=True)
-    print("=" * 48 + "\n", flush=True)
+        log(f"  Web Panel:  http://0.0.0.0:{args.web_port}/")
+    log("=" * 48)
 
     size_x = args.cols
     size_y = args.rows
@@ -1839,15 +2061,18 @@ def run(args: argparse.Namespace) -> None:
         return
 
     playback_state = SharedPlaybackState(
+        display_mode="default",
         spin_speed=args.rpm,
         text_scroll_speed=args.text_speed,
         brightness=args.brightness,
+        _default_brightness=args.brightness,
+        _default_spin_speed=args.rpm,
+        _default_text_scroll_speed=args.text_speed,
     )
     playback_lock = threading.Lock()
     stop_event = threading.Event()
 
-    # Start web control panel
-    control_server = start_control_server(args.web_port, playback_state, playback_lock, display)
+    control_server = start_control_server(args.web_port, playback_state, playback_lock, display, args)
 
     poll_thread = threading.Thread(
         target=poll_spotify,
@@ -1876,17 +2101,18 @@ def run(args: argparse.Namespace) -> None:
     transition_active: bool = False
     transition_start: float = 0.0
 
-    # Spin easing state
-    SPIN_EASE_DURATION = 1.0  # seconds to ramp up/down
+    SPIN_EASE_DURATION = 1.0
     current_rpm: float = 0.0
     was_playing: bool = False
     spin_transition_start: float = 0.0
     spin_from_rpm: float = 0.0
 
-    # Track previous display mode for transitions
-    prev_display_mode: str = "cd"
-    # Track last brightness to detect changes
     last_brightness: int = args.brightness
+
+    # Default mode auto-cycle state
+    default_cd_start: float = 0.0  # when the CD phase started
+    default_last_track_key: str | None = None  # to detect new songs in default mode
+    DEFAULT_CD_DURATION = 10.0  # seconds to show CD before switching to lyrics
 
     try:
         while True:
@@ -1901,7 +2127,6 @@ def run(args: argparse.Namespace) -> None:
                 runtime_rpm = playback_state.spin_speed
                 runtime_text_speed = playback_state.text_scroll_speed
                 runtime_brightness = playback_state.brightness
-                # Time sync data
                 stored_progress_ms = playback_state.progress_ms
                 stored_duration_ms = playback_state.duration_ms
                 fetch_time = playback_state.fetch_time
@@ -1920,40 +2145,83 @@ def run(args: argparse.Namespace) -> None:
                     pass
                 last_brightness = runtime_brightness
 
-            # Handle forced mode (lyrics or clock bypass idle logic)
+            # ══════════════════════════════════════════════════
+            #  MODE ROUTING
+            # ══════════════════════════════════════════════════
+
+            # --- STICKY: Clock mode ---
             if display_mode == "clock":
-                # Clock mode: render clock directly, no idle delay
+                with playback_lock:
+                    playback_state.effective_mode = "clock"
                 frame = render_clock(size, is_connected)
                 display.show(frame)
-
                 if args.once:
                     break
                 sleep_for = max(0.0, (1.0 / args.fps) - (time.monotonic() - frame_start))
                 time.sleep(sleep_for)
-                prev_display_mode = display_mode
                 continue
 
+            # --- STICKY: Lyrics mode ---
             if display_mode == "lyrics":
-                # Lyrics mode: render lyrics view
+                with playback_lock:
+                    playback_state.effective_mode = "lyrics"
                 frame = render_lyrics(
-                    size,
-                    current_lyrics,
-                    stored_progress_ms,
-                    stored_duration_ms,
-                    is_playing,
-                    fetch_time,
-                    stored_progress_ms,
+                    size, current_lyrics, stored_duration_ms,
+                    is_playing, fetch_time, stored_progress_ms,
                 )
                 display.show(frame)
-
                 if args.once:
                     break
                 sleep_for = max(0.0, (1.0 / args.fps) - (time.monotonic() - frame_start))
                 time.sleep(sleep_for)
-                prev_display_mode = display_mode
                 continue
 
-            # ── CD mode (existing logic) ──────────────────────────
+            # --- DEFAULT mode (auto-cycling) ---
+            if display_mode == "default":
+                # Detect new track → reset CD timer
+                if current_art_key != default_last_track_key and current_art_key is not None:
+                    default_last_track_key = current_art_key
+                    default_cd_start = now
+
+                if not is_playing or current_art_key is None:
+                    # Paused or nothing playing → clock
+                    effective = "clock"
+                elif now - default_cd_start < DEFAULT_CD_DURATION:
+                    # Within 10s of track start → CD
+                    effective = "cd"
+                else:
+                    # After 10s → lyrics
+                    effective = "lyrics"
+
+                with playback_lock:
+                    playback_state.effective_mode = effective
+
+                if effective == "clock":
+                    frame = render_clock(size, is_connected)
+                    display.show(frame)
+                    if args.once:
+                        break
+                    sleep_for = max(0.0, (1.0 / args.fps) - (time.monotonic() - frame_start))
+                    time.sleep(sleep_for)
+                    continue
+                elif effective == "lyrics":
+                    frame = render_lyrics(
+                        size, current_lyrics, stored_duration_ms,
+                        is_playing, fetch_time, stored_progress_ms,
+                    )
+                    display.show(frame)
+                    if args.once:
+                        break
+                    sleep_for = max(0.0, (1.0 / args.fps) - (time.monotonic() - frame_start))
+                    time.sleep(sleep_for)
+                    continue
+                # else effective == "cd" → fall through to CD rendering below
+
+            # ── CD mode (sticky or default-cd phase) ──────────────
+
+            if display_mode == "cd":
+                with playback_lock:
+                    playback_state.effective_mode = "cd"
 
             display_text = ""
             if not args.no_text:
@@ -1974,39 +2242,40 @@ def run(args: argparse.Namespace) -> None:
                 transition_start = now
                 current_transition_mode = args.transition
 
-            # Detect idle state
-            if not is_playing or current_art_key is None:
-                if idle_since is None:
-                    idle_since = now
-                elif now - idle_since >= 5.0 and not is_idle_state:
-                    old_art_image = last_art_image
-                    old_angle = angle
-                    old_scroll_x = scroll_x
-                    old_display_text = last_display_text
-                    old_is_idle = is_idle_state
-                    is_idle_state = True
-                    transition_active = True
-                    transition_start = now
-                    current_transition_mode = "slide-down"
-            else:
-                idle_since = None
-                if is_idle_state:
-                    old_art_image = last_art_image
-                    old_angle = angle
-                    old_scroll_x = scroll_x
-                    old_display_text = last_display_text
-                    old_is_idle = is_idle_state
-                    is_idle_state = False
-                    transition_active = True
-                    transition_start = now
-                    current_transition_mode = "slide-up"
-                    scroll_x = 0.0
+            # Detect idle state (CD mode only — in default mode, clock is handled above)
+            if display_mode == "cd":
+                if not is_playing or current_art_key is None:
+                    if idle_since is None:
+                        idle_since = now
+                    elif now - idle_since >= 5.0 and not is_idle_state:
+                        old_art_image = last_art_image
+                        old_angle = angle
+                        old_scroll_x = scroll_x
+                        old_display_text = last_display_text
+                        old_is_idle = is_idle_state
+                        is_idle_state = True
+                        transition_active = True
+                        transition_start = now
+                        current_transition_mode = "slide-down"
+                else:
+                    idle_since = None
+                    if is_idle_state:
+                        old_art_image = last_art_image
+                        old_angle = angle
+                        old_scroll_x = scroll_x
+                        old_display_text = last_display_text
+                        old_is_idle = is_idle_state
+                        is_idle_state = False
+                        transition_active = True
+                        transition_start = now
+                        current_transition_mode = "slide-up"
+                        scroll_x = 0.0
 
             prev_art_key = current_art_key
             last_art_image = current_art_image
             last_display_text = display_text
 
-            # Spin easing — smoothly ramp RPM up or down
+            # Spin easing
             target_rpm = runtime_rpm if (not is_idle_state and is_playing and current_art_image is not None) else 0.0
             if (is_playing and not was_playing) or (not is_playing and was_playing):
                 spin_from_rpm = current_rpm
@@ -2016,14 +2285,14 @@ def run(args: argparse.Namespace) -> None:
             spin_elapsed = now - spin_transition_start
             if spin_elapsed < SPIN_EASE_DURATION:
                 t = spin_elapsed / SPIN_EASE_DURATION
-                eased_t = t * t * (3.0 - 2.0 * t)  # smoothstep
+                eased_t = t * t * (3.0 - 2.0 * t)
                 current_rpm = spin_from_rpm + (target_rpm - spin_from_rpm) * eased_t
             else:
                 current_rpm = target_rpm
 
             if current_rpm > 0.01:
                 angle = (angle - 360.0 * (current_rpm / 60.0) * delta) % 360.0
-            
+
             if not is_idle_state:
                 scroll_x += runtime_text_speed * delta
 
@@ -2031,13 +2300,8 @@ def run(args: argparse.Namespace) -> None:
                 new_frame = render_clock(size, is_connected)
             else:
                 new_frame = create_full_frame(
-                    current_art_image,
-                    angle,
-                    scroll_x,
-                    display_text,
-                    size_x,
-                    size_y,
-                    args,
+                    current_art_image, angle, scroll_x, display_text,
+                    size_x, size_y, args,
                 )
 
             if transition_active and current_transition_mode != "none":
@@ -2055,15 +2319,9 @@ def run(args: argparse.Namespace) -> None:
                         if is_playing and not is_idle_state:
                             old_angle = (old_angle - 360.0 * (runtime_rpm / 60.0) * delta) % 360.0
                         old_scroll_x += runtime_text_speed * delta
-
                         old_frame = create_full_frame(
-                            old_art_image,
-                            old_angle,
-                            old_scroll_x,
-                            old_display_text,
-                            size_x,
-                            size_y,
-                            args,
+                            old_art_image, old_angle, old_scroll_x, old_display_text,
+                            size_x, size_y, args,
                         )
                     frame = blend_frames(old_frame, new_frame, progress, mode=current_transition_mode)
             else:
@@ -2077,7 +2335,6 @@ def run(args: argparse.Namespace) -> None:
             sleep_for = max(0.0, (1.0 / args.fps) - (time.monotonic() - frame_start))
             time.sleep(sleep_for)
 
-            prev_display_mode = display_mode
     except KeyboardInterrupt:
         pass
     finally:
@@ -2087,6 +2344,10 @@ def run(args: argparse.Namespace) -> None:
         poll_thread.join(timeout=1)
         display.clear()
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  CLI & ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════
 
 def positive_float(value: str) -> float:
     parsed = float(value)
@@ -2127,43 +2388,39 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hardware-mapping", default="regular")
     parser.add_argument("--pwm-bits", type=int, default=11)
     parser.add_argument("--limit-refresh-rate-hz", type=int, default=120)
-    parser.add_argument(
-        "--no-hardware-pulse",
-        action="store_true",
-        help="Avoid Pi onboard sound conflict at the cost of more possible flicker.",
-    )
+    parser.add_argument("--no-hardware-pulse", action="store_true",
+                        help="Avoid Pi onboard sound conflict.")
     parser.add_argument("--fps", type=positive_float, default=20.0)
     parser.add_argument("--rpm", type=positive_float, default=20.0)
     parser.add_argument("--token-cache", type=Path, default=Path(".cache/spotify_token.json"))
-    parser.add_argument("--mock-output", type=Path, help="Write the current frame PNG instead of using RGB matrix hardware.")
-    parser.add_argument("--preview-frames", type=Path, help="Render sample spinning-album-art disk frames and exit.")
-    parser.add_argument("--auth-only", action="store_true", help="Authorize Spotify, cache the token, and exit without using the matrix.")
-    parser.add_argument("--test-pattern", action="store_true", help="Show a bright moving color test pattern without using Spotify.")
+    parser.add_argument("--mock-output", type=Path,
+                        help="Write the current frame PNG instead of using RGB matrix hardware.")
+    parser.add_argument("--preview-frames", type=Path,
+                        help="Render sample spinning-album-art disk frames and exit.")
+    parser.add_argument("--auth-only", action="store_true",
+                        help="Authorize Spotify, cache the token, and exit without using the matrix.")
+    parser.add_argument("--test-pattern", action="store_true",
+                        help="Show a bright moving color test pattern without using Spotify.")
     parser.add_argument("--once", action="store_true", help="Render one frame and exit.")
-    parser.add_argument("--no-browser", action="store_true", help="Print the Spotify auth URL without trying to open a browser.")
-    parser.add_argument("--no-text", action="store_true", help="Disable scrolling song title and artist text overlay.")
-    parser.add_argument("--text-speed", type=positive_float, default=12.0, help="Text scroll speed in pixels per second.")
-    parser.add_argument("--text-position", choices=["bottom", "top"], default="bottom", help="Text banner position on matrix.")
-    parser.add_argument("--text-banner-height", type=int, default=0, help="Height in pixels of text banner overlay (0 for auto-fit to text).")
-    parser.add_argument("--text-font-size", type=int, default=9, help="Font size in points for scrolling text.")
-    parser.add_argument(
-        "--transition",
-        choices=["slide", "slide-right", "fade", "none"],
-        default="slide",
-        help="Transition animation style when changing tracks.",
-    )
-    parser.add_argument(
-        "--transition-duration",
-        type=positive_float,
-        default=1.5,
-        help="Duration in seconds for track change transition animation.",
-    )
-    parser.add_argument(
-        "--web-port",
-        type=int,
-        default=5000,
-        help="Port for the web control panel (0 to disable). Access at http://<pi-ip>:<port>/",
-    )
+    parser.add_argument("--no-browser", action="store_true",
+                        help="Print the Spotify auth URL without trying to open a browser.")
+    parser.add_argument("--no-text", action="store_true",
+                        help="Disable scrolling song title and artist text overlay.")
+    parser.add_argument("--text-speed", type=positive_float, default=12.0,
+                        help="Text scroll speed in pixels per second.")
+    parser.add_argument("--text-position", choices=["bottom", "top"], default="bottom",
+                        help="Text banner position on matrix.")
+    parser.add_argument("--text-banner-height", type=int, default=0,
+                        help="Height in pixels of text banner overlay (0 for auto-fit to text).")
+    parser.add_argument("--text-font-size", type=int, default=9,
+                        help="Font size in points for scrolling text.")
+    parser.add_argument("--transition", choices=["slide", "slide-right", "fade", "none"],
+                        default="slide",
+                        help="Transition animation style when changing tracks.")
+    parser.add_argument("--transition-duration", type=positive_float, default=1.5,
+                        help="Duration in seconds for track change transition animation.")
+    parser.add_argument("--web-port", type=int, default=5000,
+                        help="Port for the web control panel (0 to disable).")
     return parser
 
 

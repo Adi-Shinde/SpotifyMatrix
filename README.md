@@ -6,11 +6,14 @@ This uses Spotify's Web API `currently-playing` endpoint, not the browser-only W
 
 ## Features
 
+- **✨ Default Mode** — Smart auto-cycling: CD spinning for 10s → Lyrics → Clock when paused
 - **🎵 Spinning CD View** — Album art as a rotating vinyl record with smooth spin-up/down easing
-- **📝 Synchronized Lyrics** — Real-time lyrics display fetched from LRCLIB, synced to your playback position
+- **📝 Synchronized Lyrics** — Smooth vertically-scrolling lyrics from LRCLIB, synced to playback
 - **🕐 Clock Mode** — Clean clock face with date, day, and sweeping seconds dot
-- **📱 Web Control Panel** — Full mobile-friendly dashboard at `http://<pi-ip>:5000` to control everything from your phone
+- **📱 Web Control Panel** — Mobile-friendly dashboard at `http://<pi-ip>:5000`
+- **📄 Live Logs** — In-memory log viewer at `http://<pi-ip>:5000/logs`
 - **⚡ Runtime Settings** — Change brightness, spin speed, text speed, polling rate, and display mode without restarting
+- **🔄 Reset All** — One-tap reset to boot defaults from the web panel
 
 ## Files
 
@@ -66,16 +69,6 @@ sudo -E .venv/bin/python spotify_matrix.py \
   --web-port 5000
 ```
 
-Useful hardware options:
-
-```bash
-sudo -E .venv/bin/python spotify_matrix.py \
-  --hardware-mapping regular \
-  --gpio-slowdown 2 \
-  --brightness 65 \
-  --web-port 5000
-```
-
 For a non-Pi test that writes one PNG frame instead of using matrix hardware:
 
 ```bash
@@ -88,6 +81,17 @@ To verify the album art is what spins on the disk, render four local preview fra
 python spotify_matrix.py --preview-frames /tmp/spotify-matrix-preview
 ```
 
+## Display Modes
+
+| Mode | Description | Behavior |
+|------|-------------|----------|
+| **✨ Default** | Smart auto-cycle (recommended) | CD 10s → Lyrics → Clock when paused. Resets on new track. |
+| **💿 CD** | Sticky spinning record | Stays on CD view until you switch. Shows clock after 5s idle. |
+| **🎵 Lyrics** | Sticky synced lyrics | Stays on lyrics view until you switch. |
+| **🕐 Clock** | Sticky clock face | Stays on clock until you switch. |
+
+The display always starts in **Default** mode on boot (both auto and manual). Selecting CD, Lyrics, or Clock "locks" that mode. Click Default (or Reset All) to return to auto-cycling.
+
 ## Web Control Panel
 
 When the script is running, a web control panel is available at:
@@ -98,42 +102,41 @@ http://<pi-ip>:5000
 
 For example: `http://matrixspot.local:5000` or `http://192.168.1.xxx:5000`
 
-Open this URL on **any device on the same WiFi** — your phone, tablet, or laptop. From here you can:
+Open this URL on **any device on the same WiFi**. From here you can:
 
-- **Switch display modes**: CD (spinning record), Lyrics (synchronized lyrics), Clock
+- **Switch display modes**: Default ✨, CD 💿, Lyrics 🎵, Clock 🕐
 - **Adjust brightness**: 1-100 slider, takes effect immediately
 - **Change spin speed**: 1-120 RPM for the CD view
 - **Change text speed**: 1-100 px/s for the scrolling title/artist text
 - **Change poll rate**: 1-60 seconds between Spotify API calls
-- **See current track info**: Title, artist, album art, play/pause status
-
-To disable the web panel, pass `--web-port 0`.
+- **Reset all settings** to boot defaults
+- **View live logs** at `/logs`
 
 ## Lyrics View
 
-The lyrics view uses the free [LRCLIB API](https://lrclib.net) to fetch synchronized lyrics. When a new track starts playing, lyrics are automatically fetched in the background. The display shows:
+The lyrics view uses the free [LRCLIB API](https://lrclib.net) to fetch synchronized lyrics. The display shows:
 
-- **Previous line** (dim gray) at the top
-- **Current line** (Spotify green) in the center
-- **Next line** (dim gray) at the bottom
+- **Smooth vertical scroll** — lyrics scroll upward like a karaoke teleprompter
+- **Current line** in bright Spotify Green, centered
+- **Previous/next lines** in dim gray, fading at edges
+- **Long lines auto-scroll** horizontally
 - **Progress bar** (1px) at the very bottom
 
-Long lyrics lines automatically scroll horizontally. If no synced lyrics are available for a track, a "♪ No Lyrics ♪" message is shown.
+## Live Logs
 
-The time sync uses local monotonic clock interpolation between Spotify API polls (every 5 seconds by default), so lyrics stay accurately synced without hammering the API.
+Visit `http://<pi-ip>:5000/logs` for a terminal-style log viewer:
 
-## Display Modes
+- Color-coded entries (green info, yellow warnings, red errors)
+- Auto-scrolls to latest entries
+- Clear button to flush the buffer
+- In **manual mode** (SSH terminal): verbose every-second ticks are shown
+- In **auto mode** (systemd service): only important events are logged (track changes, errors, mode switches)
 
-| Mode | Description | How to Activate |
-|------|-------------|-----------------|
-| **CD** | Spinning album art record with scrolling title | Default mode, or set via web panel |
-| **Lyrics** | 3-line synchronized lyrics display | Set via web panel or `http://<pi-ip>:5000/mode?set=lyrics` |
-| **Clock** | Full clock face with date and time | Set via web panel or `http://<pi-ip>:5000/mode?set=clock` |
+## Quick Mode URLs
 
-## New CLI Flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--web-port` | `5000` | Port for the web control panel (0 to disable) |
-
-All existing flags (`--brightness`, `--rpm`, `--text-speed`, etc.) still work and set the initial values. The web panel can override them at runtime.
+```
+http://matrixspot.local:5000/mode?set=default
+http://matrixspot.local:5000/mode?set=cd
+http://matrixspot.local:5000/mode?set=lyrics
+http://matrixspot.local:5000/mode?set=clock
+```
