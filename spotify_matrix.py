@@ -125,6 +125,133 @@ class PlaybackArt:
     duration_ms: int = 0
 
 
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import base64
+import collections
+import datetime
+import functools
+from io import BytesIO
+import json
+import math
+import os
+import re
+import secrets
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from email.message import Message
+from urllib.error import HTTPError
+import webbrowser
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from typing import Any
+
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv() -> None:
+        return None
+
+
+AUTH_URL = "https://accounts.spotify.com/authorize"
+TOKEN_URL = "https://accounts.spotify.com/api/token"
+CURRENTLY_PLAYING_URL = "https://api.spotify.com/v1/me/player/currently-playing"
+SCOPE = "user-read-currently-playing"
+
+LRCLIB_API_URL = "https://lrclib.net/api/get"
+LRCLIB_USER_AGENT = "SpotifyMatrix/1.0 (https://github.com/Adi-Shinde/SpotifyMatrix)"
+
+SPOTIFY_GREEN = (30, 215, 96)
+LYRIC_DIM_COLOR = (80, 80, 80)
+
+COLOR_THEMES: dict[str, tuple[int, int, int]] = {
+    "spotify":  (30, 215, 96),
+    "sunset":   (255, 107, 53),
+    "ocean":    (0, 150, 255),
+    "neon":     (180, 60, 255),
+    "rose":     (255, 90, 150),
+    "arctic":   (0, 220, 220),
+    "gold":     (245, 180, 40),
+    "crimson":  (220, 40, 60),
+}
+
+# Average ms per spoken word — used to cap scroll speed during instrumental gaps
+AVG_MS_PER_WORD = 350
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  LOGGING — In-memory ring buffer + console output
+# ═══════════════════════════════════════════════════════════════════
+
+class LogBuffer:
+    """Thread-safe in-memory ring buffer for log messages."""
+
+    def __init__(self, maxlen: int = 200) -> None:
+        self._buffer: collections.deque[dict[str, str]] = collections.deque(maxlen=maxlen)
+        self._lock = threading.Lock()
+
+    def add(self, msg: str, level: str = "info") -> None:
+        now = datetime.datetime.now().strftime("%H:%M:%S")
+        entry = {"time": now, "msg": msg, "level": level}
+        with self._lock:
+            self._buffer.append(entry)
+
+    def get_all(self) -> list[dict[str, str]]:
+        with self._lock:
+            return list(self._buffer)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._buffer.clear()
+
+
+# Global log buffer instance
+_log_buffer = LogBuffer(maxlen=200)
+_is_interactive = sys.stdout.isatty()
+
+
+def log(msg: str, level: str = "info", *, console: bool = True, verbose: bool = False) -> None:
+    """
+    Log a message to the ring buffer and optionally to console.
+
+    Args:
+        msg: The log message.
+        level: "info", "warn", or "error".
+        console: If True, also print to stdout (always True for important events).
+        verbose: If True, this is a verbose/tick message. Only printed in interactive mode.
+    """
+    _log_buffer.add(msg, level)
+    if console:
+        if verbose and not _is_interactive:
+            # In auto/systemd mode, skip verbose tick messages
+            return
+        print(msg, flush=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  DATA MODELS
+# ═══════════════════════════════════════════════════════════════════
+
+@dataclass
+class PlaybackArt:
+    key: str
+    image_url: str
+    is_playing: bool
+    title: str = ""
+    artist: str = ""
+    album_name: str = ""
+    progress_ms: int = 0
+    duration_ms: int = 0
+
+
 @dataclass
 class SharedPlaybackState:
     art_key: str | None = None
@@ -158,18 +285,18 @@ class SharedPlaybackState:
     lyrics_style: str = "scroll"  # "scroll" or "pop"
     smart_scroll: bool = True  # time-proportional horizontal scrolling
     scroll_font_size: int = 9  # font size for scroll mode
-    pop_font_size: int = 8  # font size for pop mode
-    spin_speed: float = 20.0  # RPM
-    text_scroll_speed: float = 12.0  # px/s
+    pop_font_size: int = 9  # font size for pop mode
+    spin_speed: float = 10.0  # RPM
+    text_scroll_speed: float = 20.0  # px/s
     poll_interval: float = 5.0  # seconds (active polling)
     brightness: int = 65  # 1-100
     # Boot defaults (for reset)
     _default_brightness: int = 65
-    _default_spin_speed: float = 20.0
-    _default_text_scroll_speed: float = 12.0
+    _default_spin_speed: float = 10.0
+    _default_text_scroll_speed: float = 20.0
     _default_lyrics_style: str = "scroll"
     _default_scroll_font_size: int = 9
-    _default_pop_font_size: int = 8
+    _default_pop_font_size: int = 9
 
 
 @dataclass
@@ -1633,18 +1760,18 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
       <div class="slider-group" style="margin-top:16px;">
         <div class="slider-label">
           <span class="name">&#128171; Spin Speed (RPM)</span>
-          <span class="value" id="spinVal">20</span>
+          <span class="value" id="spinVal">10</span>
         </div>
-        <input type="range" id="spinSpeed" min="1" max="120" value="20"
+        <input type="range" id="spinSpeed" min="1" max="120" value="10"
                oninput="document.getElementById('spinVal').textContent=this.value"
                onchange="setSetting('spin-speed', this.value)">
       </div>
       <div class="slider-group">
         <div class="slider-label">
           <span class="name">&#128220; Text Scroll Speed</span>
-          <span class="value" id="textVal">12</span>
+          <span class="value" id="textVal">20</span>
         </div>
-        <input type="range" id="textSpeed" min="1" max="100" value="12"
+        <input type="range" id="textSpeed" min="1" max="100" value="20"
                oninput="document.getElementById('textVal').textContent=this.value"
                onchange="setSetting('text-speed', this.value)">
       </div>
@@ -1983,198 +2110,6 @@ setInterval(() => {
 </script>
 </body>
 </html>
-"""
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  WEB LOGS PAGE — HTML
-# ═══════════════════════════════════════════════════════════════════
-
-LOGS_PAGE_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SpotifyMatrix Logs</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap');
-
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-
-  body {
-    font-family: 'JetBrains Mono', monospace;
-    background: #0a0a0a;
-    color: #a1a1aa;
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-  }
-
-  .toolbar {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 12px 16px;
-    background: #141414;
-    border-bottom: 1px solid #1e1e1e;
-    position: sticky;
-    top: 0;
-    z-index: 10;
-  }
-  .toolbar a {
-    color: #1ed760;
-    text-decoration: none;
-    font-size: 12px;
-    font-weight: 500;
-  }
-  .toolbar .title {
-    font-size: 13px;
-    font-weight: 600;
-    color: #e4e4e7;
-  }
-  .toolbar button {
-    background: #1e1e1e;
-    border: 1px solid #333;
-    color: #a1a1aa;
-    padding: 6px 12px;
-    border-radius: 6px;
-    font-family: inherit;
-    font-size: 11px;
-    cursor: pointer;
-  }
-  .toolbar button:hover { background: #2a2a2a; color: #e4e4e7; }
-
-  .log-container {
-    flex: 1;
-    padding: 8px 12px;
-    overflow-y: auto;
-    font-size: 11px;
-    line-height: 1.6;
-  }
-
-  .log-line { white-space: pre-wrap; word-break: break-all; }
-  .log-line .ts { color: #555; }
-  .log-line.info .msg { color: #a1a1aa; }
-  .log-line.warn .msg { color: #f59e0b; }
-  .log-line.error .msg { color: #ef4444; }
-</style>
-</head>
-<body>
-<div class="toolbar">
-  <a href="/">&larr; Control Panel</a>
-  <span class="title">Logs</span>
-  <button onclick="clearLogs()">Clear</button>
-</div>
-<div class="log-container" id="logContainer"></div>
-<script>
-const container = document.getElementById('logContainer');
-let autoScroll = true;
-
-container.addEventListener('scroll', () => {
-  const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 40;
-  autoScroll = atBottom;
-});
-
-async function fetchLogs() {
-  try {
-    const res = await fetch('/api/logs');
-    if (!res.ok) return;
-    const logs = await res.json();
-    container.innerHTML = logs.map(l =>
-      '<div class="log-line ' + l.level + '">' +
-      '<span class="ts">[' + l.time + ']</span> ' +
-      '<span class="msg">' + escapeHtml(l.msg) + '</span></div>'
-    ).join('');
-    if (autoScroll) container.scrollTop = container.scrollHeight;
-  } catch(e) {}
-}
-
-function escapeHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-
-async function clearLogs() {
-  try { await fetch('/api/logs/clear', { method: 'POST' }); } catch(e) {}
-  container.innerHTML = '';
-}
-
-fetchLogs();
-setInterval(fetchLogs, 2000);
-</script>
-</body>
-</html>"""
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  WEB CONTROL PANEL — SERVER
-# ═══════════════════════════════════════════════════════════════════
-
-def start_control_server(
-    port: int,
-    state: SharedPlaybackState,
-    lock: threading.Lock,
-    display: MatrixDisplay | MockDisplay,
-    args: argparse.Namespace,
-) -> HTTPServer | None:
-    if port <= 0:
-        return None
-
-    outer_state = state
-    outer_lock = lock
-    outer_display = display
-    outer_args = args
-
-    class ControlPanelHandler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            parsed = urllib.parse.urlparse(self.path)
-
-            if parsed.path == "/" or parsed.path == "":
-                self._send_html(CONTROL_PANEL_HTML)
-            elif parsed.path == "/logs":
-                self._send_html(LOGS_PAGE_HTML)
-            elif parsed.path == "/api/state":
-                self._send_state()
-            elif parsed.path == "/api/logs":
-                self._send_json(_log_buffer.get_all())
-            elif parsed.path == "/api/lyrics":
-                with outer_lock:
-                    data = {
-                        "lyrics": outer_state.lyrics,
-                        "progress_ms": outer_state.progress_ms,
-                        "duration_ms": outer_state.duration_ms,
-                        "is_playing": outer_state.is_playing,
-                        "is_instrumental": outer_state.is_instrumental,
-                        "server_time": time.time(),
-                        "lyrics_lead_ms": outer_state.lyrics_lead_ms,
-                    }
-                self._send_json(data)
-            elif parsed.path == "/mode":
-                params = urllib.parse.parse_qs(parsed.query)
-                mode = params.get("set", [""])[0]
-                if mode in ("default", "cd", "lyrics", "clock"):
-                    with outer_lock:
-                        outer_state.display_mode = mode
-                    log(f"Mode changed to '{mode}' via URL")
-                    self._send_json({"ok": True, "mode": mode})
-                else:
-                    self._send_json({"error": "Invalid mode. Use: default, cd, lyrics, clock"}, 400)
-            else:
-                self.send_response(404)
-                self.end_headers()
-                self.wfile.write(b"Not Found")
-
-        def do_POST(self) -> None:
-            parsed = urllib.parse.urlparse(self.path)
-            body = self._read_body()
-
-            if parsed.path == "/api/mode":
-                mode = body.get("mode", "")
-                if mode in ("default", "cd", "lyrics", "clock"):
-                    with outer_lock:
-                        outer_state.display_mode = mode
-                    log(f"Mode changed to '{mode}' via web panel")
-                    self._send_json({"ok": True, "mode": mode})
-                else:
                     self._send_json({"error": "Invalid mode"}, 400)
 
             elif parsed.path == "/api/brightness":
