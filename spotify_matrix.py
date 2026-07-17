@@ -149,8 +149,11 @@ class SharedPlaybackState:
     accent_name: str = "spotify"
     # Custom message overlay
     custom_message: str = ""
+    # Custom Slate mode
+    custom_slate_frames: list[Image.Image] = field(default_factory=list)
+    custom_slate_frame_delay: float = 0.1
     # Runtime-adjustable settings
-    display_mode: str = "default"  # "default", "cd", "lyrics", "clock"
+    display_mode: str = "default"  # "default", "cd", "lyrics", "clock", "custom"
     effective_mode: str = "cd"  # what is actually rendering right now
     lyrics_style: str = "scroll"  # "scroll" or "pop"
     smart_scroll: bool = True  # time-proportional horizontal scrolling
@@ -1350,6 +1353,15 @@ def render_lyrics(
     return frame
 
 
+def render_custom_slate(size: int, frames: list[Image.Image], delay: float) -> Image.Image:
+    if not frames:
+        return Image.new("RGB", (size, size), (0, 0, 0))
+    if len(frames) == 1:
+        return frames[0].copy()
+    idx = int(time.time() / delay) % len(frames)
+    return frames[idx].copy()
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  WEB CONTROL PANEL — HTML
 # ═══════════════════════════════════════════════════════════════════
@@ -1649,6 +1661,9 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
     <div class="mode-btn active-default" data-mode="default" onclick="setMode('default')">
       <div class="icon">&#10024;</div><div class="label">Default</div>
     </div>
+    <div class="mode-btn" data-mode="custom" onclick="setMode('custom')">
+      <div class="icon">&#127912;</div><div class="label">Custom</div>
+    </div>
     <div class="mode-btn" data-mode="cd" onclick="setMode('cd')">
       <div class="icon">&#128191;</div><div class="label">CD</div>
     </div>
@@ -1727,6 +1742,27 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
              oninput="document.getElementById('popFontVal').textContent=this.value"
              onchange="setSetting('pop-font-size', this.value)">
     </div>
+  </div>
+</div>
+
+<!-- Custom Slate Editor -->
+<div class="card">
+  <div class="card-title">&#127912; Custom Slate (Canvas)</div>
+  <p style="color:#aaa; font-size:12px; margin-bottom:10px;">Upload an image or GIF to cast it to the Matrix!</p>
+  <input type="file" id="slateUpload" accept="image/*" style="margin-bottom:10px; width:100%; color: white; background: #222; padding: 5px; border-radius:4px;">
+  
+  <div class="msg-input-row" style="margin-bottom:10px;">
+    <input type="text" class="msg-input" id="slateText" placeholder="Add text..." style="flex:1;">
+    <input type="color" id="slateColor" value="#ffffff" style="width:30px; border:none; padding:0; background:none;">
+    <button class="msg-btn" onclick="addSlateText()">Add</button>
+  </div>
+  
+  <div style="display: flex; justify-content: center; margin-bottom: 10px;">
+    <canvas id="slateCanvas" width="64" height="64" style="width: 128px; height: 128px; border: 1px solid #333; image-rendering: pixelated; border-radius: 4px;"></canvas>
+  </div>
+  <div class="msg-input-row" style="justify-content:center;">
+    <button class="msg-btn clear" onclick="clearSlate()">Clear</button>
+    <button class="msg-btn" onclick="sendCustomSlate()">Cast to Matrix</button>
   </div>
 </div>
 
@@ -2112,6 +2148,59 @@ async function resetAll() {
   } catch(e) {}
 }
 
+const slateInput = document.getElementById('slateUpload');
+const slateCanvas = document.getElementById('slateCanvas');
+const slateCtx = slateCanvas.getContext('2d', { willReadFrequently: true });
+let customImageBase64 = null;
+
+slateInput.addEventListener('change', function(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(event) {
+    customImageBase64 = event.target.result;
+    const img = new Image();
+    img.onload = function() {
+      slateCtx.clearRect(0,0,64,64);
+      let w = img.width;
+      let h = img.height;
+      if (w > h) { h = Math.round(64 * (h/w)); w = 64; } else { w = Math.round(64 * (w/h)); h = 64; }
+      slateCtx.drawImage(img, (64-w)/2, (64-h)/2, w, h);
+    };
+    img.src = customImageBase64;
+  };
+  reader.readAsDataURL(file);
+});
+
+function addSlateText() {
+  const text = document.getElementById('slateText').value;
+  const color = document.getElementById('slateColor').value;
+  if (!text) return;
+  slateCtx.fillStyle = color;
+  slateCtx.font = "10px sans-serif";
+  slateCtx.textAlign = "center";
+  slateCtx.textBaseline = "middle";
+  slateCtx.fillText(text, 32, 32);
+  customImageBase64 = slateCanvas.toDataURL("image/png");
+}
+
+function clearSlate() {
+  slateCtx.clearRect(0, 0, 64, 64);
+  customImageBase64 = null;
+}
+
+async function sendCustomSlate() {
+  if (!customImageBase64) return;
+  try {
+    const res = await fetch('/api/custom-media', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ image_base64: customImageBase64 })
+    });
+    if (res.ok) setMode('custom');
+  } catch(e) {}
+}
+
 fetchState();
 setInterval(fetchState, 2000);
 </script>
@@ -2422,6 +2511,33 @@ def start_control_server(
                 _log_buffer.clear()
                 self._send_json({"ok": True})
 
+            elif parsed.path == "/api/custom-media":
+                try:
+                    img_data = body.get("image_base64", "")
+                    if img_data.startswith("data:image"):
+                        img_data = img_data.split(",")[1]
+                    decoded = base64.b64decode(img_data)
+                    img = Image.open(BytesIO(decoded))
+                    frames = []
+                    delay = 0.1
+                    if getattr(img, "is_animated", False):
+                        for frame_idx in range(img.n_frames):
+                            img.seek(frame_idx)
+                            frame_rgb = Image.new("RGB", img.size)
+                            frame_rgb.paste(img)
+                            frames.append(frame_rgb.resize((64, 64), Image.Resampling.LANCZOS))
+                        delay = img.info.get("duration", 100) / 1000.0
+                        if delay <= 0.01:
+                            delay = 0.1
+                    else:
+                        frames.append(img.convert("RGB").resize((64, 64), Image.Resampling.LANCZOS))
+                    with outer_lock:
+                        outer_state.custom_slate_frames = frames
+                        outer_state.custom_slate_frame_delay = delay
+                        outer_state.display_mode = "custom"
+                    self._send_json({"ok": True})
+                except Exception as e:
+                    self._send_json({"error": str(e)}, 400)
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -2812,6 +2928,20 @@ def run(args: argparse.Namespace) -> None:
             # ══════════════════════════════════════════════════
             #  MODE ROUTING
             # ══════════════════════════════════════════════════
+
+            # --- STICKY: Custom Slate mode ---
+            if display_mode == "custom":
+                with playback_lock:
+                    playback_state.effective_mode = "custom"
+                    frames = playback_state.custom_slate_frames
+                    delay = playback_state.custom_slate_frame_delay
+                frame = render_custom_slate(size, frames, delay)
+                display.show(frame)
+                if args.once:
+                    break
+                sleep_for = max(0.0, (1.0 / args.fps) - (time.monotonic() - frame_start))
+                time.sleep(sleep_for)
+                continue
 
             # --- STICKY: Clock mode ---
             if display_mode == "clock":

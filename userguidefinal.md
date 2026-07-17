@@ -22,8 +22,11 @@ The Spotify Matrix turns your 64x64 RGB LED matrix into a dynamic, standalone mu
 - **🎵 Spinning CD View** — Your album art is cropped into a vinyl record and spins while music is playing. Smooth spin-up and spin-down easing.
 - **📝 Synchronized Lyrics** — Fetches live, synchronized lyrics using the free LRCLIB API. Choose between **Scroll** mode (smooth vertical teleprompter style) or **Pop** mode (3-line flashing focus). 
 - **⚡ Smart Scroll** — Lyrics automatically and intelligently scroll left-to-right based on how fast the artist is singing that specific line.
+- **🎹 Instrumental Detection** — Displays a beautiful pulsing audio bars visualizer for instrumental tracks instead of a generic "no lyrics" message.
+- **🎨 Accent Color Themes** — Instantly restyle the matrix and web UI by selecting from 8 curated colors (Spotify Green, Neon Purple, Warm Gold, etc).
 - **🕐 Clock Mode** — A beautiful clock face with the date, day, and a sweeping seconds dot around the border.
 - **📱 Web Control Panel** — Control everything from your phone or PC on the same network. No apps needed.
+- **🎤 Live Web Lyrics & 💬 Custom Messages** — Follow live lyrics on your phone or send custom scrolling text directly to the LED matrix.
 - **📄 Live Logs** — Debug and view status via an in-memory terminal on the web panel.
 
 ---
@@ -137,12 +140,15 @@ sudo systemctl start spotifymatrix.service
 
 Navigate to: `http://matrixspot.local:5000`
 
-The control panel is organized into 5 intuitive cards:
+The control panel is organized into cards:
 
 ### 1. Now Playing
-Shows the currently active track name, artist, and playback status (Playing/Paused/Stopped).
+Shows the currently active track name, artist, and playback status (Playing/Paused/Stopped). The background of this card features a premium "glassmorphism" blur of the current album art.
 
-### 2. Display Mode
+### 2. 🎤 Live Lyrics
+A collapsible panel that streams the live, synchronized lyrics straight to your phone. The currently sung line is highlighted in your chosen Accent Color and auto-scrolls to keep you perfectly in time with the song.
+
+### 3. Display Mode
 Choose what you want to see on the matrix:
 - **✨ Default (Auto-cycle):** The recommended mode. Shows the spinning CD for 10s when a song starts, then switches to lyrics. Reverts to the clock when paused. 
 - **💿 CD:** Locks the display to the spinning vinyl record view. Shows clock after 5s idle.
@@ -151,23 +157,33 @@ Choose what you want to see on the matrix:
 
 *Note: The display always boots into Default mode.*
 
-### 3. 🎵 Lyrics Settings
+### 4. 🎵 Lyrics Settings
 Customize exactly how you read your lyrics:
 - **Style:** 
   - **Scroll Mode:** Smoothly scrolls lines vertically like a teleprompter.
   - **Pop Mode:** A 3-line view where lines pop in (previous line, current line, next line).
 - **⚡ Smart Scroll Toggle:** When enabled, long lines of lyrics will automatically scroll horizontally. The scroll speed is proportionally synced to how fast the artist is singing that specific line! Unchecking this reverts to standard back-and-forth ping-pong scrolling.
 - **Font Sizes:** Independent sliders to adjust the font size of the **Scroll Mode** (default 9) and **Pop Mode** (default 8) to fit your matrix perfectly.
+- **🎤 Lyrics Lead (ms):** A slider that allows you to shift the lyrics ahead of the audio (up to 500ms). Perfect for giving yourself a fraction of a second to read the lyrics *before* they are sung!
 
-### 4. ⚙ General Settings
+### 5. 🖼️ Custom Slate (Canvas)
+Upload any image or animated GIF directly from your device. The image will be perfectly scaled and cast to your LED Matrix instantly. You can also type text and pick a color to render custom text directly onto your canvas, creating the ultimate personalized empty slate!
+
+### 6. 💬 Custom Message
+Type a message in the text box and click **Send** to instantly display it on the LED matrix! When set, it replaces the track title/artist crawl in CD mode, and can be cleared instantly via the **Clear** button.
+
+### 7. 🎨 Accent Color
+Select from 8 carefully curated color themes (Spotify Green, Sunset Orange, Ocean Blue, Neon Purple, Rose Pink, Arctic Cyan, Warm Gold, Crimson). This updates both the Web UI and the LED Matrix instantly (affecting the lyrics active line, clock dots, and progress bars).
+
+### 8. ⚙️ General Settings
 Fine-tune the hardware and software properties:
 - **Brightness (1-100):** Adjust the LED intensity instantly.
 - **Spin Speed (RPM):** How fast the CD view spins when music plays.
 - **Text Speed (px/s):** How fast track titles and artist names scroll on the CD view.
 - **Poll Rate (1-60s):** How often the system checks Spotify for new song changes. (Default: 5 seconds).
 
-### 5. Actions
-- **Reset All Defaults:** One tap to return the matrix to its original boot state (Default mode, default brightness, etc).
+### 9. Actions
+- **Reset All Defaults:** One tap to return the matrix to its original boot state (Default mode, default brightness, default theme, etc).
 - **View Live Logs:** Opens a terminal-style window in your browser at `/logs` to debug errors and view system states in real-time.
 
 ---

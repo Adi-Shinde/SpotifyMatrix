@@ -17,8 +17,12 @@ This README serves as a brief summary. For full instructions on setup, installat
 - **✨ Smart Auto-Cycling** — Seamlessly transitions between CD view (10s), Lyrics, and Clock (when paused).
 - **🎵 Spinning CD View** — Your album art is cropped into a vinyl record and spins dynamically with playback.
 - **📝 Synchronized Lyrics** — Live synced lyrics with multiple styling modes (Scroll/Pop) and intelligent time-proportional horizontal scrolling.
+- **🎹 Instrumental Detection** — Displays a beautiful pulsing audio bars visualizer for instrumental tracks instead of a generic "no lyrics" message.
+- **🎨 Accent Color Themes** — Instantly restyle the matrix and web UI by selecting from 8 curated colors (Spotify Green, Neon Purple, Warm Gold, etc).
 - **🕐 Clock Mode** — A crisp digital clock with date, day, and a sweeping seconds indicator.
-- **📱 Web Control Panel** — A rich 5-card dashboard to control display modes, lyric font sizes, brightness, scroll speeds, and live logs from any device on your WiFi.
+- **🖼️ Custom Slate Canvas** — A built-in WYSIWYG editor on the web panel to upload images/GIFs, overlay text, and cast it instantly to the matrix.
+- **📱 Web Control Panel** — A rich dashboard to control display modes, lyric font sizes, brightness, scroll speeds, and live logs from any device on your WiFi.
+- **🎤 Live Web Lyrics & 💬 Custom Messages** — Follow live lyrics on your phone or send custom scrolling text directly to the LED matrix.
 - **🔌 Plug & Play Appliance** — Runs entirely as a background systemd service. Just plug in the Pi and it works.
 
 ## Quick Links
