@@ -526,12 +526,3 @@ function Main-Menu {
 
 # ── Entry point ──────────────────────────────────────────────
 Main-Menu
-                exit
-            }
-            default { Write-Warn "Invalid option - try again." }
-        }
-    }
-}
-
-# ── Entry point ──────────────────────────────────────────────
-Main-Menu
