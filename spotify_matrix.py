@@ -45,6 +45,20 @@ LRCLIB_USER_AGENT = "SpotifyMatrix/1.0 (https://github.com/Adi-Shinde/SpotifyMat
 SPOTIFY_GREEN = (30, 215, 96)
 LYRIC_DIM_COLOR = (80, 80, 80)
 
+COLOR_THEMES: dict[str, tuple[int, int, int]] = {
+    "spotify":  (30, 215, 96),
+    "sunset":   (255, 107, 53),
+    "ocean":    (0, 150, 255),
+    "neon":     (180, 60, 255),
+    "rose":     (255, 90, 150),
+    "arctic":   (0, 220, 220),
+    "gold":     (245, 180, 40),
+    "crimson":  (220, 40, 60),
+}
+
+# Average ms per spoken word — used to cap scroll speed during instrumental gaps
+AVG_MS_PER_WORD = 350
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  LOGGING — In-memory ring buffer + console output
@@ -128,6 +142,13 @@ class SharedPlaybackState:
     # Lyrics
     lyrics: list[tuple[int, str]] | None = None  # [(timestamp_ms, text), ...]
     lyrics_track_key: str | None = None
+    is_instrumental: bool = False  # True when LRCLIB says track is instrumental
+    lyrics_lead_ms: int = 150  # ms to shift lyrics ahead for read-along
+    # Accent color
+    accent_color: tuple[int, int, int] = (30, 215, 96)  # default SPOTIFY_GREEN
+    accent_name: str = "spotify"
+    # Custom message overlay
+    custom_message: str = ""
     # Runtime-adjustable settings
     display_mode: str = "default"  # "default", "cd", "lyrics", "clock"
     effective_mode: str = "cd"  # what is actually rendering right now
@@ -629,7 +650,8 @@ def render_idle(size: int) -> Image.Image:
     return frame
 
 
-def render_clock(size: int, is_connected: bool = True) -> Image.Image:
+def render_clock(size: int, is_connected: bool = True,
+                 accent_color: tuple[int, int, int] = SPOTIFY_GREEN) -> Image.Image:
     frame = Image.new("RGB", (size, size), (0, 0, 0))
     draw = ImageDraw.Draw(frame)
     now = datetime.datetime.now()
@@ -654,7 +676,7 @@ def render_clock(size: int, is_connected: bool = True) -> Image.Image:
     start_y = (size - total_h) // 2
 
     day_x = (size - (day_bbox[2] - day_bbox[0])) // 2
-    draw.text((day_x, start_y - day_bbox[1]), day_str, fill=SPOTIFY_GREEN, font=small_font)
+    draw.text((day_x, start_y - day_bbox[1]), day_str, fill=accent_color, font=small_font)
 
     time_y = start_y + day_h + gap
     time_x = (size - (time_bbox[2] - time_bbox[0])) // 2
@@ -685,12 +707,13 @@ def render_clock(size: int, is_connected: bool = True) -> Image.Image:
     dot_r = outer_r - 1
     sx = cx + math.cos(rad) * dot_r
     sy = cy + math.sin(rad) * dot_r
-    draw.ellipse((sx - 1.5, sy - 1.5, sx + 1.5, sy + 1.5), fill=SPOTIFY_GREEN)
+    draw.ellipse((sx - 1.5, sy - 1.5, sx + 1.5, sy + 1.5), fill=accent_color)
 
     pulse = (math.sin(time.time() * 2.0) + 1.0) / 2.0
     pulse_brightness = int(50 + pulse * 150)
     if is_connected:
-        pulse_color = (0, pulse_brightness, int(pulse_brightness * 0.3))
+        # Derive pulse from accent color
+        pulse_color = tuple(int(c * pulse_brightness / 200) for c in accent_color)
     else:
         pulse_color = (pulse_brightness, 0, 0)
 
@@ -922,7 +945,11 @@ def parse_lrc(synced_lyrics: str) -> list[tuple[int, str]]:
 
 def fetch_lyrics(
     artist: str, track: str, album: str, duration_s: int
-) -> list[tuple[int, str]] | None:
+) -> tuple[list[tuple[int, str]] | None, bool]:
+    """Fetch synced lyrics from LRCLIB.
+
+    Returns (lyrics_list_or_None, is_instrumental).
+    """
     try:
         params = {
             "artist_name": artist,
@@ -938,14 +965,22 @@ def fetch_lyrics(
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
 
+        # Detect instrumental tracks
+        is_instrumental = bool(data.get("instrumental", False))
+        if not is_instrumental:
+            plain = data.get("plainLyrics") or ""
+            synced_raw = data.get("syncedLyrics") or ""
+            if not plain.strip() and not synced_raw.strip():
+                is_instrumental = True
+
         synced = data.get("syncedLyrics")
         if not synced:
-            return None
+            return None, is_instrumental
         parsed = parse_lrc(synced)
-        return parsed if parsed else None
+        return (parsed if parsed else None), is_instrumental
     except Exception as exc:
         log(f"LRCLIB: Failed to fetch lyrics: {exc}", "warn")
-        return None
+        return None, False
 
 
 def fetch_lyrics_async(
@@ -953,13 +988,16 @@ def fetch_lyrics_async(
     state: SharedPlaybackState, lock: threading.Lock, track_key: str,
 ) -> None:
     log(f"LRCLIB: Fetching lyrics for '{track}' by '{artist}'...")
-    lyrics = fetch_lyrics(artist, track, album, duration_s)
+    lyrics, is_instrumental = fetch_lyrics(artist, track, album, duration_s)
     with lock:
         if state.art_key == track_key:
             state.lyrics = lyrics
             state.lyrics_track_key = track_key
+            state.is_instrumental = is_instrumental
     if lyrics:
         log(f"LRCLIB: Found {len(lyrics)} synced lyric lines.")
+    elif is_instrumental:
+        log("LRCLIB: Track is instrumental — no lyrics expected.")
     else:
         log("LRCLIB: No synced lyrics available for this track.")
 
@@ -1012,20 +1050,34 @@ def _get_line_duration_ms(lyrics: list[tuple[int, str]], idx: int, total_duratio
 
 def _smart_h_scroll_x(
     text_w: int, size: int, time_on_screen_ms: int, line_duration_ms: int,
+    text: str = "",
 ) -> int:
     """Calculate x offset for smart time-proportional horizontal scroll.
 
     Always starts at x=2 (first word visible).  Scrolls left proportionally
     so the end of the text is reached right as the line finishes.
     Uses ease-in-out for natural feel.
+
+    Word-rate cap: if the line duration far exceeds the expected reading time,
+    cap the scroll window so text scrolls at a natural reading pace instead
+    of stretching across a long instrumental gap.
     """
     overflow = text_w - size + 4  # 4px right padding
     if overflow <= 0:
         return (size - text_w) // 2  # centered
 
+    # Word-rate cap: estimate how long this text should take to read
+    effective_duration = line_duration_ms
+    if text:
+        word_count = max(1, len(text.split()))
+        expected_read_ms = word_count * AVG_MS_PER_WORD + 1000  # buffer
+        if line_duration_ms > expected_read_ms * 2:
+            # Cap scroll to natural reading speed, don't stretch across gap
+            effective_duration = expected_read_ms
+
     # Leave a small margin at start and end of the line duration
-    margin_ms = min(300, line_duration_ms // 6)
-    scroll_window = max(1, line_duration_ms - margin_ms * 2)
+    margin_ms = min(300, effective_duration // 6)
+    scroll_window = max(1, effective_duration - margin_ms * 2)
     t_in_scroll = time_on_screen_ms - margin_ms
 
     if t_in_scroll <= 0:
@@ -1083,8 +1135,18 @@ def render_lyrics(
     style: str = "scroll",
     smart_scroll: bool = True,
     font_size: int = 9,
+    is_instrumental: bool = False,
+    lyrics_lead_ms: int = 150,
+    accent_color: tuple[int, int, int] = SPOTIFY_GREEN,
 ) -> Image.Image:
-    """Render lyrics with smooth scrolling or 3-line pop, with optional smart scroll."""
+    """Render lyrics with smooth scrolling or 3-line pop, with optional smart scroll.
+
+    Enhancements:
+    - Instrumental visualizer (pulsing bars) when track is instrumental.
+    - Empty active lines show subtle '· · ·' dots.
+    - lyrics_lead_ms shifts estimated progress forward for read-ahead.
+    - accent_color replaces hardcoded SPOTIFY_GREEN.
+    """
     frame = Image.new("RGB", (size, size), (0, 0, 0))
     draw = ImageDraw.Draw(frame)
     font = get_font(font_size)
@@ -1099,30 +1161,68 @@ def render_lyrics(
     if duration_ms > 0:
         estimated_progress = min(estimated_progress, duration_ms)
 
+    # Apply lyrics lead offset (read-ahead: see words before they're sung)
+    display_progress = estimated_progress + lyrics_lead_ms
+
     if not lyrics:
-        # No lyrics placeholder
-        no_lyrics_text = "No Lyrics"
-        bbox = draw.textbbox((0, 0), no_lyrics_text, font=font)
-        tw = bbox[2] - bbox[0]
-        x = (size - tw) // 2
-        y = (size - (bbox[3] - bbox[1])) // 2
-        draw.text((x, y - bbox[1]), no_lyrics_text, fill=LYRIC_DIM_COLOR, font=font)
-        note = "\u266a"
-        nbbox = draw.textbbox((0, 0), note, font=font)
-        nw = nbbox[2] - nbbox[0]
-        draw.text((x - nw - 3, y - nbbox[1]), note, fill=SPOTIFY_GREEN, font=font)
-        draw.text((x + tw + 3, y - nbbox[1]), note, fill=SPOTIFY_GREEN, font=font)
+        if is_instrumental:
+            # ── Instrumental Visualizer: pulsing bars ──
+            now_t = time.monotonic()
+            num_bars = 8
+            bar_gap = 2
+            total_bar_w = size - (num_bars + 1) * bar_gap
+            bar_w = max(2, total_bar_w // num_bars)
+            max_bar_h = size // 2 - 8
+            min_bar_h = 4
+
+            for i in range(num_bars):
+                # Each bar pulses at a different phase
+                phase = i * (math.pi / num_bars * 2)
+                pulse = (math.sin(now_t * 3.0 + phase) + 1.0) / 2.0
+                bar_h = int(min_bar_h + pulse * (max_bar_h - min_bar_h))
+
+                bx = bar_gap + i * (bar_w + bar_gap)
+                by = size // 2 - bar_h // 2 - 4
+
+                # Gradient the color intensity per bar
+                intensity = 0.4 + 0.6 * pulse
+                bar_color = tuple(int(c * intensity) for c in accent_color)
+                draw.rectangle((bx, by, bx + bar_w - 1, by + bar_h - 1), fill=bar_color)
+
+            # "Instrumental" label below bars
+            label = "Instrumental"
+            lbbox = draw.textbbox((0, 0), label, font=font)
+            lw = lbbox[2] - lbbox[0]
+            lx = (size - lw) // 2
+            ly = size // 2 + max_bar_h // 2
+            draw.text((lx, ly - lbbox[1]), label, fill=LYRIC_DIM_COLOR, font=font)
+        else:
+            # No lyrics placeholder
+            no_lyrics_text = "No Lyrics"
+            bbox = draw.textbbox((0, 0), no_lyrics_text, font=font)
+            tw = bbox[2] - bbox[0]
+            x = (size - tw) // 2
+            y = (size - (bbox[3] - bbox[1])) // 2
+            draw.text((x, y - bbox[1]), no_lyrics_text, fill=LYRIC_DIM_COLOR, font=font)
+            note = "\u266a"
+            nbbox = draw.textbbox((0, 0), note, font=font)
+            nw = nbbox[2] - nbbox[0]
+            draw.text((x - nw - 3, y - nbbox[1]), note, fill=accent_color, font=font)
+            draw.text((x + tw + 3, y - nbbox[1]), note, fill=accent_color, font=font)
     else:
-        idx = get_current_lyric_index(lyrics, estimated_progress)
+        idx = get_current_lyric_index(lyrics, display_progress)
         now_mono = time.monotonic()
 
         # Common: time the current line has been on screen
         if idx >= 0:
-            time_on_screen_ms = max(0, estimated_progress - lyrics[idx][0])
+            time_on_screen_ms = max(0, display_progress - lyrics[idx][0])
             line_dur_ms = _get_line_duration_ms(lyrics, idx, duration_ms)
         else:
             time_on_screen_ms = 0
             line_dur_ms = 3000
+
+        # Dots pattern for empty active lines (instrumental gaps)
+        dots_text = "· · ·"
 
         if style == "scroll":
             # Smooth vertical scroll animation
@@ -1158,8 +1258,15 @@ def render_lyrics(
                     continue
 
                 text = lyrics[li][1]
+                is_active_line = (li == idx)
+
+                # Handle empty lines
                 if not text.strip():
-                    continue
+                    if is_active_line:
+                        # Show dots for instrumental gap at active position
+                        text = dots_text
+                    else:
+                        continue
 
                 line_target_y = li * line_height
                 y_pixel = center_y + (line_target_y - current_y)
@@ -1167,8 +1274,7 @@ def render_lyrics(
                 if y_pixel < -12 or y_pixel > size + 12:
                     continue
 
-                is_active_line = (li == idx)
-                base_color = SPOTIFY_GREEN if is_active_line else LYRIC_DIM_COLOR
+                base_color = accent_color if is_active_line else LYRIC_DIM_COLOR
 
                 # Vertical edge fade
                 fade_factor = 1.0
@@ -1189,7 +1295,7 @@ def render_lyrics(
                     # Non-active lines: show start, no scroll
                     x = 2
                 elif smart_scroll:
-                    x = _smart_h_scroll_x(text_w, size, time_on_screen_ms, line_dur_ms)
+                    x = _smart_h_scroll_x(text_w, size, time_on_screen_ms, line_dur_ms, text)
                 else:
                     x = _legacy_h_scroll_x(text_w, size, now_mono, True, time_on_screen_ms)
 
@@ -1198,17 +1304,21 @@ def render_lyrics(
             # Pop mode — 3 fixed lines
             y_positions = [10, 28, 46]
             line_indices = [idx - 1, idx, idx + 1]
-            colors = [LYRIC_DIM_COLOR, SPOTIFY_GREEN, LYRIC_DIM_COLOR]
+            colors = [LYRIC_DIM_COLOR, accent_color, LYRIC_DIM_COLOR]
 
             for line_i, (li, y_pos, color) in enumerate(zip(line_indices, y_positions, colors)):
                 if li < 0 or li >= len(lyrics):
                     continue
 
                 text = lyrics[li][1]
-                if not text.strip():
-                    continue
-
                 is_active_line = (line_i == 1)
+
+                # Handle empty lines
+                if not text.strip():
+                    if is_active_line:
+                        text = dots_text
+                    else:
+                        continue
 
                 bbox = draw.textbbox((0, 0), text, font=font)
                 text_w = bbox[2] - bbox[0]
@@ -1221,8 +1331,8 @@ def render_lyrics(
                     x = 2
                 elif smart_scroll:
                     li_dur = _get_line_duration_ms(lyrics, li, duration_ms)
-                    li_time = max(0, estimated_progress - lyrics[li][0])
-                    x = _smart_h_scroll_x(text_w, size, li_time, li_dur)
+                    li_time = max(0, display_progress - lyrics[li][0])
+                    x = _smart_h_scroll_x(text_w, size, li_time, li_dur, text)
                 else:
                     x = _legacy_h_scroll_x(text_w, size, now_mono, True, time_on_screen_ms)
 
@@ -1233,7 +1343,7 @@ def render_lyrics(
         progress_frac = max(0.0, min(1.0, estimated_progress / duration_ms))
         bar_w = int(progress_frac * size)
         if bar_w > 0:
-            draw.rectangle((0, size - 1, bar_w - 1, size - 1), fill=SPOTIFY_GREEN)
+            draw.rectangle((0, size - 1, bar_w - 1, size - 1), fill=accent_color)
         if bar_w < size:
             draw.rectangle((bar_w, size - 1, size - 1, size - 1), fill=(30, 30, 30))
 
@@ -1261,9 +1371,9 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
     --card-border: #1e1e1e;
     --text: #e4e4e7;
     --text-dim: #71717a;
-    --green: #1ed760;
-    --green-dim: rgba(30, 215, 96, 0.15);
-    --green-glow: rgba(30, 215, 96, 0.3);
+    --accent: #1ed760;
+    --accent-dim: rgba(30, 215, 96, 0.15);
+    --accent-glow: rgba(30, 215, 96, 0.3);
     --gold: #f59e0b;
     --gold-dim: rgba(245, 158, 11, 0.15);
     --gold-glow: rgba(245, 158, 11, 0.3);
@@ -1287,7 +1397,7 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
   }
   .header h1 {
     font-size: 20px; font-weight: 700; letter-spacing: -0.5px;
-    background: linear-gradient(135deg, var(--green), #1ed79a);
+    background: linear-gradient(135deg, var(--accent), #1ed79a);
     -webkit-background-clip: text; -webkit-text-fill-color: transparent;
   }
   .header .subtitle {
@@ -1299,17 +1409,29 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
     display: inline-block; width: 6px; height: 6px;
     border-radius: 50%; margin-right: 4px; vertical-align: middle;
   }
-  .status-dot.connected { background: var(--green); box-shadow: 0 0 6px var(--green-glow); }
+  .status-dot.connected { background: var(--accent); box-shadow: 0 0 6px var(--accent-glow); }
   .status-dot.disconnected { background: var(--danger); }
 
   .card {
     background: var(--card); border: 1px solid var(--card-border);
     border-radius: var(--radius); padding: 16px; margin-bottom: 12px;
+    position: relative; overflow: hidden;
   }
   .card-title {
     font-size: 11px; font-weight: 600; color: var(--text-dim);
     text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px;
   }
+
+  /* Album art glow backdrop */
+  .now-playing-card { position: relative; }
+  .art-glow {
+    position: absolute; top: -20px; left: -20px; right: -20px; bottom: -20px;
+    background-size: cover; background-position: center;
+    filter: blur(40px) saturate(1.5); opacity: 0.12;
+    z-index: 0; transition: background-image 1s ease;
+    pointer-events: none;
+  }
+  .now-playing-card > *:not(.art-glow) { position: relative; z-index: 1; }
 
   /* Now Playing */
   .now-playing { display: flex; align-items: center; gap: 12px; }
@@ -1331,7 +1453,7 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
     font-size: 10px; color: #555;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px;
   }
-  .play-status { font-size: 10px; color: var(--green); margin-top: 2px; }
+  .play-status { font-size: 10px; color: var(--accent); margin-top: 2px; }
   .play-status.paused { color: var(--text-dim); }
   .effective-mode { font-size: 10px; color: var(--gold); margin-top: 1px; }
 
@@ -1345,8 +1467,8 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
   }
   .mode-btn:active { transform: scale(0.96); }
   .mode-btn.active {
-    border-color: var(--green); background: var(--green-dim);
-    box-shadow: 0 0 10px var(--green-glow);
+    border-color: var(--accent); background: var(--accent-dim);
+    box-shadow: 0 0 10px var(--accent-glow);
   }
   .mode-btn.active-default {
     border-color: var(--gold); background: var(--gold-dim);
@@ -1366,7 +1488,7 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
   }
   .slider-label .name { font-size: 12px; font-weight: 500; }
   .slider-label .value {
-    font-size: 12px; font-weight: 600; color: var(--green);
+    font-size: 12px; font-weight: 600; color: var(--accent);
     min-width: 36px; text-align: right;
   }
   input[type="range"] {
@@ -1375,12 +1497,12 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
   }
   input[type="range"]::-webkit-slider-thumb {
     -webkit-appearance: none; width: 20px; height: 20px;
-    border-radius: 50%; background: var(--green); cursor: pointer;
-    box-shadow: 0 0 8px var(--green-glow);
+    border-radius: 50%; background: var(--accent); cursor: pointer;
+    box-shadow: 0 0 8px var(--accent-glow);
   }
   input[type="range"]::-moz-range-thumb {
     width: 20px; height: 20px; border-radius: 50%;
-    background: var(--green); cursor: pointer; border: none;
+    background: var(--accent); cursor: pointer; border: none;
   }
   select.form-select {
     width: 100%; padding: 8px; background: #222; color: var(--text);
@@ -1407,10 +1529,10 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
     content: ""; position: absolute; height: 16px; width: 16px;
     left: 3px; bottom: 3px; background: #888; border-radius: 50%; transition: 0.3s;
   }
-  .switch input:checked + .slider { background: var(--green-dim); }
+  .switch input:checked + .slider { background: var(--accent-dim); }
   .switch input:checked + .slider:before {
-    transform: translateX(18px); background: var(--green);
-    box-shadow: 0 0 6px var(--green-glow);
+    transform: translateX(18px); background: var(--accent);
+    box-shadow: 0 0 6px var(--accent-glow);
   }
 
   /* Buttons */
@@ -1430,6 +1552,64 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
   /* Inline row for two sliders side by side */
   .inline-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 
+  /* Collapsible lyrics panel */
+  .lyrics-header {
+    display: flex; justify-content: space-between; align-items: center;
+    cursor: pointer; -webkit-user-select: none; user-select: none;
+  }
+  .lyrics-header .chevron {
+    font-size: 14px; transition: transform 0.3s ease; color: var(--text-dim);
+  }
+  .lyrics-header .chevron.open { transform: rotate(180deg); }
+  .lyrics-body {
+    max-height: 0; overflow: hidden; transition: max-height 0.4s ease;
+  }
+  .lyrics-body.open { max-height: 300px; }
+  .lyrics-container {
+    height: 250px; overflow-y: auto; margin-top: 10px;
+    font-size: 13px; line-height: 2; text-align: center;
+    scrollbar-width: thin; scrollbar-color: #333 transparent;
+  }
+  .lyrics-container::-webkit-scrollbar { width: 4px; }
+  .lyrics-container::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+  .lyrics-line { color: var(--text-dim); transition: color 0.3s, font-weight 0.3s; padding: 2px 8px; }
+  .lyrics-line.active { color: var(--accent); font-weight: 700; font-size: 14px; }
+  .lyrics-line.instrumental-dots { color: var(--text-dim); font-size: 16px; letter-spacing: 4px; }
+
+  /* Custom message */
+  .msg-input-row { display: flex; gap: 8px; }
+  .msg-input {
+    flex: 1; padding: 8px 12px; background: #222; color: var(--text);
+    border: 1px solid #333; border-radius: 6px; font-family: inherit;
+    font-size: 12px; outline: none;
+  }
+  .msg-input:focus { border-color: var(--accent); }
+  .msg-btn {
+    padding: 8px 14px; background: var(--accent-dim); color: var(--accent);
+    border: 1px solid var(--accent); border-radius: 6px; font-family: inherit;
+    font-size: 11px; font-weight: 600; cursor: pointer; white-space: nowrap;
+  }
+  .msg-btn:active { transform: scale(0.97); }
+  .msg-btn.clear { background: #1e1e1e; color: var(--text-dim); border-color: #333; }
+
+  /* Accent color swatches */
+  .color-grid { display: flex; gap: 8px; flex-wrap: wrap; }
+  .color-swatch {
+    width: 28px; height: 28px; border-radius: 50%; cursor: pointer;
+    border: 2px solid transparent; transition: all 0.2s;
+    position: relative;
+  }
+  .color-swatch:active { transform: scale(0.9); }
+  .color-swatch.active {
+    border-color: var(--text); box-shadow: 0 0 10px var(--accent-glow);
+  }
+  .color-swatch .check {
+    display: none; position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, -50%); font-size: 12px; color: #000;
+    font-weight: 700; text-shadow: 0 0 2px rgba(255,255,255,0.5);
+  }
+  .color-swatch.active .check { display: block; }
+
   .footer {
     text-align: center; padding: 16px 0;
     font-size: 10px; color: var(--text-dim);
@@ -1447,7 +1627,8 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
 </div>
 
 <!-- Now Playing -->
-<div class="card">
+<div class="card now-playing-card">
+  <div class="art-glow" id="artGlow"></div>
   <div class="card-title">Now Playing</div>
   <div class="now-playing">
     <div class="album-art" id="albumArt"></div>
@@ -1480,6 +1661,17 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Live Lyrics -->
+<div class="card">
+  <div class="lyrics-header" onclick="toggleLyrics()">
+    <div class="card-title" style="margin-bottom:0">&#127908; Live Lyrics</div>
+    <span class="chevron" id="lyricsChevron">&#9660;</span>
+  </div>
+  <div class="lyrics-body" id="lyricsBody">
+    <div class="lyrics-container" id="lyricsContainer"></div>
+  </div>
+</div>
+
 <!-- Lyrics Settings -->
 <div class="card">
   <div class="card-title">&#127925; Lyrics Settings</div>
@@ -1506,6 +1698,16 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
     </label>
   </div>
 
+  <div class="slider-group">
+    <div class="slider-label">
+      <span class="name">&#127908; Lyrics Lead (ms)</span>
+      <span class="value" id="lyricsLeadVal">150</span>
+    </div>
+    <input type="range" id="lyricsLead" min="0" max="500" step="10" value="150"
+           oninput="document.getElementById('lyricsLeadVal').textContent=this.value"
+           onchange="setSetting('lyrics-lead', this.value)">
+  </div>
+
   <div class="inline-row">
     <div class="slider-group">
       <div class="slider-label">
@@ -1526,6 +1728,23 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
              onchange="setSetting('pop-font-size', this.value)">
     </div>
   </div>
+</div>
+
+<!-- Custom Message -->
+<div class="card">
+  <div class="card-title">&#128172; Custom Message</div>
+  <div class="msg-input-row">
+    <input type="text" class="msg-input" id="customMsg" placeholder="Type a message..." maxlength="100">
+    <button class="msg-btn" onclick="sendCustomMsg()">Send</button>
+    <button class="msg-btn clear" onclick="clearCustomMsg()">Clear</button>
+  </div>
+  <div style="font-size:10px;color:var(--text-dim);margin-top:6px" id="msgStatus"></div>
+</div>
+
+<!-- Accent Color -->
+<div class="card">
+  <div class="card-title">&#127912; Accent Color</div>
+  <div class="color-grid" id="colorGrid"></div>
 </div>
 
 <!-- General Settings -->
@@ -1585,6 +1804,60 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
 
 <script>
 let currentState = {};
+let lyricsOpen = false;
+let lyricsData = null;
+let lyricsInterval = null;
+
+const COLOR_THEMES = {
+  spotify:  {r:30,g:215,b:96},
+  sunset:   {r:255,g:107,b:53},
+  ocean:    {r:0,g:150,b:255},
+  neon:     {r:180,g:60,b:255},
+  rose:     {r:255,g:90,b:150},
+  arctic:   {r:0,g:220,b:220},
+  gold:     {r:245,g:180,b:40},
+  crimson:  {r:220,g:40,b:60}
+};
+
+// Build color swatches
+(function buildSwatches() {
+  const grid = document.getElementById('colorGrid');
+  for (const [name, c] of Object.entries(COLOR_THEMES)) {
+    const el = document.createElement('div');
+    el.className = 'color-swatch';
+    el.dataset.theme = name;
+    el.style.background = `rgb(${c.r},${c.g},${c.b})`;
+    el.innerHTML = '<span class="check">&#10003;</span>';
+    el.onclick = () => setAccentColor(name);
+    grid.appendChild(el);
+  }
+})();
+
+function setAccentCSS(name) {
+  const c = COLOR_THEMES[name] || COLOR_THEMES.spotify;
+  const root = document.documentElement;
+  root.style.setProperty('--accent', `rgb(${c.r},${c.g},${c.b})`);
+  root.style.setProperty('--accent-dim', `rgba(${c.r},${c.g},${c.b},0.15)`);
+  root.style.setProperty('--accent-glow', `rgba(${c.r},${c.g},${c.b},0.3)`);
+  // Update header gradient
+  const h1 = document.querySelector('.header h1');
+  if (h1) h1.style.background = `linear-gradient(135deg, rgb(${c.r},${c.g},${c.b}), rgb(${Math.min(255,c.r+30)},${Math.min(255,c.g+30)},${Math.min(255,c.b+30)}))`;
+  // Update swatches
+  document.querySelectorAll('.color-swatch').forEach(sw => {
+    sw.classList.toggle('active', sw.dataset.theme === name);
+  });
+}
+
+async function setAccentColor(name) {
+  setAccentCSS(name);
+  try {
+    await fetch('/api/accent-color', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({value: name})
+    });
+  } catch(e) {}
+}
 
 async function fetchState() {
   try {
@@ -1619,12 +1892,18 @@ function updateUI(s) {
     em.textContent = '\\u2728 Default \\u2192 ' + (modeNames[s.effective_mode] || s.effective_mode);
   } else { em.textContent = ''; }
 
+  // Album art + glow
   const artDiv = document.getElementById('albumArt');
+  const glowDiv = document.getElementById('artGlow');
   if (s.image_url) {
     if (!artDiv.querySelector('img') || artDiv.querySelector('img').src !== s.image_url) {
       artDiv.innerHTML = '<img src="' + s.image_url + '" alt="Art">';
+      glowDiv.style.backgroundImage = 'url(' + s.image_url + ')';
     }
-  } else { artDiv.innerHTML = ''; }
+  } else {
+    artDiv.innerHTML = '';
+    glowDiv.style.backgroundImage = '';
+  }
 
   // Mode buttons
   document.querySelectorAll('.mode-btn').forEach(btn => {
@@ -1632,6 +1911,9 @@ function updateUI(s) {
     btn.classList.remove('active', 'active-default');
     if (m === s.display_mode) btn.classList.add(m === 'default' ? 'active-default' : 'active');
   });
+
+  // Accent color
+  if (s.accent_name) setAccentCSS(s.accent_name);
 
   // Lyrics settings
   if (document.activeElement?.id !== 'lyricsStyle') {
@@ -1651,6 +1933,10 @@ function updateUI(s) {
     document.getElementById('popFont').value = s.pop_font_size || 8;
     document.getElementById('popFontVal').textContent = s.pop_font_size || 8;
   }
+  if (document.activeElement?.id !== 'lyricsLead') {
+    document.getElementById('lyricsLead').value = s.lyrics_lead_ms ?? 150;
+    document.getElementById('lyricsLeadVal').textContent = s.lyrics_lead_ms ?? 150;
+  }
 
   // General settings
   if (document.activeElement?.id !== 'brightness') {
@@ -1669,6 +1955,83 @@ function updateUI(s) {
     document.getElementById('pollRate').value = Math.round(s.poll_interval);
     document.getElementById('pollVal').textContent = Math.round(s.poll_interval);
   }
+
+  // Custom message status
+  const msgStatus = document.getElementById('msgStatus');
+  if (s.custom_message) {
+    msgStatus.textContent = 'Active: "' + s.custom_message + '"';
+    msgStatus.style.color = 'var(--accent)';
+  } else {
+    msgStatus.textContent = '';
+  }
+}
+
+// Live lyrics
+function toggleLyrics() {
+  lyricsOpen = !lyricsOpen;
+  document.getElementById('lyricsBody').classList.toggle('open', lyricsOpen);
+  document.getElementById('lyricsChevron').classList.toggle('open', lyricsOpen);
+  if (lyricsOpen && !lyricsInterval) {
+    fetchLyricsData();
+    lyricsInterval = setInterval(fetchLyricsData, 1000);
+  } else if (!lyricsOpen && lyricsInterval) {
+    clearInterval(lyricsInterval);
+    lyricsInterval = null;
+  }
+}
+
+async function fetchLyricsData() {
+  try {
+    const res = await fetch('/api/lyrics');
+    if (!res.ok) return;
+    lyricsData = await res.json();
+    renderLiveLyrics();
+  } catch(e) {}
+}
+
+function renderLiveLyrics() {
+  const container = document.getElementById('lyricsContainer');
+  if (!lyricsData || !lyricsData.lyrics || lyricsData.lyrics.length === 0) {
+    container.innerHTML = '<div style="padding:40px;color:var(--text-dim)">' +
+      (lyricsData && lyricsData.is_instrumental ? '&#127925; Instrumental' : 'No synced lyrics') + '</div>';
+    return;
+  }
+
+  // Estimate current progress
+  let progress = lyricsData.progress_ms || 0;
+  if (lyricsData.is_playing && lyricsData.server_time) {
+    progress += (Date.now() / 1000 - lyricsData.server_time) * 1000;
+  }
+  progress += (lyricsData.lyrics_lead_ms || 0);
+
+  // Find active index
+  let activeIdx = -1;
+  for (let i = lyricsData.lyrics.length - 1; i >= 0; i--) {
+    if (lyricsData.lyrics[i][0] <= progress) { activeIdx = i; break; }
+  }
+
+  let html = '';
+  for (let i = 0; i < lyricsData.lyrics.length; i++) {
+    const text = lyricsData.lyrics[i][1];
+    const isActive = i === activeIdx;
+    if (!text.trim()) {
+      if (isActive) html += '<div class="lyrics-line instrumental-dots active">· · ·</div>';
+      else html += '<div class="lyrics-line">&nbsp;</div>';
+    } else {
+      html += '<div class="lyrics-line' + (isActive ? ' active' : '') + '">' + escapeHtml(text) + '</div>';
+    }
+  }
+  container.innerHTML = html;
+
+  // Auto-scroll to active line
+  const activeLine = container.querySelector('.lyrics-line.active');
+  if (activeLine) {
+    activeLine.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 async function setMode(mode) {
@@ -1713,6 +2076,31 @@ async function setSettingBool(name, value) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({value: value})
     });
+  } catch(e) {}
+}
+
+async function sendCustomMsg() {
+  const msg = document.getElementById('customMsg').value.trim();
+  if (!msg) return;
+  try {
+    await fetch('/api/custom-message', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({value: msg})
+    });
+    document.getElementById('customMsg').value = '';
+    setTimeout(fetchState, 300);
+  } catch(e) {}
+}
+
+async function clearCustomMsg() {
+  try {
+    await fetch('/api/custom-message', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({value: ''})
+    });
+    setTimeout(fetchState, 300);
   } catch(e) {}
 }
 
@@ -1881,6 +2269,18 @@ def start_control_server(
                 self._send_state()
             elif parsed.path == "/api/logs":
                 self._send_json(_log_buffer.get_all())
+            elif parsed.path == "/api/lyrics":
+                with outer_lock:
+                    data = {
+                        "lyrics": outer_state.lyrics,
+                        "progress_ms": outer_state.progress_ms,
+                        "duration_ms": outer_state.duration_ms,
+                        "is_playing": outer_state.is_playing,
+                        "is_instrumental": outer_state.is_instrumental,
+                        "server_time": time.time(),
+                        "lyrics_lead_ms": outer_state.lyrics_lead_ms,
+                    }
+                self._send_json(data)
             elif parsed.path == "/mode":
                 params = urllib.parse.parse_qs(parsed.query)
                 mode = params.get("set", [""])[0]
@@ -1983,12 +2383,40 @@ def start_control_server(
                     outer_state.spin_speed = outer_state._default_spin_speed
                     outer_state.text_scroll_speed = outer_state._default_text_scroll_speed
                     outer_state.poll_interval = 5.0
+                    outer_state.accent_name = "spotify"
+                    outer_state.accent_color = COLOR_THEMES["spotify"]
+                    outer_state.custom_message = ""
+                    outer_state.lyrics_lead_ms = 150
                 try:
                     outer_display.set_brightness(outer_state._default_brightness)
                 except Exception:
                     pass
                 log("Settings reset to defaults")
                 self._send_json({"ok": True})
+
+            elif parsed.path == "/api/accent-color":
+                val = body.get("value", "spotify")
+                if val in COLOR_THEMES:
+                    with outer_lock:
+                        outer_state.accent_name = val
+                        outer_state.accent_color = COLOR_THEMES[val]
+                    self._send_json({"ok": True, "accent_name": val})
+                else:
+                    self._send_json({"error": "Invalid theme"}, 400)
+
+            elif parsed.path == "/api/custom-message":
+                val = str(body.get("value", ""))
+                with outer_lock:
+                    outer_state.custom_message = val
+                log(f"Custom message set: '{val}'" if val else "Custom message cleared")
+                self._send_json({"ok": True, "custom_message": val})
+
+            elif parsed.path == "/api/lyrics-lead":
+                val = int(body.get("value", 150))
+                val = max(0, min(500, val))
+                with outer_lock:
+                    outer_state.lyrics_lead_ms = val
+                self._send_json({"ok": True, "lyrics_lead_ms": val})
 
             elif parsed.path == "/api/logs/clear":
                 _log_buffer.clear()
@@ -2045,6 +2473,9 @@ def start_control_server(
                     "has_lyrics": outer_state.lyrics is not None and len(outer_state.lyrics or []) > 0,
                     "progress_ms": outer_state.progress_ms,
                     "duration_ms": outer_state.duration_ms,
+                    "accent_name": outer_state.accent_name,
+                    "custom_message": outer_state.custom_message,
+                    "lyrics_lead_ms": outer_state.lyrics_lead_ms,
                 }
             self._send_json(data)
 
@@ -2102,6 +2533,14 @@ def poll_spotify(
             if art and art.is_playing:
                 last_playing_time = time.time()
                 current_wait = active_seconds
+
+                remaining_ms = art.duration_ms - art.progress_ms
+                if remaining_ms < 15000:
+                    current_wait = max(1.5, remaining_ms / 5000.0)
+                    log(f"Spotify: Near track end. Accelerated poll rate: {current_wait:.1f}s", verbose=True)
+                elif art.progress_ms < 30000 and art.duration_ms > 120000:
+                    current_wait = min(10.0, active_seconds * 1.5)
+                    log(f"Spotify: Track just started. Backed off poll rate: {current_wait:.1f}s", verbose=True)
 
             time_since_played = time.time() - last_playing_time
             if time_since_played > 60.0:
@@ -2206,6 +2645,12 @@ def poll_spotify(
 # ═══════════════════════════════════════════════════════════════════
 
 def run(args: argparse.Namespace) -> None:
+    try:
+        os.nice(-5)
+        log("Process priority elevated (nice=-5)")
+    except (OSError, PermissionError, AttributeError):
+        log("Could not elevate process priority (not root, or Windows?)", "warn")
+
     if args.preview_frames:
         render_preview_frames(args.preview_frames)
         return
@@ -2347,6 +2792,10 @@ def run(args: argparse.Namespace) -> None:
                 fetch_time = playback_state.fetch_time
                 current_lyrics = playback_state.lyrics
                 is_connected = playback_state.is_connected
+                is_instrumental = playback_state.is_instrumental
+                lyrics_lead_ms = playback_state.lyrics_lead_ms
+                accent_color = playback_state.accent_color
+                custom_message = playback_state.custom_message
 
             now = time.monotonic()
             delta = now - last_frame
@@ -2368,7 +2817,7 @@ def run(args: argparse.Namespace) -> None:
             if display_mode == "clock":
                 with playback_lock:
                     playback_state.effective_mode = "clock"
-                frame = render_clock(size, is_connected)
+                frame = render_clock(size, is_connected, accent_color)
                 display.show(frame)
                 if args.once:
                     break
@@ -2386,6 +2835,9 @@ def run(args: argparse.Namespace) -> None:
                     playback_state.lyrics_style,
                     playback_state.smart_scroll,
                     playback_state.scroll_font_size if playback_state.lyrics_style == "scroll" else playback_state.pop_font_size,
+                    is_instrumental=is_instrumental,
+                    lyrics_lead_ms=lyrics_lead_ms,
+                    accent_color=accent_color,
                 )
                 display.show(frame)
                 if args.once:
@@ -2415,7 +2867,7 @@ def run(args: argparse.Namespace) -> None:
                     playback_state.effective_mode = effective
 
                 if effective == "clock":
-                    frame = render_clock(size, is_connected)
+                    frame = render_clock(size, is_connected, accent_color)
                     display.show(frame)
                     if args.once:
                         break
@@ -2429,6 +2881,9 @@ def run(args: argparse.Namespace) -> None:
                         playback_state.lyrics_style,
                         playback_state.smart_scroll,
                         playback_state.scroll_font_size if playback_state.lyrics_style == "scroll" else playback_state.pop_font_size,
+                        is_instrumental=is_instrumental,
+                        lyrics_lead_ms=lyrics_lead_ms,
+                        accent_color=accent_color,
                     )
                     display.show(frame)
                     if args.once:
@@ -2446,7 +2901,9 @@ def run(args: argparse.Namespace) -> None:
 
             display_text = ""
             if not args.no_text:
-                if title and artist:
+                if custom_message:
+                    display_text = custom_message
+                elif title and artist:
                     display_text = f"{title} · {artist}"
                 elif title or artist:
                     display_text = title or artist
