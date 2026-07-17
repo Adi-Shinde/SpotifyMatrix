@@ -143,7 +143,7 @@ class SharedPlaybackState:
     lyrics: list[tuple[int, str]] | None = None  # [(timestamp_ms, text), ...]
     lyrics_track_key: str | None = None
     is_instrumental: bool = False  # True when LRCLIB says track is instrumental
-    lyrics_lead_ms: int = 150  # ms to shift lyrics ahead for read-along
+    lyrics_lead_ms: int = 180  # ms to shift lyrics ahead for read-along
     # Accent color
     accent_color: tuple[int, int, int] = (30, 215, 96)  # default SPOTIFY_GREEN
     accent_name: str = "spotify"
@@ -1367,6 +1367,7 @@ def render_custom_slate(size: int, frames: list[Image.Image], delay: float) -> I
 # ═══════════════════════════════════════════════════════════════════
 
 CONTROL_PANEL_HTML = """<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -1379,464 +1380,302 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
 
   :root {
     --bg: #0a0a0a;
-    --card: #141414;
-    --card-border: #1e1e1e;
+    --card: rgba(20, 20, 20, 0.6);
+    --card-border: rgba(255, 255, 255, 0.1);
     --text: #e4e4e7;
     --text-dim: #71717a;
     --accent: #1ed760;
     --accent-dim: rgba(30, 215, 96, 0.15);
     --accent-glow: rgba(30, 215, 96, 0.3);
     --gold: #f59e0b;
-    --gold-dim: rgba(245, 158, 11, 0.15);
-    --gold-glow: rgba(245, 158, 11, 0.3);
-    --danger: #ef4444;
-    --radius: 12px;
   }
 
   body {
-    font-family: 'Inter', -apple-system, sans-serif;
-    background: var(--bg);
+    background-color: var(--bg);
     color: var(--text);
-    min-height: 100vh;
-    padding: 16px;
-    padding-bottom: 40px;
-    -webkit-tap-highlight-color: transparent;
+    font-family: 'Inter', -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    padding: 20px;
+    padding-bottom: 60px;
   }
 
-  .header {
-    text-align: center;
-    padding: 16px 0 20px;
-  }
-  .header h1 {
-    font-size: 20px; font-weight: 700; letter-spacing: -0.5px;
-    background: linear-gradient(135deg, var(--accent), #1ed79a);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-  }
-  .header .subtitle {
-    font-size: 11px; color: var(--text-dim); margin-top: 4px;
-    text-transform: uppercase; letter-spacing: 1.5px;
+  /* Dynamic Background */
+  #appBackground {
+    position: fixed;
+    top: -20px; left: -20px; right: -20px; bottom: -20px;
+    background-size: cover;
+    background-position: center;
+    filter: blur(40px) brightness(0.4);
+    z-index: -1;
+    transition: background-image 1s ease;
   }
 
-  .status-dot {
-    display: inline-block; width: 6px; height: 6px;
-    border-radius: 50%; margin-right: 4px; vertical-align: middle;
-  }
-  .status-dot.connected { background: var(--accent); box-shadow: 0 0 6px var(--accent-glow); }
-  .status-dot.disconnected { background: var(--danger); }
+  .container { max-width: 480px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; position: relative; z-index: 1; }
+  .header { text-align: center; margin-bottom: 10px; text-shadow: 0 2px 10px rgba(0,0,0,0.5); }
+  .header h1 { font-size: 24px; font-weight: 700; letter-spacing: -0.5px; }
+  .header p { font-size: 13px; color: #a1a1aa; margin-top: 4px; }
 
+  /* Glassmorphism Cards */
   .card {
-    background: var(--card); border: 1px solid var(--card-border);
-    border-radius: var(--radius); padding: 16px; margin-bottom: 12px;
-    position: relative; overflow: hidden;
+    background: var(--card);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--card-border);
+    border-radius: 16px;
+    padding: 20px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
   }
-  .card-title {
-    font-size: 11px; font-weight: 600; color: var(--text-dim);
-    text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px;
-  }
+  .card-title { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: #a1a1aa; font-weight: 600; margin-bottom: 16px; text-shadow: 0 1px 4px rgba(0,0,0,0.8); }
 
-  /* Album art glow backdrop */
-  .now-playing-card { position: relative; }
-  .art-glow {
-    position: absolute; top: -20px; left: -20px; right: -20px; bottom: -20px;
-    background-size: cover; background-position: center;
-    filter: blur(40px) saturate(1.5); opacity: 0.12;
-    z-index: 0; transition: background-image 1s ease;
-    pointer-events: none;
-  }
-  .now-playing-card > *:not(.art-glow) { position: relative; z-index: 1; }
+  .now-playing { display: flex; gap: 16px; align-items: center; position: relative; overflow: hidden; }
+  .album-art { width: 72px; height: 72px; border-radius: 8px; background: #27272a; flex-shrink: 0; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
+  .album-art img { width: 100%; height: 100%; border-radius: 8px; object-fit: cover; }
+  .track-info { flex: 1; min-width: 0; }
+  .track-title { font-size: 16px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-shadow: 0 1px 4px rgba(0,0,0,0.8); }
+  .track-artist { font-size: 14px; color: #a1a1aa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 4px; text-shadow: 0 1px 4px rgba(0,0,0,0.8); }
+  .instrumental-badge { display: inline-block; font-size: 10px; font-weight: 600; background: var(--accent-dim); color: var(--accent); padding: 2px 6px; border-radius: 4px; margin-top: 6px; border: 1px solid var(--accent-glow); }
 
-  /* Now Playing */
-  .now-playing { display: flex; align-items: center; gap: 12px; }
-  .now-playing .album-art {
-    width: 48px; height: 48px; border-radius: 8px;
-    background: #222; flex-shrink: 0; overflow: hidden;
-  }
-  .now-playing .album-art img { width: 100%; height: 100%; object-fit: cover; }
-  .now-playing .track-info { flex: 1; min-width: 0; }
-  .track-info .title {
-    font-size: 14px; font-weight: 600;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
-  .track-info .artist {
-    font-size: 12px; color: var(--text-dim);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
-  .track-info .album-line {
-    font-size: 10px; color: #555;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px;
-  }
-  .play-status { font-size: 10px; color: var(--accent); margin-top: 2px; }
-  .play-status.paused { color: var(--text-dim); }
-  .effective-mode { font-size: 10px; color: var(--gold); margin-top: 1px; }
-
-  /* Mode Grid */
-  .mode-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  /* Modes */
+  .modes { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
   .mode-btn {
-    background: var(--bg); border: 2px solid var(--card-border);
-    border-radius: 10px; padding: 10px 4px; text-align: center;
-    cursor: pointer; transition: all 0.2s ease;
-    -webkit-user-select: none; user-select: none;
+    background: rgba(255,255,255,0.05); border: 1px solid var(--card-border); color: var(--text);
+    padding: 12px; border-radius: 12px; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.2s;
   }
-  .mode-btn:active { transform: scale(0.96); }
-  .mode-btn.active {
-    border-color: var(--accent); background: var(--accent-dim);
-    box-shadow: 0 0 10px var(--accent-glow);
-  }
-  .mode-btn.active-default {
-    border-color: var(--gold); background: var(--gold-dim);
-    box-shadow: 0 0 10px var(--gold-glow);
-  }
-  .mode-btn .icon { font-size: 20px; margin-bottom: 2px; }
-  .mode-btn .label {
-    font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px;
-  }
+  .mode-btn.active { background: var(--accent-dim); border-color: var(--accent); color: var(--accent); }
+  .mode-btn:active { transform: scale(0.98); }
 
-  /* Form elements */
-  .slider-group { margin-bottom: 14px; }
+  /* Sliders */
+  .slider-group { margin-bottom: 16px; }
   .slider-group:last-child { margin-bottom: 0; }
-  .slider-label {
-    display: flex; justify-content: space-between;
-    align-items: center; margin-bottom: 6px;
+  .slider-label { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 13px; font-weight: 500; text-shadow: 0 1px 4px rgba(0,0,0,0.8); }
+  .slider-label .value { color: var(--accent); font-variant-numeric: tabular-nums; }
+  input[type=range] {
+    width: 100%; -webkit-appearance: none; background: transparent; height: 24px; cursor: pointer;
   }
-  .slider-label .name { font-size: 12px; font-weight: 500; }
-  .slider-label .value {
-    font-size: 12px; font-weight: 600; color: var(--accent);
-    min-width: 36px; text-align: right;
+  input[type=range]::-webkit-slider-runnable-track {
+    width: 100%; height: 6px; background: rgba(255,255,255,0.1); border-radius: 3px;
   }
-  input[type="range"] {
-    -webkit-appearance: none; width: 100%;
-    height: 6px; border-radius: 3px; background: #333; outline: none;
+  input[type=range]::-webkit-slider-thumb {
+    height: 18px; width: 18px; border-radius: 50%; background: var(--text);
+    -webkit-appearance: none; margin-top: -6px; box-shadow: 0 2px 6px rgba(0,0,0,0.5); transition: transform 0.1s;
   }
-  input[type="range"]::-webkit-slider-thumb {
-    -webkit-appearance: none; width: 20px; height: 20px;
-    border-radius: 50%; background: var(--accent); cursor: pointer;
-    box-shadow: 0 0 8px var(--accent-glow);
-  }
-  input[type="range"]::-moz-range-thumb {
-    width: 20px; height: 20px; border-radius: 50%;
-    background: var(--accent); cursor: pointer; border: none;
-  }
-  select.form-select {
-    width: 100%; padding: 8px; background: #222; color: var(--text);
-    border: 1px solid #333; border-radius: 6px; font-family: inherit;
-    font-size: 12px; font-weight: 500; outline: none; cursor: pointer;
-  }
+  input[type=range]:active::-webkit-slider-thumb { transform: scale(1.2); background: var(--accent); }
 
-  /* Toggle switch */
-  .toggle-row {
-    display: flex; justify-content: space-between; align-items: center;
-    margin-bottom: 14px;
+  /* Lyric Styles */
+  .segmented { display: flex; background: rgba(0,0,0,0.4); border-radius: 8px; padding: 4px; margin-bottom: 16px; border: 1px solid var(--card-border); }
+  .seg-btn {
+    flex: 1; text-align: center; padding: 6px 0; font-size: 13px; font-weight: 500;
+    color: var(--text-dim); cursor: pointer; border-radius: 6px; transition: all 0.2s;
   }
-  .toggle-row .name { font-size: 12px; font-weight: 500; }
-  .toggle-row .desc { font-size: 10px; color: var(--text-dim); margin-top: 1px; }
-  .switch {
-    position: relative; width: 40px; height: 22px; flex-shrink: 0;
-  }
-  .switch input { opacity: 0; width: 0; height: 0; }
-  .switch .slider {
-    position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
-    background: #333; border-radius: 22px; transition: 0.3s;
-  }
-  .switch .slider:before {
-    content: ""; position: absolute; height: 16px; width: 16px;
-    left: 3px; bottom: 3px; background: #888; border-radius: 50%; transition: 0.3s;
-  }
-  .switch input:checked + .slider { background: var(--accent-dim); }
-  .switch input:checked + .slider:before {
-    transform: translateX(18px); background: var(--accent);
-    box-shadow: 0 0 6px var(--accent-glow);
-  }
+  .seg-btn.active { background: rgba(255,255,255,0.1); color: var(--text); box-shadow: 0 2px 8px rgba(0,0,0,0.2); }
 
-  /* Buttons */
-  .btn-row { display: flex; gap: 8px; }
-  .btn {
-    flex: 1; padding: 10px; border: none; border-radius: 8px;
-    font-family: 'Inter', sans-serif; font-size: 12px; font-weight: 600;
-    cursor: pointer; transition: all 0.2s; text-transform: uppercase;
-    letter-spacing: 0.5px;
-  }
-  .btn:active { transform: scale(0.97); }
-  .btn-reset { background: #1e1e1e; color: var(--text-dim); border: 1px solid #333; }
-  .btn-reset:hover { background: #2a2a2a; color: var(--text); }
-  .btn-logs { background: #1e1e1e; color: var(--text-dim); border: 1px solid #333; }
-  .btn-logs:hover { background: #2a2a2a; color: var(--text); }
-
-  /* Inline row for two sliders side by side */
-  .inline-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-
-  /* Collapsible lyrics panel */
-  .lyrics-header {
-    display: flex; justify-content: space-between; align-items: center;
-    cursor: pointer; -webkit-user-select: none; user-select: none;
-  }
-  .lyrics-header .chevron {
-    font-size: 14px; transition: transform 0.3s ease; color: var(--text-dim);
-  }
-  .lyrics-header .chevron.open { transform: rotate(180deg); }
-  .lyrics-body {
-    max-height: 0; overflow: hidden; transition: max-height 0.4s ease;
-  }
-  .lyrics-body.open { max-height: 300px; }
-  .lyrics-container {
-    height: 250px; overflow-y: auto; margin-top: 10px;
-    font-size: 13px; line-height: 2; text-align: center;
-    scrollbar-width: thin; scrollbar-color: #333 transparent;
-  }
-  .lyrics-container::-webkit-scrollbar { width: 4px; }
-  .lyrics-container::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
-  .lyrics-line { color: var(--text-dim); transition: color 0.3s, font-weight 0.3s; padding: 2px 8px; }
-  .lyrics-line.active { color: var(--accent); font-weight: 700; font-size: 14px; }
-  .lyrics-line.instrumental-dots { color: var(--text-dim); font-size: 16px; letter-spacing: 4px; }
-
-  /* Custom message */
+  /* Custom Slate */
+  #customSlateCard { display: none; } /* Hidden by default */
   .msg-input-row { display: flex; gap: 8px; }
   .msg-input {
-    flex: 1; padding: 8px 12px; background: #222; color: var(--text);
-    border: 1px solid #333; border-radius: 6px; font-family: inherit;
-    font-size: 12px; outline: none;
+    flex: 1; background: rgba(0,0,0,0.4); border: 1px solid var(--card-border);
+    color: white; padding: 10px 12px; border-radius: 8px; font-family: inherit; font-size: 14px; outline: none;
   }
   .msg-input:focus { border-color: var(--accent); }
   .msg-btn {
-    padding: 8px 14px; background: var(--accent-dim); color: var(--accent);
-    border: 1px solid var(--accent); border-radius: 6px; font-family: inherit;
-    font-size: 11px; font-weight: 600; cursor: pointer; white-space: nowrap;
+    background: var(--accent); color: #000; border: none; font-weight: 600;
+    padding: 0 16px; border-radius: 8px; cursor: pointer; font-size: 14px;
   }
-  .msg-btn:active { transform: scale(0.97); }
-  .msg-btn.clear { background: #1e1e1e; color: var(--text-dim); border-color: #333; }
+  .msg-btn.clear { background: rgba(255,255,255,0.1); color: var(--text); }
+  
+  /* Expander for Advanced Settings */
+  .adv-toggle {
+    width: 100%; text-align: center; background: transparent; border: 1px solid var(--card-border);
+    color: var(--text-dim); padding: 10px; border-radius: 12px; cursor: pointer; font-size: 13px; font-weight: 500; margin-bottom: 16px;
+  }
+  #advSettings { display: none; }
 
-  /* Accent color swatches */
-  .color-grid { display: flex; gap: 8px; flex-wrap: wrap; }
+  /* Color Grid */
+  .color-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
   .color-swatch {
-    width: 28px; height: 28px; border-radius: 50%; cursor: pointer;
-    border: 2px solid transparent; transition: all 0.2s;
-    position: relative;
+    aspect-ratio: 1; border-radius: 50%; cursor: pointer; position: relative;
+    border: 2px solid transparent; transition: transform 0.2s; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
   }
   .color-swatch:active { transform: scale(0.9); }
-  .color-swatch.active {
-    border-color: var(--text); box-shadow: 0 0 10px var(--accent-glow);
-  }
   .color-swatch .check {
-    display: none; position: absolute; top: 50%; left: 50%;
-    transform: translate(-50%, -50%); font-size: 12px; color: #000;
-    font-weight: 700; text-shadow: 0 0 2px rgba(255,255,255,0.5);
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: white; font-size: 16px; font-weight: bold; opacity: 0; text-shadow: 0 1px 4px rgba(0,0,0,0.5);
   }
-  .color-swatch.active .check { display: block; }
+  .color-swatch.active { border-color: white; transform: scale(1.1); }
+  .color-swatch.active .check { opacity: 1; }
 
-  .footer {
-    text-align: center; padding: 16px 0;
-    font-size: 10px; color: var(--text-dim);
+  .btn-row { display: flex; gap: 12px; }
+  .btn {
+    flex: 1; padding: 12px; border-radius: 12px; border: none; font-weight: 600; font-size: 14px; cursor: pointer;
   }
+  .btn-reset { background: rgba(255,255,255,0.05); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2); }
+  .btn-logs { background: rgba(255,255,255,0.05); color: var(--text); border: 1px solid var(--card-border); }
+
+  .footer { text-align: center; font-size: 12px; color: #52525b; margin-top: 24px; text-shadow: 0 1px 4px rgba(0,0,0,0.8); }
 </style>
 </head>
 <body>
 
-<div class="header">
-  <h1>SpotifyMatrix</h1>
-  <div class="subtitle">
-    <span class="status-dot connected" id="statusDot"></span>
-    <span id="statusText">Connected</span>
-  </div>
-</div>
+<div id="appBackground"></div>
 
-<!-- Now Playing -->
-<div class="card now-playing-card">
-  <div class="art-glow" id="artGlow"></div>
-  <div class="card-title">Now Playing</div>
-  <div class="now-playing">
-    <div class="album-art" id="albumArt"></div>
+<div class="container">
+  <div class="header">
+    <h1>SpotifyMatrix</h1>
+  </div>
+
+  <!-- Now Playing -->
+  <div class="card now-playing" onclick="toggleLiveLyrics()" style="cursor: pointer;" title="Tap for Live Lyrics">
+    <div class="album-art">
+      <img id="npImg" src="" style="display:none">
+    </div>
     <div class="track-info">
-      <div class="title" id="trackTitle">&mdash;</div>
-      <div class="artist" id="trackArtist">Waiting for Spotify...</div>
-      <div class="album-line" id="albumName"></div>
-      <div class="play-status" id="playStatus">&#9208; Paused</div>
-      <div class="effective-mode" id="effectiveMode"></div>
+      <div id="npTitle" class="track-title" style="color:var(--text-dim)">Not Playing</div>
+      <div id="npArtist" class="track-artist">--</div>
+      <div id="npInstr" class="instrumental-badge" style="display:none">&#127929; Instrumental</div>
     </div>
   </div>
-</div>
 
-<!-- Display Mode -->
-<div class="card">
-  <div class="card-title">Display Mode</div>
-  <div class="mode-grid">
-    <div class="mode-btn active-default" data-mode="default" onclick="setMode('default')">
-      <div class="icon">&#10024;</div><div class="label">Default</div>
-    </div>
-    <div class="mode-btn" data-mode="custom" onclick="setMode('custom')">
-      <div class="icon">&#127912;</div><div class="label">Custom</div>
-    </div>
-    <div class="mode-btn" data-mode="cd" onclick="setMode('cd')">
-      <div class="icon">&#128191;</div><div class="label">CD</div>
-    </div>
-    <div class="mode-btn" data-mode="lyrics" onclick="setMode('lyrics')">
-      <div class="icon">&#127925;</div><div class="label">Lyrics</div>
-    </div>
-    <div class="mode-btn" data-mode="clock" onclick="setMode('clock')">
-      <div class="icon">&#128336;</div><div class="label">Clock</div>
+  <!-- Live Lyrics Drawer -->
+  <div class="card" id="liveLyricsCard" style="display:none;">
+    <div class="card-title">&#127908; Live Lyrics</div>
+    <div id="liveLyricsBox" style="height:200px; overflow-y:auto; font-size:14px; line-height:1.6; color:var(--text-dim); text-align:center; padding-right:10px; position:relative;">
+      <!-- Lyrics injected here -->
     </div>
   </div>
-</div>
 
-<!-- Live Lyrics -->
-<div class="card">
-  <div class="lyrics-header" onclick="toggleLyrics()">
-    <div class="card-title" style="margin-bottom:0">&#127908; Live Lyrics</div>
-    <span class="chevron" id="lyricsChevron">&#9660;</span>
-  </div>
-  <div class="lyrics-body" id="lyricsBody">
-    <div class="lyrics-container" id="lyricsContainer"></div>
-  </div>
-</div>
-
-<!-- Lyrics Settings -->
-<div class="card">
-  <div class="card-title">&#127925; Lyrics Settings</div>
-
-  <div class="slider-group">
-    <div class="slider-label">
-      <span class="name">Style</span>
-      <span class="value" id="lyricsStyleVal">Scroll</span>
+  <!-- Display Mode -->
+  <div class="card">
+    <div class="card-title">&#128242; Display Mode</div>
+    <div class="modes">
+      <button class="mode-btn" id="mode-default" onclick="setMode('default')">Auto (Smart)</button>
+      <button class="mode-btn" id="mode-cd" onclick="setMode('cd')">CD View</button>
+      <button class="mode-btn" id="mode-lyrics" onclick="setMode('lyrics')">Lyrics</button>
+      <button class="mode-btn" id="mode-clock" onclick="setMode('clock')">Clock</button>
+      <button class="mode-btn" id="mode-custom" onclick="setMode('custom')" style="grid-column: span 2;">Custom Slate</button>
     </div>
-    <select id="lyricsStyle" class="form-select" onchange="setSettingString('lyrics-style', this.value)">
-      <option value="scroll">Smooth Scroll</option>
-      <option value="pop">Pop (3-Line)</option>
-    </select>
   </div>
 
-  <div class="toggle-row">
-    <div>
-      <div class="name">&#9889; Smart Scroll</div>
-      <div class="desc">Scroll speed matches line duration</div>
+  <!-- Main Settings (Brightness & Lyric Style) -->
+  <div class="card" id="mainSettingsCard">
+    <div class="card-title">&#9881; Main Settings</div>
+    
+    <div class="segmented">
+      <div class="seg-btn" id="style-scroll" onclick="setSetting('lyrics-style', 'scroll')">Scroll Mode</div>
+      <div class="seg-btn" id="style-pop" onclick="setSetting('lyrics-style', 'pop')">Pop Mode</div>
     </div>
-    <label class="switch">
-      <input type="checkbox" id="smartScroll" checked onchange="setSettingBool('smart-scroll', this.checked)">
-      <span class="slider"></span>
-    </label>
-  </div>
 
-  <div class="slider-group">
-    <div class="slider-label">
-      <span class="name">&#127908; Lyrics Lead (ms)</span>
-      <span class="value" id="lyricsLeadVal">150</span>
-    </div>
-    <input type="range" id="lyricsLead" min="0" max="500" step="10" value="150"
-           oninput="document.getElementById('lyricsLeadVal').textContent=this.value"
-           onchange="setSetting('lyrics-lead', this.value)">
-  </div>
-
-  <div class="inline-row">
     <div class="slider-group">
       <div class="slider-label">
-        <span class="name">Scroll Font</span>
-        <span class="value" id="scrollFontVal">9</span>
+        <span class="name">&#9728; Brightness</span>
+        <span class="value" id="brightnessVal">65</span>
       </div>
-      <input type="range" id="scrollFont" min="6" max="14" value="9"
-             oninput="document.getElementById('scrollFontVal').textContent=this.value"
-             onchange="setSetting('scroll-font-size', this.value)">
+      <input type="range" id="brightness" min="1" max="100" value="65"
+             oninput="document.getElementById('brightnessVal').textContent=this.value"
+             onchange="setSetting('brightness', this.value)">
     </div>
-    <div class="slider-group">
-      <div class="slider-label">
-        <span class="name">Pop Font</span>
-        <span class="value" id="popFontVal">8</span>
+  </div>
+
+  <!-- Custom Slate Editor -->
+  <div class="card" id="customSlateCard">
+    <div class="card-title">&#127912; Custom Slate (Canvas)</div>
+    <p style="color:#a1a1aa; font-size:12px; margin-bottom:10px; text-shadow: 0 1px 4px rgba(0,0,0,0.8);">Upload an image or GIF to cast it to the Matrix!</p>
+    <input type="file" id="slateUpload" accept="image/*" style="margin-bottom:10px; width:100%; color: white; background: rgba(0,0,0,0.4); padding: 5px; border-radius:4px; border: 1px solid var(--card-border);">
+    
+    <div class="msg-input-row" style="margin-bottom:10px;">
+      <input type="text" class="msg-input" id="slateText" placeholder="Add text...">
+      <input type="color" id="slateColor" value="#ffffff" style="width:30px; border:none; padding:0; background:none;">
+      <button class="msg-btn" onclick="addSlateText()">Add</button>
+    </div>
+    
+    <div style="display: flex; justify-content: center; margin-bottom: 10px;">
+      <canvas id="slateCanvas" width="64" height="64" style="width: 128px; height: 128px; border: 1px solid var(--card-border); image-rendering: pixelated; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);"></canvas>
+    </div>
+    <div class="msg-input-row" style="justify-content:center;">
+      <button class="msg-btn clear" onclick="clearSlate()">Clear</button>
+      <button class="msg-btn" onclick="sendCustomSlate()">Cast to Matrix</button>
+    </div>
+  </div>
+
+  <!-- Advanced Settings -->
+  <button class="adv-toggle" id="advToggleBtn" onclick="toggleAdv()">Show Advanced Settings &#9662;</button>
+  <div id="advSettings">
+    <div class="card">
+      <div class="card-title">&#9881; Advanced Tweaks</div>
+
+      <div class="slider-group">
+        <div class="slider-label">
+          <span class="name">Scroll Font Size</span>
+          <span class="value" id="scrollFontVal">9</span>
+        </div>
+        <input type="range" id="scrollFont" min="6" max="14" value="9"
+               oninput="document.getElementById('scrollFontVal').textContent=this.value"
+               onchange="setSetting('scroll-font-size', this.value)">
       </div>
-      <input type="range" id="popFont" min="6" max="14" value="8"
-             oninput="document.getElementById('popFontVal').textContent=this.value"
-             onchange="setSetting('pop-font-size', this.value)">
+      <div class="slider-group">
+        <div class="slider-label">
+          <span class="name">Pop Font Size</span>
+          <span class="value" id="popFontVal">9</span>
+        </div>
+        <input type="range" id="popFont" min="6" max="14" value="9"
+               oninput="document.getElementById('popFontVal').textContent=this.value"
+               onchange="setSetting('pop-font-size', this.value)">
+      </div>
+      <div class="slider-group">
+        <div class="slider-label">
+          <span class="name">Lyrics Lead (ms)</span>
+          <span class="value" id="leadVal">180</span>
+        </div>
+        <input type="range" id="leadTime" min="0" max="500" step="10" value="180"
+               oninput="document.getElementById('leadVal').textContent=this.value"
+               onchange="setSetting('lyrics-lead', this.value)">
+      </div>
+
+      <div class="slider-group" style="margin-top:16px;">
+        <div class="slider-label">
+          <span class="name">&#128171; Spin Speed (RPM)</span>
+          <span class="value" id="spinVal">20</span>
+        </div>
+        <input type="range" id="spinSpeed" min="1" max="120" value="20"
+               oninput="document.getElementById('spinVal').textContent=this.value"
+               onchange="setSetting('spin-speed', this.value)">
+      </div>
+      <div class="slider-group">
+        <div class="slider-label">
+          <span class="name">&#128220; Text Scroll Speed</span>
+          <span class="value" id="textVal">12</span>
+        </div>
+        <input type="range" id="textSpeed" min="1" max="100" value="12"
+               oninput="document.getElementById('textVal').textContent=this.value"
+               onchange="setSetting('text-speed', this.value)">
+      </div>
+      <div class="slider-group">
+        <div class="slider-label">
+          <span class="name">&#128225; Poll Rate (sec)</span>
+          <span class="value" id="pollVal">5</span>
+        </div>
+        <input type="range" id="pollRate" min="1" max="60" value="5"
+               oninput="document.getElementById('pollVal').textContent=this.value"
+               onchange="setSetting('poll-rate', this.value)">
+      </div>
     </div>
   </div>
-</div>
 
-<!-- Custom Slate Editor -->
-<div class="card">
-  <div class="card-title">&#127912; Custom Slate (Canvas)</div>
-  <p style="color:#aaa; font-size:12px; margin-bottom:10px;">Upload an image or GIF to cast it to the Matrix!</p>
-  <input type="file" id="slateUpload" accept="image/*" style="margin-bottom:10px; width:100%; color: white; background: #222; padding: 5px; border-radius:4px;">
-  
-  <div class="msg-input-row" style="margin-bottom:10px;">
-    <input type="text" class="msg-input" id="slateText" placeholder="Add text..." style="flex:1;">
-    <input type="color" id="slateColor" value="#ffffff" style="width:30px; border:none; padding:0; background:none;">
-    <button class="msg-btn" onclick="addSlateText()">Add</button>
+  <!-- Accent Color -->
+  <div class="card" id="colorCard">
+    <div class="card-title">&#127912; Accent Color</div>
+    <div class="color-grid" id="colorGrid"></div>
   </div>
-  
-  <div style="display: flex; justify-content: center; margin-bottom: 10px;">
-    <canvas id="slateCanvas" width="64" height="64" style="width: 128px; height: 128px; border: 1px solid #333; image-rendering: pixelated; border-radius: 4px;"></canvas>
-  </div>
-  <div class="msg-input-row" style="justify-content:center;">
-    <button class="msg-btn clear" onclick="clearSlate()">Clear</button>
-    <button class="msg-btn" onclick="sendCustomSlate()">Cast to Matrix</button>
-  </div>
-</div>
 
-<!-- Custom Message -->
-<div class="card">
-  <div class="card-title">&#128172; Custom Message</div>
-  <div class="msg-input-row">
-    <input type="text" class="msg-input" id="customMsg" placeholder="Type a message..." maxlength="100">
-    <button class="msg-btn" onclick="sendCustomMsg()">Send</button>
-    <button class="msg-btn clear" onclick="clearCustomMsg()">Clear</button>
-  </div>
-  <div style="font-size:10px;color:var(--text-dim);margin-top:6px" id="msgStatus"></div>
-</div>
-
-<!-- Accent Color -->
-<div class="card">
-  <div class="card-title">&#127912; Accent Color</div>
-  <div class="color-grid" id="colorGrid"></div>
-</div>
-
-<!-- General Settings -->
-<div class="card">
-  <div class="card-title">&#9881; General Settings</div>
-
-  <div class="slider-group">
-    <div class="slider-label">
-      <span class="name">&#9728; Brightness</span>
-      <span class="value" id="brightnessVal">65</span>
+  <!-- Actions -->
+  <div class="card">
+    <div class="btn-row">
+      <button class="btn btn-reset" onclick="resetAll()">&#8635; Reset All</button>
+      <button class="btn btn-logs" onclick="window.location='/logs'">&#128196; Logs</button>
     </div>
-    <input type="range" id="brightness" min="1" max="100" value="65"
-           oninput="document.getElementById('brightnessVal').textContent=this.value"
-           onchange="setSetting('brightness', this.value)">
   </div>
 
-  <div class="slider-group">
-    <div class="slider-label">
-      <span class="name">&#128171; Spin Speed</span>
-      <span class="value" id="spinVal">20</span>
-    </div>
-    <input type="range" id="spinSpeed" min="1" max="120" value="20"
-           oninput="document.getElementById('spinVal').textContent=this.value"
-           onchange="setSetting('spin-speed', this.value)">
-  </div>
-
-  <div class="slider-group">
-    <div class="slider-label">
-      <span class="name">&#128220; Text Speed</span>
-      <span class="value" id="textVal">12</span>
-    </div>
-    <input type="range" id="textSpeed" min="1" max="100" value="12"
-           oninput="document.getElementById('textVal').textContent=this.value"
-           onchange="setSetting('text-speed', this.value)">
-  </div>
-
-  <div class="slider-group">
-    <div class="slider-label">
-      <span class="name">&#128225; Poll Rate (sec)</span>
-      <span class="value" id="pollVal">5</span>
-    </div>
-    <input type="range" id="pollRate" min="1" max="60" value="5"
-           oninput="document.getElementById('pollVal').textContent=this.value"
-           onchange="setSetting('poll-rate', this.value)">
-  </div>
+  <div class="footer">SpotifyMatrix &middot; matrixspot.local</div>
 </div>
-
-<!-- Actions -->
-<div class="card">
-  <div class="btn-row">
-    <button class="btn btn-reset" onclick="resetAll()">&#8635; Reset All</button>
-    <button class="btn btn-logs" onclick="window.location='/logs'">&#128196; View Logs</button>
-  </div>
-</div>
-
-<div class="footer">SpotifyMatrix &middot; matrixspot.local</div>
 
 <script>
 let currentState = {};
@@ -1855,7 +1694,6 @@ const COLOR_THEMES = {
   crimson:  {r:220,g:40,b:60}
 };
 
-// Build color swatches
 (function buildSwatches() {
   const grid = document.getElementById('colorGrid');
   for (const [name, c] of Object.entries(COLOR_THEMES)) {
@@ -1869,274 +1707,139 @@ const COLOR_THEMES = {
   }
 })();
 
-function setAccentCSS(name) {
-  const c = COLOR_THEMES[name] || COLOR_THEMES.spotify;
-  const root = document.documentElement;
-  root.style.setProperty('--accent', `rgb(${c.r},${c.g},${c.b})`);
-  root.style.setProperty('--accent-dim', `rgba(${c.r},${c.g},${c.b},0.15)`);
-  root.style.setProperty('--accent-glow', `rgba(${c.r},${c.g},${c.b},0.3)`);
-  // Update header gradient
-  const h1 = document.querySelector('.header h1');
-  if (h1) h1.style.background = `linear-gradient(135deg, rgb(${c.r},${c.g},${c.b}), rgb(${Math.min(255,c.r+30)},${Math.min(255,c.g+30)},${Math.min(255,c.b+30)}))`;
-  // Update swatches
-  document.querySelectorAll('.color-swatch').forEach(sw => {
-    sw.classList.toggle('active', sw.dataset.theme === name);
+function toggleAdv() {
+  const adv = document.getElementById('advSettings');
+  const btn = document.querySelector('.adv-toggle');
+  if (adv.style.display === 'block') {
+    adv.style.display = 'none';
+    btn.innerHTML = 'Show Advanced Settings &#9662;';
+  } else {
+    adv.style.display = 'block';
+    btn.innerHTML = 'Hide Advanced Settings &#9652;';
+  }
+}
+
+async function fetchState() {
+  try {
+    const res = await fetch('/api/state');
+    const s = await res.json();
+    currentState = s;
+    updateUI(s);
+  } catch(e) {}
+}
+
+function updateUI(s) {
+  // Update Background Image
+  const appBg = document.getElementById('appBackground');
+  if (s.image_url) {
+    appBg.style.backgroundImage = `url('${s.image_url}')`;
+    document.getElementById('npImg').src = s.image_url;
+    document.getElementById('npImg').style.display = 'block';
+  } else {
+    appBg.style.backgroundImage = 'none';
+    document.getElementById('npImg').style.display = 'none';
+  }
+  
+  if (s.is_playing) {
+    document.getElementById('npTitle').textContent = s.title;
+    document.getElementById('npTitle').style.color = 'var(--text)';
+    document.getElementById('npArtist').textContent = s.artist;
+  } else {
+    document.getElementById('npTitle').textContent = s.is_connected ? "Paused" : "Not Playing";
+    document.getElementById('npTitle').style.color = 'var(--text-dim)';
+    document.getElementById('npArtist').textContent = "--";
+  }
+
+  // Update modes visibility
+  document.querySelectorAll('.mode-btn').forEach(el => el.classList.remove('active'));
+  const mBtn = document.getElementById('mode-' + s.display_mode);
+  if (mBtn) mBtn.classList.add('active');
+
+  const customCard = document.getElementById('customSlateCard');
+  const mainSettings = document.getElementById('mainSettingsCard');
+  const advBtn = document.getElementById('advToggleBtn');
+  const advCard = document.getElementById('advSettings');
+  const colorCard = document.getElementById('colorCard');
+  
+  if (s.display_mode === 'custom') {
+    customCard.style.display = 'block';
+    if(mainSettings) mainSettings.style.display = 'none';
+    if(advBtn) advBtn.style.display = 'none';
+    if(advCard) advCard.style.display = 'none';
+    if(colorCard) colorCard.style.display = 'none';
+  } else {
+    customCard.style.display = 'none';
+    if(mainSettings) mainSettings.style.display = 'block';
+    if(advBtn) advBtn.style.display = 'block';
+    if(colorCard) colorCard.style.display = 'block';
+  }
+
+  // Segmented lyrics style
+  document.querySelectorAll('.seg-btn').forEach(el => el.classList.remove('active'));
+  const sBtn = document.getElementById('style-' + s.lyrics_style);
+  if (sBtn) sBtn.classList.add('active');
+
+  // Sliders
+  function setSld(id, val) {
+    const el = document.getElementById(id);
+    if(el && document.activeElement !== el) {
+      el.value = val;
+      document.getElementById(id+'Val').textContent = val;
+    }
+  }
+  setSld('brightness', s.brightness);
+  setSld('spinSpeed', s.spin_speed);
+  setSld('textSpeed', s.text_scroll_speed);
+  setSld('pollRate', s.poll_interval);
+  setSld('scrollFont', s.scroll_font_size);
+  setSld('popFont', s.pop_font_size);
+  setSld('leadTime', s.lyrics_lead_ms);
+
+  // Colors
+  const t = COLOR_THEMES[s.accent_name] || COLOR_THEMES.spotify;
+  document.documentElement.style.setProperty('--accent', `rgb(${t.r},${t.g},${t.b})`);
+  document.documentElement.style.setProperty('--accent-dim', `rgba(${t.r},${t.g},${t.b},0.15)`);
+  document.documentElement.style.setProperty('--accent-glow', `rgba(${t.r},${t.g},${t.b},0.3)`);
+  
+  document.querySelectorAll('.color-swatch').forEach(el => {
+    el.classList.toggle('active', el.dataset.theme === s.accent_name);
   });
+  
+  // Badges
+  const instr = document.getElementById('npInstr');
+  if (s.is_instrumental) { instr.style.display = 'inline-block'; }
+  else { instr.style.display = 'none'; }
+}
+
+async function setMode(m) {
+  try {
+    await fetch('/api/mode', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mode: m})
+    });
+    setTimeout(fetchState, 100);
+  } catch(e) {}
+}
+
+async function setSetting(key, value) {
+  try {
+    await fetch('/api/' + key, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({value: value})
+    });
+  } catch(e) {}
 }
 
 async function setAccentColor(name) {
-  setAccentCSS(name);
   try {
     await fetch('/api/accent-color', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({value: name})
     });
-  } catch(e) {}
-}
-
-async function fetchState() {
-  try {
-    const res = await fetch('/api/state');
-    if (!res.ok) return;
-    const data = await res.json();
-    currentState = data;
-    updateUI(data);
-  } catch(e) {
-    document.getElementById('statusDot').className = 'status-dot disconnected';
-    document.getElementById('statusText').textContent = 'Connection Lost';
-  }
-}
-
-function updateUI(s) {
-  const dot = document.getElementById('statusDot');
-  const stxt = document.getElementById('statusText');
-  dot.className = 'status-dot ' + (s.is_connected ? 'connected' : 'disconnected');
-  stxt.textContent = s.is_connected ? 'Connected' : 'Disconnected';
-
-  document.getElementById('trackTitle').textContent = s.title || '\\u2014';
-  document.getElementById('trackArtist').textContent = s.artist || 'Waiting for Spotify...';
-  document.getElementById('albumName').textContent = s.album_name || '';
-
-  const ps = document.getElementById('playStatus');
-  if (s.is_playing) { ps.textContent = '\\u25b6 Playing'; ps.className = 'play-status'; }
-  else { ps.textContent = '\\u23f8 Paused'; ps.className = 'play-status paused'; }
-
-  const em = document.getElementById('effectiveMode');
-  if (s.display_mode === 'default') {
-    const modeNames = {cd:'CD', lyrics:'Lyrics', clock:'Clock'};
-    em.textContent = '\\u2728 Default \\u2192 ' + (modeNames[s.effective_mode] || s.effective_mode);
-  } else { em.textContent = ''; }
-
-  // Album art + glow
-  const artDiv = document.getElementById('albumArt');
-  const glowDiv = document.getElementById('artGlow');
-  if (s.image_url) {
-    if (!artDiv.querySelector('img') || artDiv.querySelector('img').src !== s.image_url) {
-      artDiv.innerHTML = '<img src="' + s.image_url + '" alt="Art">';
-      glowDiv.style.backgroundImage = 'url(' + s.image_url + ')';
-    }
-  } else {
-    artDiv.innerHTML = '';
-    glowDiv.style.backgroundImage = '';
-  }
-
-  // Mode buttons
-  document.querySelectorAll('.mode-btn').forEach(btn => {
-    const m = btn.dataset.mode;
-    btn.classList.remove('active', 'active-default');
-    if (m === s.display_mode) btn.classList.add(m === 'default' ? 'active-default' : 'active');
-  });
-
-  // Accent color
-  if (s.accent_name) setAccentCSS(s.accent_name);
-
-  // Lyrics settings
-  if (document.activeElement?.id !== 'lyricsStyle') {
-    const sel = document.getElementById('lyricsStyle');
-    if (sel) {
-      sel.value = s.lyrics_style || 'scroll';
-      document.getElementById('lyricsStyleVal').textContent = s.lyrics_style === 'pop' ? 'Pop' : 'Scroll';
-    }
-  }
-  const ss = document.getElementById('smartScroll');
-  if (ss && document.activeElement !== ss) ss.checked = s.smart_scroll !== false;
-  if (document.activeElement?.id !== 'scrollFont') {
-    document.getElementById('scrollFont').value = s.scroll_font_size || 9;
-    document.getElementById('scrollFontVal').textContent = s.scroll_font_size || 9;
-  }
-  if (document.activeElement?.id !== 'popFont') {
-    document.getElementById('popFont').value = s.pop_font_size || 8;
-    document.getElementById('popFontVal').textContent = s.pop_font_size || 8;
-  }
-  if (document.activeElement?.id !== 'lyricsLead') {
-    document.getElementById('lyricsLead').value = s.lyrics_lead_ms ?? 150;
-    document.getElementById('lyricsLeadVal').textContent = s.lyrics_lead_ms ?? 150;
-  }
-
-  // General settings
-  if (document.activeElement?.id !== 'brightness') {
-    document.getElementById('brightness').value = s.brightness;
-    document.getElementById('brightnessVal').textContent = s.brightness;
-  }
-  if (document.activeElement?.id !== 'spinSpeed') {
-    document.getElementById('spinSpeed').value = Math.round(s.spin_speed);
-    document.getElementById('spinVal').textContent = Math.round(s.spin_speed);
-  }
-  if (document.activeElement?.id !== 'textSpeed') {
-    document.getElementById('textSpeed').value = Math.round(s.text_scroll_speed);
-    document.getElementById('textVal').textContent = Math.round(s.text_scroll_speed);
-  }
-  if (document.activeElement?.id !== 'pollRate') {
-    document.getElementById('pollRate').value = Math.round(s.poll_interval);
-    document.getElementById('pollVal').textContent = Math.round(s.poll_interval);
-  }
-
-  // Custom message status
-  const msgStatus = document.getElementById('msgStatus');
-  if (s.custom_message) {
-    msgStatus.textContent = 'Active: "' + s.custom_message + '"';
-    msgStatus.style.color = 'var(--accent)';
-  } else {
-    msgStatus.textContent = '';
-  }
-}
-
-// Live lyrics
-function toggleLyrics() {
-  lyricsOpen = !lyricsOpen;
-  document.getElementById('lyricsBody').classList.toggle('open', lyricsOpen);
-  document.getElementById('lyricsChevron').classList.toggle('open', lyricsOpen);
-  if (lyricsOpen && !lyricsInterval) {
-    fetchLyricsData();
-    lyricsInterval = setInterval(fetchLyricsData, 1000);
-  } else if (!lyricsOpen && lyricsInterval) {
-    clearInterval(lyricsInterval);
-    lyricsInterval = null;
-  }
-}
-
-async function fetchLyricsData() {
-  try {
-    const res = await fetch('/api/lyrics');
-    if (!res.ok) return;
-    lyricsData = await res.json();
-    renderLiveLyrics();
-  } catch(e) {}
-}
-
-function renderLiveLyrics() {
-  const container = document.getElementById('lyricsContainer');
-  if (!lyricsData || !lyricsData.lyrics || lyricsData.lyrics.length === 0) {
-    container.innerHTML = '<div style="padding:40px;color:var(--text-dim)">' +
-      (lyricsData && lyricsData.is_instrumental ? '&#127925; Instrumental' : 'No synced lyrics') + '</div>';
-    return;
-  }
-
-  // Estimate current progress
-  let progress = lyricsData.progress_ms || 0;
-  if (lyricsData.is_playing && lyricsData.server_time) {
-    progress += (Date.now() / 1000 - lyricsData.server_time) * 1000;
-  }
-  progress += (lyricsData.lyrics_lead_ms || 0);
-
-  // Find active index
-  let activeIdx = -1;
-  for (let i = lyricsData.lyrics.length - 1; i >= 0; i--) {
-    if (lyricsData.lyrics[i][0] <= progress) { activeIdx = i; break; }
-  }
-
-  let html = '';
-  for (let i = 0; i < lyricsData.lyrics.length; i++) {
-    const text = lyricsData.lyrics[i][1];
-    const isActive = i === activeIdx;
-    if (!text.trim()) {
-      if (isActive) html += '<div class="lyrics-line instrumental-dots active">· · ·</div>';
-      else html += '<div class="lyrics-line">&nbsp;</div>';
-    } else {
-      html += '<div class="lyrics-line' + (isActive ? ' active' : '') + '">' + escapeHtml(text) + '</div>';
-    }
-  }
-  container.innerHTML = html;
-
-  // Auto-scroll to active line
-  const activeLine = container.querySelector('.lyrics-line.active');
-  if (activeLine) {
-    activeLine.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  }
-}
-
-function escapeHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-
-async function setMode(mode) {
-  document.querySelectorAll('.mode-btn').forEach(btn => {
-    const m = btn.dataset.mode;
-    btn.classList.remove('active', 'active-default');
-    if (m === mode) btn.classList.add(mode === 'default' ? 'active-default' : 'active');
-  });
-  try {
-    await fetch('/api/mode', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({mode: mode})
-    });
-  } catch(e) {}
-}
-
-async function setSetting(name, value) {
-  try {
-    await fetch('/api/' + name, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({value: Number(value)})
-    });
-  } catch(e) {}
-}
-
-async function setSettingString(name, value) {
-  try {
-    await fetch('/api/' + name, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({value: value})
-    });
-  } catch(e) {}
-}
-
-async function setSettingBool(name, value) {
-  try {
-    await fetch('/api/' + name, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({value: value})
-    });
-  } catch(e) {}
-}
-
-async function sendCustomMsg() {
-  const msg = document.getElementById('customMsg').value.trim();
-  if (!msg) return;
-  try {
-    await fetch('/api/custom-message', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({value: msg})
-    });
-    document.getElementById('customMsg').value = '';
-    setTimeout(fetchState, 300);
-  } catch(e) {}
-}
-
-async function clearCustomMsg() {
-  try {
-    await fetch('/api/custom-message', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({value: ''})
-    });
-    setTimeout(fetchState, 300);
+    setTimeout(fetchState, 100);
   } catch(e) {}
 }
 
@@ -2148,6 +1851,7 @@ async function resetAll() {
   } catch(e) {}
 }
 
+/* Custom Slate Logic */
 const slateInput = document.getElementById('slateUpload');
 const slateCanvas = document.getElementById('slateCanvas');
 const slateCtx = slateCanvas.getContext('2d', { willReadFrequently: true });
@@ -2201,11 +1905,85 @@ async function sendCustomSlate() {
   } catch(e) {}
 }
 
+// Live Lyrics
+function toggleLiveLyrics() {
+  lyricsOpen = !lyricsOpen;
+  const c = document.getElementById('liveLyricsCard');
+  c.style.display = lyricsOpen ? 'block' : 'none';
+  if (lyricsOpen) {
+    fetchLyricsData();
+    lyricsInterval = setInterval(updateLiveLyricsScroll, 500);
+  } else {
+    clearInterval(lyricsInterval);
+  }
+}
+
+async function fetchLyricsData() {
+  try {
+    const res = await fetch('/api/lyrics');
+    const data = await res.json();
+    lyricsData = data.lyrics;
+    renderLyricsHTML();
+  } catch(e) {}
+}
+
+function renderLyricsHTML() {
+  const box = document.getElementById('liveLyricsBox');
+  if (!lyricsData || lyricsData.length === 0) {
+    box.innerHTML = '<div style="margin-top:80px;font-style:italic;">No synced lyrics available.</div>';
+    return;
+  }
+  let html = '<div style="height:80px;"></div>';
+  lyricsData.forEach((line, i) => {
+    html += `<div id="line-${i}" style="transition:all 0.3s; padding:4px 0;">${line[1] || '· · ·'}</div>`;
+  });
+  html += '<div style="height:100px;"></div>';
+  box.innerHTML = html;
+}
+
+function updateLiveLyricsScroll() {
+  if (!lyricsData || !currentState.is_playing) return;
+  const currentMs = currentState.progress_ms + (Date.now() - window.lastStateFetchTime);
+  let activeIdx = -1;
+  for (let i = lyricsData.length - 1; i >= 0; i--) {
+    if (currentMs >= lyricsData[i][0]) {
+      activeIdx = i;
+      break;
+    }
+  }
+  const box = document.getElementById('liveLyricsBox');
+  for (let i=0; i<lyricsData.length; i++) {
+    const el = document.getElementById('line-'+i);
+    if (!el) continue;
+    if (i === activeIdx) {
+      el.style.color = 'var(--text)';
+      el.style.fontWeight = '600';
+      el.style.fontSize = '16px';
+    } else {
+      el.style.color = 'var(--text-dim)';
+      el.style.fontWeight = '400';
+      el.style.fontSize = '14px';
+    }
+  }
+  if (activeIdx !== -1) {
+    const activeEl = document.getElementById('line-'+activeIdx);
+    if (activeEl) {
+      box.scrollTop = activeEl.offsetTop - box.offsetTop - 80;
+    }
+  }
+}
+
+// Fetch loop
+window.lastStateFetchTime = Date.now();
 fetchState();
-setInterval(fetchState, 2000);
+setInterval(() => {
+  window.lastStateFetchTime = Date.now();
+  fetchState();
+}, 2000);
 </script>
 </body>
-</html>"""
+</html>
+"""
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2474,8 +2252,7 @@ def start_control_server(
                     outer_state.poll_interval = 5.0
                     outer_state.accent_name = "spotify"
                     outer_state.accent_color = COLOR_THEMES["spotify"]
-                    outer_state.custom_message = ""
-                    outer_state.lyrics_lead_ms = 150
+                    outer_state.lyrics_lead_ms = 180
                 try:
                     outer_display.set_brightness(outer_state._default_brightness)
                 except Exception:
@@ -2493,15 +2270,8 @@ def start_control_server(
                 else:
                     self._send_json({"error": "Invalid theme"}, 400)
 
-            elif parsed.path == "/api/custom-message":
-                val = str(body.get("value", ""))
-                with outer_lock:
-                    outer_state.custom_message = val
-                log(f"Custom message set: '{val}'" if val else "Custom message cleared")
-                self._send_json({"ok": True, "custom_message": val})
-
             elif parsed.path == "/api/lyrics-lead":
-                val = int(body.get("value", 150))
+                val = int(body.get("value", 180))
                 val = max(0, min(500, val))
                 with outer_lock:
                     outer_state.lyrics_lead_ms = val
@@ -2590,7 +2360,6 @@ def start_control_server(
                     "progress_ms": outer_state.progress_ms,
                     "duration_ms": outer_state.duration_ms,
                     "accent_name": outer_state.accent_name,
-                    "custom_message": outer_state.custom_message,
                     "lyrics_lead_ms": outer_state.lyrics_lead_ms,
                 }
             self._send_json(data)
@@ -2911,7 +2680,6 @@ def run(args: argparse.Namespace) -> None:
                 is_instrumental = playback_state.is_instrumental
                 lyrics_lead_ms = playback_state.lyrics_lead_ms
                 accent_color = playback_state.accent_color
-                custom_message = playback_state.custom_message
 
             now = time.monotonic()
             delta = now - last_frame
@@ -3031,9 +2799,7 @@ def run(args: argparse.Namespace) -> None:
 
             display_text = ""
             if not args.no_text:
-                if custom_message:
-                    display_text = custom_message
-                elif title and artist:
+                if title and artist:
                     display_text = f"{title} · {artist}"
                 elif title or artist:
                     display_text = title or artist
