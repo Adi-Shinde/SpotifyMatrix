@@ -4,4 +4,3 @@
 __pycache__/
 *.pyc
 .venv/
-matrix_control.ps1
