@@ -1643,15 +1643,7 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
                oninput="document.getElementById('textVal').textContent=this.value"
                onchange="setSetting('text-speed', this.value)">
       </div>
-      <div class="slider-group">
-        <div class="slider-label">
-          <span class="name">&#128225; Poll Rate (sec)</span>
-          <span class="value" id="pollVal">5</span>
-        </div>
-        <input type="range" id="pollRate" min="1" max="60" value="5"
-               oninput="document.getElementById('pollVal').textContent=this.value"
-               onchange="setSetting('poll-rate', this.value)">
-      </div>
+
     </div>
   </div>
 
@@ -1715,7 +1707,12 @@ const COLOR_THEMES = {
   pickerInput.style.width = '100%';
   pickerInput.style.height = '100%';
   pickerInput.style.cursor = 'pointer';
+  pickerInput.style.zIndex = '10';
+  pickerInput.style.left = '0';
+  pickerInput.style.top = '0';
   pickerInput.value = '#00dcdd';
+  
+  customEl.onclick = () => pickerInput.click();
   
   pickerInput.addEventListener('input', async (e) => {
     const hex = e.target.value;
