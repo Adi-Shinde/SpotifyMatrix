@@ -173,14 +173,18 @@ Upload any image or animated GIF directly from your device. The image will be pe
 Type a message in the text box and click **Send** to instantly display it on the LED matrix! When set, it replaces the track title/artist crawl in CD mode, and can be cleared instantly via the **Clear** button.
 
 ### 7. 🎨 Accent Color
-Select from 8 carefully curated color themes (Spotify Green, Sunset Orange, Ocean Blue, Neon Purple, Rose Pink, Arctic Cyan, Warm Gold, Crimson). This updates both the Web UI and the LED Matrix instantly (affecting the lyrics active line, clock dots, and progress bars).
+Select from 7 carefully curated preset color themes (Spotify Green, Sunset Orange, Neon Purple, Rose Pink, Arctic Cyan, Warm Gold, Crimson) or use the **Rainbow Custom Color Picker** to select any exact RGB hex code! This updates both the Web UI and the LED Matrix instantly (affecting the lyrics active line, clock dots, and progress bars).
 
 ### 8. ⚙️ General Settings
 Fine-tune the hardware and software properties:
 - **Brightness (1-100):** Adjust the LED intensity instantly.
 - **Spin Speed (RPM):** How fast the CD view spins when music plays.
 - **Text Speed (px/s):** How fast track titles and artist names scroll on the CD view.
-- **Poll Rate (1-60s):** How often the system checks Spotify for new song changes. (Default: 5 seconds).
+- **Dynamic Spotify API Polling:** The matrix actively optimizes background API polling to save bandwidth and ensure instant responsiveness:
+  - **5.0s (Active):** Default polling speed while music is actively playing in the middle of a track.
+  - **10.0s (Throttled):** When a track first starts (first 30 seconds), the system checks less frequently to save API bandwidth.
+  - **1.5s (Accelerated):** During the last 10 seconds of a track, the system polls incredibly fast to instantly catch the track transition and prevent album art flicker.
+  - **30.0s (Idle):** If music is paused for over a minute, the system goes into a deep sleep polling state.
 
 ### 9. Actions
 - **Reset All Defaults:** One tap to return the matrix to its original boot state (Default mode, default brightness, default theme, etc).

@@ -158,7 +158,6 @@ class SharedPlaybackState:
     pop_font_size: int = 9  # font size for pop mode
     spin_speed: float = 10.0  # RPM
     text_scroll_speed: float = 20.0  # px/s
-    poll_interval: float = 5.0  # seconds (active polling)
     brightness: int = 65  # 1-100
     # Boot defaults (for reset)
     _default_brightness: int = 65
@@ -1830,7 +1829,6 @@ function updateUI(s) {
   setSld('brightness', 'brightnessVal', s.brightness);
   setSld('spinSpeed', 'spinVal', s.spin_speed);
   setSld('textSpeed', 'textVal', s.text_scroll_speed);
-  setSld('pollRate', 'pollVal', s.poll_interval);
   setSld('scrollFont', 'scrollFontVal', s.scroll_font_size);
   setSld('popFont', 'popFontVal', s.pop_font_size);
   setSld('leadTime', 'leadVal', s.lyrics_lead_ms);
@@ -1869,6 +1867,7 @@ async function setSetting(key, value) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({value: value})
     });
+    setTimeout(fetchState, 100);
   } catch(e) {}
 }
 
@@ -2218,7 +2217,7 @@ def start_control_server(
                     self._send_json({"error": "Invalid mode"}, 400)
 
             elif parsed.path == "/api/brightness":
-                val = int(body.get("value", 65))
+                val = int(body.get("value", outer_state._default_brightness))
                 val = max(1, min(100, val))
                 with outer_lock:
                     outer_state.brightness = val
@@ -2230,25 +2229,18 @@ def start_control_server(
                 self._send_json({"ok": True, "brightness": val})
 
             elif parsed.path == "/api/spin-speed":
-                val = float(body.get("value", 20))
+                val = float(body.get("value", outer_state._default_spin_speed))
                 val = max(1.0, min(120.0, val))
                 with outer_lock:
                     outer_state.spin_speed = val
                 self._send_json({"ok": True, "spin_speed": val})
 
             elif parsed.path == "/api/text-speed":
-                val = float(body.get("value", 12))
+                val = float(body.get("value", outer_state._default_text_scroll_speed))
                 val = max(1.0, min(100.0, val))
                 with outer_lock:
                     outer_state.text_scroll_speed = val
                 self._send_json({"ok": True, "text_scroll_speed": val})
-
-            elif parsed.path == "/api/poll-rate":
-                val = float(body.get("value", 5))
-                val = max(1.0, min(60.0, val))
-                with outer_lock:
-                    outer_state.poll_interval = val
-                self._send_json({"ok": True, "poll_interval": val})
 
             elif parsed.path == "/api/lyrics-style":
                 style = body.get("value", "scroll")
@@ -2289,7 +2281,6 @@ def start_control_server(
                     outer_state.brightness = outer_state._default_brightness
                     outer_state.spin_speed = outer_state._default_spin_speed
                     outer_state.text_scroll_speed = outer_state._default_text_scroll_speed
-                    outer_state.poll_interval = 5.0
                     outer_state.accent_name = "spotify"
                     outer_state.accent_color = COLOR_THEMES["spotify"]
                     outer_state.lyrics_lead_ms = 180
@@ -2394,7 +2385,6 @@ def start_control_server(
                     "brightness": outer_state.brightness,
                     "spin_speed": outer_state.spin_speed,
                     "text_scroll_speed": outer_state.text_scroll_speed,
-                    "poll_interval": outer_state.poll_interval,
                     "title": outer_state.title,
                     "artist": outer_state.artist,
                     "album_name": outer_state.album_name,
@@ -2447,8 +2437,7 @@ def poll_spotify(
 
     while not stop_event.is_set():
         try:
-            with state_lock:
-                active_seconds = state.poll_interval
+            active_seconds = 5.0
             current_wait = active_seconds
 
             if first_poll:
@@ -2469,7 +2458,7 @@ def poll_spotify(
                 current_wait = active_seconds
 
                 remaining_ms = art.duration_ms - art.progress_ms
-                if remaining_ms < 15000:
+                if remaining_ms < 10000:
                     current_wait = max(1.5, remaining_ms / 5000.0)
                     log(f"Spotify: Near track end. Accelerated poll rate: {current_wait:.1f}s", verbose=True)
                 elif art.progress_ms < 30000 and art.duration_ms > 120000:
