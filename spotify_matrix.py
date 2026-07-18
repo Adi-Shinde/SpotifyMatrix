@@ -1682,7 +1682,6 @@ let lyricsInterval = null;
 const COLOR_THEMES = {
   spotify:  {r:30,g:215,b:96},
   sunset:   {r:255,g:107,b:53},
-  ocean:    {r:0,g:150,b:255},
   neon:     {r:180,g:60,b:255},
   rose:     {r:255,g:90,b:150},
   arctic:   {r:0,g:220,b:220},
@@ -1701,6 +1700,50 @@ const COLOR_THEMES = {
     el.onclick = () => setAccentColor(name);
     grid.appendChild(el);
   }
+  
+  // Custom Color Picker
+  const customEl = document.createElement('div');
+  customEl.className = 'color-swatch';
+  customEl.dataset.theme = 'custom';
+  customEl.style.position = 'relative';
+  customEl.style.overflow = 'hidden';
+  customEl.style.background = 'conic-gradient(red, yellow, lime, aqua, blue, magenta, red)';
+  
+  const pickerInput = document.createElement('input');
+  pickerInput.type = 'color';
+  pickerInput.style.position = 'absolute';
+  pickerInput.style.opacity = '0';
+  pickerInput.style.width = '100%';
+  pickerInput.style.height = '100%';
+  pickerInput.style.cursor = 'pointer';
+  pickerInput.value = '#00dcdd';
+  
+  pickerInput.addEventListener('input', async (e) => {
+    const hex = e.target.value;
+    customEl.style.background = hex;
+  });
+  
+  pickerInput.addEventListener('change', async (e) => {
+    const hex = e.target.value;
+    const r = parseInt(hex.substr(1,2), 16);
+    const g = parseInt(hex.substr(3,2), 16);
+    const b = parseInt(hex.substr(5,2), 16);
+    try {
+      await fetch('/api/accent-color', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({value: 'custom', r: r, g: g, b: b})
+      });
+      setTimeout(fetchState, 100);
+    } catch(err) {}
+  });
+  
+  customEl.appendChild(pickerInput);
+  const check = document.createElement('span');
+  check.className = 'check';
+  check.innerHTML = '&#10003;';
+  customEl.appendChild(check);
+  grid.appendChild(customEl);
 })();
 
 function toggleAdv() {
@@ -2971,7 +3014,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-hardware-pulse", action="store_true",
                         help="Avoid Pi onboard sound conflict.")
     parser.add_argument("--fps", type=positive_float, default=20.0)
-    parser.add_argument("--rpm", type=positive_float, default=20.0)
+    parser.add_argument("--rpm", type=positive_float, default=10.0)
     parser.add_argument("--token-cache", type=Path, default=Path(".cache/spotify_token.json"))
     parser.add_argument("--mock-output", type=Path,
                         help="Write the current frame PNG instead of using RGB matrix hardware.")
@@ -2986,7 +3029,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Print the Spotify auth URL without trying to open a browser.")
     parser.add_argument("--no-text", action="store_true",
                         help="Disable scrolling song title and artist text overlay.")
-    parser.add_argument("--text-speed", type=positive_float, default=12.0,
+    parser.add_argument("--text-speed", type=positive_float, default=20.0,
                         help="Text scroll speed in pixels per second.")
     parser.add_argument("--text-position", choices=["bottom", "top"], default="bottom",
                         help="Text banner position on matrix.")
