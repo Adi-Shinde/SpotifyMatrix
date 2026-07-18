@@ -48,12 +48,11 @@ LYRIC_DIM_COLOR = (80, 80, 80)
 COLOR_THEMES: dict[str, tuple[int, int, int]] = {
     "spotify":  (30, 215, 96),
     "sunset":   (255, 107, 53),
-    "ocean":    (0, 150, 255),
     "neon":     (180, 60, 255),
     "rose":     (255, 90, 150),
     "arctic":   (0, 220, 220),
     "gold":     (245, 180, 40),
-    "crimson":  (220, 40, 60),
+    "crimson":  (220, 40, 60)
 }
 
 # Average ms per spoken word — used to cap scroll speed during instrumental gaps
@@ -1365,7 +1364,6 @@ def render_custom_slate(size: int, frames: list[Image.Image], delay: float) -> I
 # ═══════════════════════════════════════════════════════════════════
 
 CONTROL_PANEL_HTML = """<!DOCTYPE html>
-<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -1631,18 +1629,18 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
       <div class="slider-group" style="margin-top:16px;">
         <div class="slider-label">
           <span class="name">&#128171; Spin Speed (RPM)</span>
-          <span class="value" id="spinVal">20</span>
+          <span class="value" id="spinVal">10</span>
         </div>
-        <input type="range" id="spinSpeed" min="1" max="120" value="20"
+        <input type="range" id="spinSpeed" min="1" max="120" value="10"
                oninput="document.getElementById('spinVal').textContent=this.value"
                onchange="setSetting('spin-speed', this.value)">
       </div>
       <div class="slider-group">
         <div class="slider-label">
           <span class="name">&#128220; Text Scroll Speed</span>
-          <span class="value" id="textVal">12</span>
+          <span class="value" id="textVal">20</span>
         </div>
-        <input type="range" id="textSpeed" min="1" max="100" value="12"
+        <input type="range" id="textSpeed" min="1" max="100" value="20"
                oninput="document.getElementById('textVal').textContent=this.value"
                onchange="setSetting('text-speed', this.value)">
       </div>
@@ -1778,20 +1776,21 @@ function updateUI(s) {
   if (sBtn) sBtn.classList.add('active');
 
   // Sliders
-  function setSld(id, val) {
+  function setSld(id, lblId, val) {
     const el = document.getElementById(id);
     if(el && document.activeElement !== el) {
       el.value = val;
-      document.getElementById(id+'Val').textContent = val;
+      const lbl = document.getElementById(lblId);
+      if(lbl) lbl.textContent = val;
     }
   }
-  setSld('brightness', s.brightness);
-  setSld('spinSpeed', s.spin_speed);
-  setSld('textSpeed', s.text_scroll_speed);
-  setSld('pollRate', s.poll_interval);
-  setSld('scrollFont', s.scroll_font_size);
-  setSld('popFont', s.pop_font_size);
-  setSld('leadTime', s.lyrics_lead_ms);
+  setSld('brightness', 'brightnessVal', s.brightness);
+  setSld('spinSpeed', 'spinVal', s.spin_speed);
+  setSld('textSpeed', 'textVal', s.text_scroll_speed);
+  setSld('pollRate', 'pollVal', s.poll_interval);
+  setSld('scrollFont', 'scrollFontVal', s.scroll_font_size);
+  setSld('popFont', 'popFontVal', s.pop_font_size);
+  setSld('leadTime', 'leadVal', s.lyrics_lead_ms);
 
   // Colors
   const t = COLOR_THEMES[s.accent_name] || COLOR_THEMES.spotify;
@@ -2260,7 +2259,16 @@ def start_control_server(
 
             elif parsed.path == "/api/accent-color":
                 val = body.get("value", "spotify")
-                if val in COLOR_THEMES:
+                if val == "custom":
+                    r = int(body.get("r", 255))
+                    g = int(body.get("g", 255))
+                    b = int(body.get("b", 255))
+                    with outer_lock:
+                        outer_state.accent_name = "custom"
+                        outer_state.accent_color = (r, g, b)
+                    log(f"Accent color set to custom ({r},{g},{b})")
+                    self._send_json({"ok": True, "accent_name": "custom"})
+                elif val in COLOR_THEMES:
                     with outer_lock:
                         outer_state.accent_name = val
                         outer_state.accent_color = COLOR_THEMES[val]
