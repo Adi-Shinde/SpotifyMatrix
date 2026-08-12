@@ -12,20 +12,21 @@ import math
 import os
 import re
 import secrets
+import signal
 import sys
 import threading
 import time
 import urllib.parse
 import urllib.request
 from email.message import Message
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 import webbrowser
 from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
 
 try:
     from dotenv import load_dotenv
@@ -40,6 +41,7 @@ CURRENTLY_PLAYING_URL = "https://api.spotify.com/v1/me/player/currently-playing"
 SCOPE = "user-read-currently-playing"
 
 LRCLIB_API_URL = "https://lrclib.net/api/get"
+LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
 LRCLIB_USER_AGENT = "SpotifyMatrix/1.0 (https://github.com/Adi-Shinde/SpotifyMatrix)"
 
 SPOTIFY_GREEN = (30, 215, 96)
@@ -57,6 +59,33 @@ COLOR_THEMES: dict[str, tuple[int, int, int]] = {
 
 # Average ms per spoken word — used to cap scroll speed during instrumental gaps
 AVG_MS_PER_WORD = 350
+
+# Alpha cutoff when stripping font anti-aliasing. See draw_text_batch — this is
+# measured, not guessed: 60 keeps every stroke of the stock font at size 7,
+# 110 eats thin stems, 140 destroys the glyphs.
+CRISP_THRESHOLD = 60
+
+# Web panel request limits. The panel is unauthenticated on the LAN, so an
+# accidental or hostile oversized upload must not be able to OOM the Pi.
+MAX_REQUEST_BYTES = 8 * 1024 * 1024
+# Upper bound on how much of an oversized body we will read and throw away in
+# order to answer 413 cleanly. Past this we let the connection drop.
+MAX_DRAIN_BYTES = 64 * 1024 * 1024
+MAX_SLATE_FRAMES = 120
+
+# Spotify poll cadence (seconds). Module-level so the exception handlers in
+# poll_spotify cannot reference it before assignment.
+POLL_ACTIVE_SECONDS = 5.0
+POLL_IDLE_SECONDS = 30.0
+
+# Brightness units per second when easing toward a new target.
+BRIGHTNESS_RAMP_PER_SEC = 120.0
+
+# Preferred album-art download size. Above the 64px panel so rotation has
+# resampling headroom, but far below Spotify's 640px original — which cost a
+# slow download and a full-size decode for detail the panel cannot show.
+# Spotify serves 640/300/64, so this selects the 300px variant.
+ART_TARGET_PX = 160
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -138,8 +167,15 @@ class SharedPlaybackState:
     progress_ms: int = 0
     duration_ms: int = 0
     fetch_time: float = 0.0  # time.monotonic() when Spotify data was fetched
+    # Smoothed correction for systematic lag in Spotify's reported progress,
+    # measured by comparing each poll against what we extrapolated. Keeps drift
+    # from accumulating so lyrics_lead_ms can be a taste control, not a patch.
+    progress_offset_ms: float = 0.0
     # Lyrics
     lyrics: list[tuple[int, str]] | None = None  # [(timestamp_ms, text), ...]
+    # Per-line [(word, start_ms), ...] when the source is enhanced LRC; empty
+    # lists otherwise, in which case karaoke mode interpolates word timing.
+    lyrics_words: list[list[tuple[str, int]]] = field(default_factory=list)
     lyrics_track_key: str | None = None
     is_instrumental: bool = False  # True when LRCLIB says track is instrumental
     lyrics_lead_ms: int = 180  # ms to shift lyrics ahead for read-along
@@ -245,7 +281,7 @@ class SpotifyClient:
         else:
             log("Spotify: No token found in cache")
 
-    def get_currently_playing(self) -> dict[str, Any] | None:
+    def get_currently_playing(self, *, _retried: bool = False) -> dict[str, Any] | None:
         token = self._valid_access_token()
         response = http_request(
             "GET",
@@ -260,9 +296,17 @@ class SpotifyClient:
         if response.status == 204:
             return None
         if response.status == 401:
+            # Refresh and retry exactly once. Recursing unconditionally here
+            # spins forever when the refreshed token is still rejected
+            # (revoked app authorization, changed scopes, disabled account).
+            if _retried:
+                raise RuntimeError(
+                    "Spotify rejected the refreshed access token (401). "
+                    "The authorization was likely revoked — re-run with --auth-only."
+                )
             log("Spotify API: Token expired (401), refreshing...", "warn")
             self._refresh_access_token()
-            return self.get_currently_playing()
+            return self.get_currently_playing(_retried=True)
         if response.status == 429:
             retry_after = int(response.headers.get("Retry-After", "0"))
             log(f"Spotify API: Rate limited (429)! Wait {retry_after}s.", "error")
@@ -288,8 +332,22 @@ class SpotifyClient:
         if not self.token_cache.exists():
             return None
 
-        with self.token_cache.open("r", encoding="utf-8") as token_file:
-            return json.load(token_file)
+        # A truncated or corrupt cache must not be fatal. This file is written
+        # on a Pi that gets unplugged without shutting down, so a zero-byte or
+        # half-written token is a realistic state. Crashing here happens before
+        # the web panel starts, so systemd would restart into the same crash
+        # forever with no way to see why.
+        try:
+            with self.token_cache.open("r", encoding="utf-8") as token_file:
+                token = json.load(token_file)
+        except (OSError, ValueError) as exc:
+            log(f"Spotify: Token cache unreadable ({exc}) — re-authorization needed.", "error")
+            return None
+
+        if not isinstance(token, dict) or "access_token" not in token:
+            log("Spotify: Token cache malformed — re-authorization needed.", "error")
+            return None
+        return token
 
     def _save_token(self, token: dict[str, Any]) -> None:
         self.token_cache.parent.mkdir(parents=True, exist_ok=True)
@@ -299,9 +357,22 @@ class SpotifyClient:
         if previous_refresh_token and "refresh_token" not in token:
             token["refresh_token"] = previous_refresh_token
 
-        with self.token_cache.open("w", encoding="utf-8") as token_file:
+        # Atomic write: truncating the real file first means a power cut mid-write
+        # leaves an empty token and forces a full re-auth. Write a temp file,
+        # fsync it, then rename — os.replace is atomic on POSIX.
+        tmp_path = self.token_cache.with_suffix(self.token_cache.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as token_file:
             json.dump(token, token_file, indent=2)
+            token_file.flush()
+            os.fsync(token_file.fileno())
+        os.replace(tmp_path, self.token_cache)
 
+        # NOTE: these permissions are deliberately loose because --auth-only runs
+        # as the login user while the systemd service runs as root, and both need
+        # to read and rewrite this file. os.replace takes the temp file's mode, so
+        # the chmod has to happen after the rename, not before.
+        # Tighten to 0600 only together with running the service as a non-root
+        # user (see IMPROVEMENTS.md B16, Phase 5) — doing it alone breaks re-auth.
         try:
             os.chmod(self.token_cache, 0o666)
             os.chmod(self.token_cache.parent, 0o777)
@@ -452,6 +523,48 @@ class LocalCallbackServer:
 #  DISPLAY BACKENDS
 # ═══════════════════════════════════════════════════════════════════
 
+@functools.lru_cache(maxsize=8)
+def _gamma_table(gamma: float) -> tuple[int, ...]:
+    """256*3 lookup table for Image.point(), or empty for a no-op gamma.
+
+    LED PWM output is linear but sRGB pixel values are perceptually encoded, so
+    sending them straight to the panel makes midtones read too bright and
+    crushes shadows. Decoding to linear with an exponent fixes it.
+
+    Note: recent versions of the hzeller library apply their own CIE1931
+    luminance curve. Stacking both double-corrects and destroys shadow detail,
+    which is why the default is 1.0 (off) — measure on your panel, then pick a
+    value (1.6-2.2 is the useful range) with --gamma.
+    """
+    if abs(gamma - 1.0) < 0.01:
+        return ()
+    ramp = [min(255, int(((i / 255.0) ** gamma) * 255.0 + 0.5)) for i in range(256)]
+    return tuple(ramp * 3)
+
+
+def apply_gamma(image: Image.Image, gamma: float) -> Image.Image:
+    table = _gamma_table(gamma)
+    if not table:
+        return image
+    return image.point(list(table))
+
+
+def enhance_album_art(
+    image: Image.Image, saturation: float, contrast: float
+) -> Image.Image:
+    """Boost art once at download time — never per frame.
+
+    A 64x64 crop of a subtle album cover loses most of its separation. A mild
+    saturation and contrast lift restores it, and because this runs once per
+    track it is effectively free.
+    """
+    if abs(saturation - 1.0) > 0.01:
+        image = ImageEnhance.Color(image).enhance(saturation)
+    if abs(contrast - 1.0) > 0.01:
+        image = ImageEnhance.Contrast(image).enhance(contrast)
+    return image
+
+
 class MatrixDisplay:
     def __init__(self, args: argparse.Namespace) -> None:
         try:
@@ -477,9 +590,10 @@ class MatrixDisplay:
 
         self.matrix = RGBMatrix(options=options)
         self.canvas = self.matrix.CreateFrameCanvas()
+        self.gamma = float(getattr(args, "gamma", 1.0))
 
     def show(self, image: Image.Image) -> None:
-        self.canvas.SetImage(image.convert("RGB"))
+        self.canvas.SetImage(apply_gamma(image.convert("RGB"), self.gamma))
         self.canvas = self.matrix.SwapOnVSync(self.canvas)
 
     def clear(self) -> None:
@@ -490,12 +604,14 @@ class MatrixDisplay:
 
 
 class MockDisplay:
-    def __init__(self, output: Path) -> None:
+    def __init__(self, output: Path, gamma: float = 1.0) -> None:
         self.output = output
         self.output.parent.mkdir(parents=True, exist_ok=True)
+        self.gamma = gamma
 
     def show(self, image: Image.Image) -> None:
-        image.save(self.output)
+        # Same gamma path as hardware so preview frames match the panel.
+        apply_gamma(image.convert("RGB"), self.gamma).save(self.output)
 
     def clear(self) -> None:
         return
@@ -520,8 +636,38 @@ def demo_album_art(size: int) -> Image.Image:
     return image
 
 
-@functools.lru_cache(maxsize=16)
+# Optional pixel-font path, set once from --lyrics-font. A bitmap/pixel font
+# lands every stroke on the pixel grid; the stock PIL default is a proportional
+# anti-aliased TTF, which on a 64x64 panel smears each glyph across half-lit
+# LEDs. That blur is most of why small sizes read as mush.
+_PIXEL_FONT_PATH: str | None = None
+
+
+def set_pixel_font(path: str | None) -> None:
+    global _PIXEL_FONT_PATH
+    if not path:
+        return
+    if not Path(path).exists():
+        log(f"Font: '{path}' not found — falling back to the default font.", "warn")
+        return
+    try:
+        ImageFont.truetype(path, 9)
+    except OSError as exc:
+        log(f"Font: '{path}' could not be loaded ({exc}) — using the default.", "warn")
+        return
+    _PIXEL_FONT_PATH = path
+    get_font.cache_clear()
+    get_text_height.cache_clear()
+    log(f"Font: using pixel font {path}")
+
+
+@functools.lru_cache(maxsize=32)
 def get_font(size: int = 9) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
+    if _PIXEL_FONT_PATH:
+        try:
+            return ImageFont.truetype(_PIXEL_FONT_PATH, size)
+        except OSError:
+            pass
     try:
         return ImageFont.load_default(size=size)
     except TypeError:
@@ -529,6 +675,45 @@ def get_font(size: int = 9) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
             return ImageFont.truetype("arial.ttf", size)
         except OSError:
             return ImageFont.load_default()
+
+
+def draw_text_batch(
+    frame: Image.Image,
+    items: list[tuple[tuple[int, int], str]],
+    font: Any,
+    color: tuple[int, int, int],
+    crisp: bool = True,
+    threshold: int = CRISP_THRESHOLD,
+) -> None:
+    """Draw several same-coloured strings, optionally with anti-aliasing removed.
+
+    PIL always anti-aliases TrueType glyphs. Those partial-coverage pixels
+    become half-lit LEDs, which is what makes small text look blurry rather
+    than small. Rendering into a mask and thresholding snaps every glyph back
+    onto the pixel grid.
+
+    Batched by colour so a wrapped karaoke line costs two masks per frame
+    rather than one per word.
+
+    The threshold matters more than it looks: measured against the stock font
+    at size 7, 60 keeps every stroke while removing all 74 half-lit pixels,
+    whereas 110 already starts eating thin stems ("for" renders as "lor") and
+    140 destroys the text. Tune with --text-threshold if you load a different
+    font.
+    """
+    if not items:
+        return
+    if not crisp:
+        draw = ImageDraw.Draw(frame)
+        for xy, text in items:
+            draw.text(xy, text, fill=color, font=font)
+        return
+
+    mask = Image.new("L", frame.size, 0)
+    mask_draw = ImageDraw.Draw(mask)
+    for xy, text in items:
+        mask_draw.text(xy, text, fill=255, font=font)
+    frame.paste(color, (0, 0), mask.point(lambda p: 255 if p >= threshold else 0))
 
 
 @functools.lru_cache(maxsize=16)
@@ -568,7 +753,7 @@ def playback_art_from_response(playback: dict[str, Any] | None) -> PlaybackArt |
     if not images:
         return None
 
-    image = max(images, key=lambda candidate: candidate.get("width") or 0)
+    image = pick_art_variant(images, ART_TARGET_PX)
     item_id = item.get("id") or item.get("uri") or image["url"]
 
     progress_ms = int(playback.get("progress_ms", 0))
@@ -586,10 +771,28 @@ def playback_art_from_response(playback: dict[str, Any] | None) -> PlaybackArt |
     )
 
 
-def download_image(url: str) -> Image.Image:
+def pick_art_variant(images: list[dict[str, Any]], target: int) -> dict[str, Any]:
+    """Smallest artwork at least `target` px wide, falling back to the largest.
+
+    Spotify offers 640/300/64 variants. This used to always take the 640 and
+    then downscale it to 64 — paying the download, the decode and the resize
+    for detail that cannot survive a 64x64 panel. Note we deliberately do not
+    pick an exact 64px source: the disc is rotated, and resampling a
+    already-minimal image every frame visibly degrades it.
+    """
+    usable = [img for img in images if (img.get("width") or 0) >= target]
+    if usable:
+        return min(usable, key=lambda candidate: candidate.get("width") or 0)
+    return max(images, key=lambda candidate: candidate.get("width") or 0)
+
+
+def download_image(
+    url: str, *, saturation: float = 1.0, contrast: float = 1.0
+) -> Image.Image:
     request = urllib.request.Request(url)
     with urllib.request.urlopen(request, timeout=15) as response:
-        return Image.open(BytesIO(response.read())).convert("RGB")
+        image = Image.open(BytesIO(response.read())).convert("RGB")
+    return enhance_album_art(image, saturation, contrast)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -607,13 +810,50 @@ def _get_disc_mask(size: int) -> Image.Image:
     return _disc_mask_cache[size]
 
 
-def render_record(art: Image.Image | None, angle: float, size: int) -> Image.Image:
+# Only the current track's fitted art is ever needed, so this holds one entry
+# per (track, disc size) and is cleared on change.
+_fitted_art_cache: dict[tuple[str, int], Image.Image] = {}
+
+
+def _get_fitted_art(art: Image.Image, art_key: str | None, size: int) -> Image.Image:
+    """Square-crop and downscale the artwork once per track, not once per frame.
+
+    ImageOps.fit with LANCZOS was previously running on every frame against the
+    full-resolution Spotify image — 20 identical resamples a second, all thrown
+    away. The result depends only on the artwork and the disc size; only the
+    rotation is per-frame.
+    """
+    if art_key is None:
+        # No stable identity to key on — don't risk serving another track's art.
+        return ImageOps.fit(art, (size, size), method=Image.Resampling.LANCZOS)
+
+    cache_key = (art_key, size)
+    cached = _fitted_art_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # Keep a few entries: during a track transition the old and new discs are
+    # both rendered every frame, and a single-entry cache would thrash between
+    # them and refit both on every frame.
+    if len(_fitted_art_cache) >= 4:
+        _fitted_art_cache.clear()
+    fitted = ImageOps.fit(art, (size, size), method=Image.Resampling.LANCZOS)
+    _fitted_art_cache[cache_key] = fitted
+    return fitted
+
+
+def render_record(
+    art: Image.Image | None,
+    angle: float,
+    size: int,
+    art_key: str | None = None,
+) -> Image.Image:
     frame = Image.new("RGBA", (size, size), (0, 0, 0, 255))
     if art is None:
         return frame.convert("RGB")
 
     disc_size = size
-    art_square = ImageOps.fit(art, (disc_size, disc_size), method=Image.Resampling.LANCZOS)
+    art_square = _get_fitted_art(art, art_key, disc_size)
     rotated = art_square.rotate(angle, resample=Image.Resampling.BICUBIC)
 
     disc_mask = _get_disc_mask(disc_size)
@@ -649,11 +889,64 @@ def render_idle(size: int) -> Image.Image:
     return frame
 
 
+_clock_face_cache: dict[tuple, Image.Image] = {}
+
+
 def render_clock(size: int, is_connected: bool = True,
                  accent_color: tuple[int, int, int] = SPOTIFY_GREEN) -> Image.Image:
+    """Clock frame. The static face is cached; only the second dot and the
+    connection pulse are drawn per frame.
+
+    The face (three text layouts, twelve tick marks, the bezel) changes once a
+    minute but was being rebuilt on every one of the ~20 frames per second.
+    """
+    now = datetime.datetime.now()
+    face_key = (size, accent_color, now.hour, now.minute, now.day)
+
+    face = _clock_face_cache.get(face_key)
+    if face is None:
+        _clock_face_cache.clear()
+        face = _render_clock_face(size, accent_color, now)
+        _clock_face_cache[face_key] = face
+
+    frame = face.copy()
+    draw = ImageDraw.Draw(frame)
+
+    margin = 1
+    cx = cy = size / 2.0
+    outer_r = (size - margin * 2) / 2.0
+
+    second_angle = (now.second / 60.0) * 360 - 90
+    rad = math.radians(second_angle)
+    dot_r = outer_r - 1
+    sx = cx + math.cos(rad) * dot_r
+    sy = cy + math.sin(rad) * dot_r
+    draw.ellipse((sx - 1.5, sy - 1.5, sx + 1.5, sy + 1.5), fill=accent_color)
+
+    pulse = (math.sin(time.time() * 2.0) + 1.0) / 2.0
+    pulse_brightness = int(50 + pulse * 150)
+    if is_connected:
+        pulse_color = tuple(int(c * pulse_brightness / 200) for c in accent_color)
+    else:
+        pulse_color = (pulse_brightness, 0, 0)
+
+    pulse_margin = max(4, size // 12)
+    pulse_x = size - pulse_margin
+    pulse_y = size - pulse_margin
+    pulse_r = 2
+    draw.ellipse(
+        (pulse_x - pulse_r, pulse_y - pulse_r, pulse_x + pulse_r, pulse_y + pulse_r),
+        fill=pulse_color,
+    )
+
+    return frame
+
+
+def _render_clock_face(
+    size: int, accent_color: tuple[int, int, int], now: datetime.datetime
+) -> Image.Image:
     frame = Image.new("RGB", (size, size), (0, 0, 0))
     draw = ImageDraw.Draw(frame)
-    now = datetime.datetime.now()
 
     day_str = now.strftime("%a").upper()
     time_str = now.strftime("%I:%M %p").lstrip("0")
@@ -700,27 +993,6 @@ def render_clock(size: int, is_connected: bool = True,
         y2 = cy + math.sin(tick_angle) * inner_r
         tick_color = (100, 100, 120) if hour % 3 != 0 else (160, 160, 180)
         draw.line((x1, y1, x2, y2), fill=tick_color, width=1)
-
-    second_angle = (now.second / 60.0) * 360 - 90
-    rad = math.radians(second_angle)
-    dot_r = outer_r - 1
-    sx = cx + math.cos(rad) * dot_r
-    sy = cy + math.sin(rad) * dot_r
-    draw.ellipse((sx - 1.5, sy - 1.5, sx + 1.5, sy + 1.5), fill=accent_color)
-
-    pulse = (math.sin(time.time() * 2.0) + 1.0) / 2.0
-    pulse_brightness = int(50 + pulse * 150)
-    if is_connected:
-        # Derive pulse from accent color
-        pulse_color = tuple(int(c * pulse_brightness / 200) for c in accent_color)
-    else:
-        pulse_color = (pulse_brightness, 0, 0)
-
-    pulse_margin = max(4, size // 12)
-    pulse_x = size - pulse_margin
-    pulse_y = size - pulse_margin
-    pulse_r = 2
-    draw.ellipse((pulse_x - pulse_r, pulse_y - pulse_r, pulse_x + pulse_r, pulse_y + pulse_r), fill=pulse_color)
 
     return frame
 
@@ -771,7 +1043,9 @@ def draw_scrolling_text(
     if unit_w <= 0:
         return image
 
-    offset_x = -(scroll_x % unit_w)
+    # Snap to whole pixels. Drawing at fractional x let PIL round inconsistently
+    # between frames, which on an LED panel reads as a permanent shimmer.
+    offset_x = -int(scroll_x % unit_w)
     cur_x = offset_x
 
     while cur_x < size_x:
@@ -779,19 +1053,82 @@ def draw_scrolling_text(
             draw.text((cur_x, y_pos), full_unit, fill=text_color, font=font)
         cur_x += unit_w
 
-    fade_width = min(6, size_x // 10)
-    for i in range(fade_width):
-        left_x = i
-        right_x = size_x - 1 - i
-        for y in range(banner_y0, banner_y1 + 1):
-            orig = image.getpixel((left_x, y))
-            blended = tuple(int(orig[c] * i / fade_width) for c in range(3))
-            image.putpixel((left_x, y), blended)
-            orig = image.getpixel((right_x, y))
-            blended = tuple(int(orig[c] * i / fade_width) for c in range(3))
-            image.putpixel((right_x, y), blended)
-
+    _apply_edge_fade(image, banner_y0, banner_y1)
     return image
+
+
+@functools.lru_cache(maxsize=8)
+def _edge_fade_mask(size_x: int, height: int) -> Image.Image:
+    """Horizontal edge-fade mask, built once per banner geometry.
+
+    Replaces a getpixel/putpixel loop that crossed the Python/C boundary about
+    130 times a frame. Image.composite does the same work in one C call.
+    """
+    fade_width = min(6, size_x // 10)
+    mask = Image.new("L", (size_x, 1), 255)
+    for i in range(fade_width):
+        level = int(255 * i / fade_width) if fade_width else 255
+        mask.putpixel((i, 0), level)
+        mask.putpixel((size_x - 1 - i, 0), level)
+    return mask.resize((size_x, height), Image.Resampling.NEAREST)
+
+
+def _apply_edge_fade(image: Image.Image, banner_y0: int, banner_y1: int) -> None:
+    height = banner_y1 - banner_y0 + 1
+    if height <= 0:
+        return
+    size_x = image.size[0]
+    band = image.crop((0, banner_y0, size_x, banner_y1 + 1))
+    faded = Image.composite(
+        band, Image.new("RGB", band.size, (0, 0, 0)), _edge_fade_mask(size_x, height)
+    )
+    image.paste(faded, (0, banner_y0))
+
+
+@functools.lru_cache(maxsize=4)
+def _clock_overlay(
+    size_x: int, size_y: int, hour_str: str, minute_str: str,
+    font_size: int, text_position: str,
+) -> Image.Image:
+    """Transparent HH / MM corner overlay for the CD view.
+
+    This is 20 draw.text calls (an 8-direction shadow pass plus two
+    foregrounds) for a string that changes once a minute, so it is cached by
+    the time it displays rather than rebuilt every frame.
+    """
+    overlay = Image.new("RGBA", (size_x, size_y), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    clock_font = get_font(font_size)
+
+    hour_bbox = draw.textbbox((0, 0), hour_str, font=clock_font)
+    minute_bbox = draw.textbbox((0, 0), minute_str, font=clock_font)
+
+    hour_h = hour_bbox[3] - hour_bbox[1]
+    minute_w = minute_bbox[2] - minute_bbox[0]
+    minute_h = minute_bbox[3] - minute_bbox[1]
+
+    if text_position == "top":
+        clock_y = size_y - max(hour_h, minute_h) - 1
+    else:
+        clock_y = 1
+
+    hour_x = 1
+    minute_x = size_x - minute_w - 1
+
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            if dx or dy:
+                draw.text((hour_x + dx, clock_y - hour_bbox[1] + dy),
+                          hour_str, fill=(0, 0, 0, 255), font=clock_font)
+                draw.text((minute_x + dx, clock_y - minute_bbox[1] + dy),
+                          minute_str, fill=(0, 0, 0, 255), font=clock_font)
+
+    draw.text((hour_x, clock_y - hour_bbox[1]),
+              hour_str, fill=(200, 200, 200, 255), font=clock_font)
+    draw.text((minute_x, clock_y - minute_bbox[1]),
+              minute_str, fill=(200, 200, 200, 255), font=clock_font)
+
+    return overlay
 
 
 def create_full_frame(
@@ -802,6 +1139,7 @@ def create_full_frame(
     size_x: int,
     size_y: int,
     args: argparse.Namespace,
+    art_key: str | None = None,
 ) -> Image.Image:
     has_text = bool(display_text) and not args.no_text
     if has_text:
@@ -814,7 +1152,11 @@ def create_full_frame(
         gap = 0
         cd_size = min(size_x, size_y)
 
-    cd_img = render_record(art_image, angle, cd_size) if art_image else render_idle(cd_size)
+    cd_img = (
+        render_record(art_image, angle, cd_size, art_key)
+        if art_image
+        else render_idle(cd_size)
+    )
 
     frame = Image.new("RGB", (size_x, size_y), (0, 0, 0))
     cd_x = (size_x - cd_size) // 2
@@ -822,37 +1164,12 @@ def create_full_frame(
     frame.paste(cd_img, (cd_x, cd_y))
 
     now = datetime.datetime.now()
-    hour_str = now.strftime("%I").lstrip("0")
-    minute_str = now.strftime("%M")
-
-    clock_font_size = max(9, args.text_font_size + 1)
-    clock_font = get_font(clock_font_size)
-    dummy_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-
-    hour_bbox = dummy_draw.textbbox((0, 0), hour_str, font=clock_font)
-    minute_bbox = dummy_draw.textbbox((0, 0), minute_str, font=clock_font)
-
-    hour_h = hour_bbox[3] - hour_bbox[1]
-    minute_w = minute_bbox[2] - minute_bbox[0]
-    minute_h = minute_bbox[3] - minute_bbox[1]
-
-    draw = ImageDraw.Draw(frame)
-    if args.text_position == "top":
-        clock_y = size_y - max(hour_h, minute_h) - 1
-    else:
-        clock_y = 1
-
-    hour_x = 1
-    minute_x = size_x - minute_w - 1
-
-    for dx in [-1, 0, 1]:
-        for dy in [-1, 0, 1]:
-            if dx != 0 or dy != 0:
-                draw.text((hour_x + dx, clock_y - hour_bbox[1] + dy), hour_str, fill=(0, 0, 0), font=clock_font)
-                draw.text((minute_x + dx, clock_y - minute_bbox[1] + dy), minute_str, fill=(0, 0, 0), font=clock_font)
-
-    draw.text((hour_x, clock_y - hour_bbox[1]), hour_str, fill=(200, 200, 200), font=clock_font)
-    draw.text((minute_x, clock_y - minute_bbox[1]), minute_str, fill=(200, 200, 200), font=clock_font)
+    overlay = _clock_overlay(
+        size_x, size_y,
+        now.strftime("%I").lstrip("0"), now.strftime("%M"),
+        max(9, args.text_font_size + 1), args.text_position,
+    )
+    frame.paste(overlay, (0, 0), overlay)
 
     if has_text:
         frame = draw_scrolling_text(
@@ -926,71 +1243,236 @@ def render_test_pattern(size: int, offset: int) -> Image.Image:
 # ═══════════════════════════════════════════════════════════════════
 
 _LRC_LINE_RE = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)")
+# Enhanced-LRC per-word timestamps, e.g. "<00:12.34>Hello <00:12.90>world".
+_LRC_WORD_RE = re.compile(r"<(\d+):(\d+(?:\.\d+)?)>")
 
 
-def parse_lrc(synced_lyrics: str) -> list[tuple[int, str]]:
-    result: list[tuple[int, str]] = []
+def _parse_word_tags(text: str) -> tuple[str, list[tuple[str, int]]]:
+    """Split an enhanced-LRC line into clean text plus (word, start_ms) pairs.
+
+    These tags were previously left in the line body and drawn on the matrix as
+    literal '<00:12.34>' garbage. Parsing them instead gives exact per-word
+    karaoke timing for free on tracks that carry it.
+    """
+    matches = list(_LRC_WORD_RE.finditer(text))
+    clean = re.sub(r"\s+", " ", _LRC_WORD_RE.sub("", text)).strip()
+    if not matches:
+        return clean, []
+
+    words: list[tuple[str, int]] = []
+    for index, match in enumerate(matches):
+        start_ms = int((int(match.group(1)) * 60 + float(match.group(2))) * 1000)
+        end_pos = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        chunk = text[match.end():end_pos].strip()
+        if chunk:
+            words.append((chunk, start_ms))
+    return clean, words
+
+
+def parse_lrc(synced_lyrics: str) -> tuple[list[tuple[int, str]], list[list[tuple[str, int]]]]:
+    """Parse LRC into (lines, per_line_word_timings).
+
+    word_timings[i] is empty for plain LRC and populated for enhanced LRC.
+    """
+    rows: list[tuple[int, str, list[tuple[str, int]]]] = []
     for line in synced_lyrics.splitlines():
         match = _LRC_LINE_RE.match(line.strip())
-        if match:
-            minutes = int(match.group(1))
-            seconds = float(match.group(2))
-            text = match.group(3).strip()
-            timestamp_ms = int((minutes * 60 + seconds) * 1000)
-            result.append((timestamp_ms, text))
-    result.sort(key=lambda x: x[0])
-    return result
+        if not match:
+            continue
+        minutes = int(match.group(1))
+        seconds = float(match.group(2))
+        text, word_times = _parse_word_tags(match.group(3))
+        rows.append((int((minutes * 60 + seconds) * 1000), text, word_times))
+
+    rows.sort(key=lambda row: row[0])
+    return [(ts, text) for ts, text, _ in rows], [words for _, _, words in rows]
+
+
+# Suffixes Spotify adds that LRCLIB's exact-match endpoint will not forgive.
+_TITLE_NOISE_RE = re.compile(
+    r"""\s*(?:
+          -\s*(?:\d{4}\s*)?(?:remaster(?:ed)?|re-?recorded|radio\s*edit|single\s*version
+              |album\s*version|mono|stereo|live|demo|edit|deluxe)\b.*$
+        | \((?:feat|ft|with|featuring)\.?[^)]*\)
+        | \[(?:feat|ft|with|featuring)\.?[^\]]*\]
+        | \((?:remaster(?:ed)?|live|mono|stereo|deluxe|bonus)[^)]*\)
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def normalize_track_title(title: str) -> str:
+    """Strip decorations that break LRCLIB's exact-match lookup.
+
+    'Song (feat. X) - Remastered 2011' misses /api/get every time, even though
+    the plain title is in the database.
+    """
+    cleaned = _TITLE_NOISE_RE.sub("", title)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -–—")
+    return cleaned or title
+
+
+def _lyrics_cache_path(cache_dir: Path, artist: str, track: str, duration_s: int) -> Path:
+    import hashlib
+    key = f"{artist.lower()}|{track.lower()}|{duration_s // 5}"
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
+    return cache_dir / f"{digest}.json"
+
+
+def _lrclib_get(params: dict[str, str], url: str = LRCLIB_API_URL) -> dict[str, Any] | None:
+    req = urllib.request.Request(
+        f"{url}?{urllib.parse.urlencode(params)}",
+        headers={"User-Agent": LRCLIB_USER_AGENT},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _lyrics_from_payload(
+    data: dict[str, Any]
+) -> tuple[list[tuple[int, str]] | None, list[list[tuple[str, int]]], bool]:
+    is_instrumental = bool(data.get("instrumental", False))
+    if not is_instrumental:
+        plain = data.get("plainLyrics") or ""
+        synced_raw = data.get("syncedLyrics") or ""
+        if not plain.strip() and not synced_raw.strip():
+            is_instrumental = True
+
+    synced = data.get("syncedLyrics")
+    if not synced:
+        return None, [], is_instrumental
+    lines, words = parse_lrc(synced)
+    return (lines if lines else None), words, is_instrumental
 
 
 def fetch_lyrics(
-    artist: str, track: str, album: str, duration_s: int
-) -> tuple[list[tuple[int, str]] | None, bool]:
+    artist: str, track: str, album: str, duration_s: int,
+    cache_dir: Path | None = None,
+) -> tuple[list[tuple[int, str]] | None, list[list[tuple[str, int]]], bool]:
     """Fetch synced lyrics from LRCLIB.
 
-    Returns (lyrics_list_or_None, is_instrumental).
+    Returns (lines_or_None, per_line_word_timings, is_instrumental).
+
+    Tries, in order: the on-disk cache, an exact /api/get, an /api/get with the
+    title normalized, then /api/search. The exact endpoint requires artist,
+    track, album and duration all to match, so on its own it misses a large
+    fraction of a normal library.
     """
+    cache_path = (
+        _lyrics_cache_path(cache_dir, artist, track, duration_s) if cache_dir else None
+    )
+    if cache_path and cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            lines = [(int(t), s) for t, s in cached.get("lines") or []]
+            words = [[(w, int(t)) for w, t in wl] for wl in cached.get("words") or []]
+            log("LRCLIB: Loaded lyrics from cache.", verbose=True)
+            return (lines or None), words, bool(cached.get("instrumental"))
+        except (OSError, ValueError, TypeError):
+            pass  # fall through and refetch
+
+    clean_title = normalize_track_title(track)
+    attempts: list[tuple[str, dict[str, str], str]] = [
+        ("exact", {
+            "artist_name": artist, "track_name": track,
+            "album_name": album, "duration": str(duration_s),
+        }, LRCLIB_API_URL),
+    ]
+    if clean_title != track:
+        attempts.append(("normalized title", {
+            "artist_name": artist, "track_name": clean_title,
+            "album_name": album, "duration": str(duration_s),
+        }, LRCLIB_API_URL))
+
+    result: tuple[list[tuple[int, str]] | None, list[list[tuple[str, int]]], bool] | None = None
+
+    for label, params, url in attempts:
+        try:
+            data = _lrclib_get(params, url)
+        except HTTPError as exc:
+            if exc.code == 404:
+                log(f"LRCLIB: No {label} match.", verbose=True)
+                continue
+            log(f"LRCLIB: HTTP {exc.code} on {label} lookup.", "warn")
+            return None, [], False
+        except (URLError, TimeoutError, OSError) as exc:
+            log(f"LRCLIB: Network error: {exc}", "warn")
+            return None, [], False
+        except ValueError as exc:
+            log(f"LRCLIB: Bad response: {exc}", "warn")
+            return None, [], False
+        if data:
+            result = _lyrics_from_payload(data)
+            break
+
+    if result is None:
+        result = _lrclib_search(artist, clean_title, duration_s)
+
+    if result is None:
+        return None, [], False
+
+    lines, words, instrumental = result
+    if cache_path and (lines or instrumental):
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(
+                json.dumps({
+                    "lines": lines or [],
+                    "words": words,
+                    "instrumental": instrumental,
+                }),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass  # cache is an optimization, never fatal
+
+    return lines, words, instrumental
+
+
+def _lrclib_search(
+    artist: str, track: str, duration_s: int
+) -> tuple[list[tuple[int, str]] | None, list[list[tuple[str, int]]], bool] | None:
+    """Last-resort fuzzy lookup, picking the closest result by duration."""
     try:
-        params = {
-            "artist_name": artist,
-            "track_name": track,
-            "album_name": album,
-            "duration": str(duration_s),
-        }
-        req = urllib.request.Request(
-            f"{LRCLIB_API_URL}?{urllib.parse.urlencode(params)}",
-            headers={"User-Agent": LRCLIB_USER_AGENT},
-            method="GET",
+        results = _lrclib_get(
+            {"artist_name": artist, "track_name": track}, LRCLIB_SEARCH_URL
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+        log(f"LRCLIB: Search failed: {exc}", verbose=True)
+        return None
 
-        # Detect instrumental tracks
-        is_instrumental = bool(data.get("instrumental", False))
-        if not is_instrumental:
-            plain = data.get("plainLyrics") or ""
-            synced_raw = data.get("syncedLyrics") or ""
-            if not plain.strip() and not synced_raw.strip():
-                is_instrumental = True
+    if not isinstance(results, list) or not results:
+        log("LRCLIB: Search returned nothing.", verbose=True)
+        return None
 
-        synced = data.get("syncedLyrics")
-        if not synced:
-            return None, is_instrumental
-        parsed = parse_lrc(synced)
-        return (parsed if parsed else None), is_instrumental
-    except Exception as exc:
-        log(f"LRCLIB: Failed to fetch lyrics: {exc}", "warn")
-        return None, False
+    synced = [r for r in results if r.get("syncedLyrics")]
+    if not synced:
+        return None
+
+    # Duration is the strongest signal that we matched the right recording.
+    best = min(synced, key=lambda r: abs((r.get("duration") or 0) - duration_s))
+    if abs((best.get("duration") or 0) - duration_s) > 8:
+        log("LRCLIB: Search hits were all the wrong length — ignoring.", verbose=True)
+        return None
+
+    log("LRCLIB: Matched via search fallback.")
+    return _lyrics_from_payload(best)
 
 
 def fetch_lyrics_async(
     artist: str, track: str, album: str, duration_s: int,
     state: SharedPlaybackState, lock: threading.Lock, track_key: str,
+    cache_dir: Path | None = None,
 ) -> None:
     log(f"LRCLIB: Fetching lyrics for '{track}' by '{artist}'...")
-    lyrics, is_instrumental = fetch_lyrics(artist, track, album, duration_s)
+    lyrics, words, is_instrumental = fetch_lyrics(
+        artist, track, album, duration_s, cache_dir
+    )
     with lock:
         if state.art_key == track_key:
             state.lyrics = lyrics
+            state.lyrics_words = words
             state.lyrics_track_key = track_key
             state.is_instrumental = is_instrumental
     if lyrics:
@@ -1020,19 +1502,57 @@ def get_current_lyric_index(lyrics: list[tuple[int, str]], progress_ms: int) -> 
     return result
 
 
-# Persistent state for smooth lyrics scrolling (updated each frame)
-_lyrics_scroll_state = {
-    "last_idx": -1,
-    "scroll_y": 0.0,       # current interpolated Y offset
-    "target_y": 0.0,       # target Y offset
-    "transition_start": 0.0,
-}
-
-LYRICS_FONT_SIZE = 9
-LYRICS_LINE_HEIGHT = 14   # pixels between lines (font 9 ≈ 10px tall + 4px gap)
-LYRICS_CENTER_Y = 28      # vertical center for the active line
 LYRICS_SCROLL_DURATION = 0.4  # seconds for smooth scroll animation
-LYRICS_H_SCROLL_SPEED = 15.0  # px/s for horizontal overflow scroll
+KARAOKE_MAX_ROWS = 4          # wrapped rows allowed for the active line
+
+
+class _LyricsScroll:
+    """Vertical scroll animation state for lyrics 'scroll' mode.
+
+    Replaces a module-level dict that had two defects:
+
+    1. The animation start position was the last *completed* target rather than
+       where the text actually was on screen. Lines arriving closer together
+       than LYRICS_SCROLL_DURATION (i.e. rap and fast verses) therefore snapped
+       backwards before animating forward again.
+    2. Nothing reset between tracks, so finishing a song on line 40 and starting
+       the next on line 0 smoothly scrolled through 40 lines of nothing.
+    """
+
+    def __init__(self) -> None:
+        self.track_key: str | None = None
+        self.last_idx: int = -1
+        self.from_y: float = 0.0
+        self.target_y: float = 0.0
+        self.current_y: float = 0.0
+        self.transition_start: float = 0.0
+
+    def sync_track(self, track_key: str | None) -> None:
+        if track_key == self.track_key:
+            return
+        self.track_key = track_key
+        self.last_idx = -1
+        self.from_y = self.target_y = self.current_y = 0.0
+        self.transition_start = 0.0
+
+    def position(self, idx: int, line_height: int, now: float) -> float:
+        if idx != self.last_idx:
+            self.from_y = self.current_y  # animate from the visible position
+            self.last_idx = idx
+            self.target_y = float(idx * line_height)
+            self.transition_start = now
+
+        elapsed = now - self.transition_start
+        if elapsed < LYRICS_SCROLL_DURATION:
+            t = elapsed / LYRICS_SCROLL_DURATION
+            eased = 1.0 - (1.0 - t) ** 3
+            self.current_y = self.from_y + (self.target_y - self.from_y) * eased
+        else:
+            self.current_y = self.target_y
+        return self.current_y
+
+
+_lyrics_scroll = _LyricsScroll()
 
 
 def _get_line_duration_ms(lyrics: list[tuple[int, str]], idx: int, total_duration_ms: int) -> int:
@@ -1124,6 +1644,199 @@ def _legacy_h_scroll_x(
         return 2 - overflow + int(frac * overflow)
 
 
+LYRIC_NEXT_COLOR = (55, 55, 55)
+LYRIC_UNSUNG_COLOR = (120, 120, 120)
+
+
+def word_spans(
+    text: str,
+    line_start_ms: int,
+    line_end_ms: int,
+    word_times: list[tuple[str, int]] | None = None,
+) -> list[tuple[str, int]]:
+    """[(word, start_ms), ...] for a lyric line.
+
+    Uses real enhanced-LRC timings when the source has them, otherwise spreads
+    the line's duration across the words weighted by length — longer words take
+    proportionally longer to sing, which tracks reality closely enough to read
+    along by.
+    """
+    words = text.split()
+    if not words:
+        return []
+    if word_times and len(word_times) == len(words):
+        return list(word_times)
+
+    weights = [len(w) + 1 for w in words]
+    total = sum(weights) or 1
+    duration = max(1, line_end_ms - line_start_ms)
+    spans: list[tuple[str, int]] = []
+    accumulated = 0
+    for word, weight in zip(words, weights):
+        spans.append((word, line_start_ms + int(duration * accumulated / total)))
+        accumulated += weight
+    return spans
+
+
+def wrap_to_width(words: list[str], font: Any, max_width: int, draw: ImageDraw.ImageDraw) -> list[list[str]]:
+    """Greedy word wrap into rows no wider than max_width."""
+    rows: list[list[str]] = []
+    current: list[str] = []
+    for word in words:
+        candidate = " ".join(current + [word])
+        if current and draw.textlength(candidate, font=font) > max_width:
+            rows.append(current)
+            current = [word]
+        else:
+            current.append(word)
+    if current:
+        rows.append(current)
+    return rows
+
+
+def _fit_lyric_block(
+    words: list[str], size: int, max_font: int, max_rows: int,
+    draw: ImageDraw.ImageDraw,
+) -> tuple[Any, int, list[list[str]]]:
+    """Largest font (down to 6) whose wrapped block fits in max_rows.
+
+    A fixed size forces one compromise across every genre; a dense rap bar and
+    a three-word hook want different sizes. The slider becomes a maximum.
+    """
+    for font_size in range(max_font, 5, -1):
+        font = get_font(font_size)
+        rows = wrap_to_width(words, font, size - 4, draw)
+        if len(rows) <= max_rows:
+            return font, font_size, rows
+    font = get_font(6)
+    return font, 6, wrap_to_width(words, font, size - 4, draw)[:max_rows]
+
+
+def _render_karaoke(
+    frame: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    size: int,
+    lyrics: list[tuple[int, str]],
+    lyrics_words: list[list[tuple[str, int]]],
+    idx: int,
+    display_progress: int,
+    duration_ms: int,
+    max_font: int,
+    accent_color: tuple[int, int, int],
+    crisp: bool,
+) -> None:
+    """Karaoke layout: the whole line, wrapped, with words lit as they are sung.
+
+    Horizontal scrolling could only ever show a 64px window that *follows* the
+    vocal, so the words visible were the ones already sung and the next word was
+    off-screen until it slid in. No amount of lead time fixes that, because the
+    constraint is space, not time. Wrapping shows the entire line at once and
+    lets the highlight carry position instead of content.
+    """
+    # Before the first line: count down to it rather than showing nothing.
+    if idx < 0:
+        first_start = lyrics[0][0]
+        remaining = first_start - display_progress
+        if 0 < remaining <= 5000:
+            _draw_countdown(frame, draw, size, remaining, accent_color, crisp)
+        return
+
+    line_text = lyrics[idx][1]
+    line_end = lyrics[idx + 1][0] if idx + 1 < len(lyrics) else (
+        duration_ms if duration_ms > 0 else lyrics[idx][0] + 5000
+    )
+
+    # Empty active line means an instrumental gap — show how long until the
+    # next line instead of a static row of dots.
+    if not line_text.strip():
+        remaining = line_end - display_progress
+        if remaining > 0:
+            _draw_countdown(frame, draw, size, remaining, accent_color, crisp)
+        return
+
+    word_times = lyrics_words[idx] if idx < len(lyrics_words) else []
+    spans = word_spans(line_text, lyrics[idx][0], line_end, word_times)
+
+    font, font_size, rows = _fit_lyric_block(
+        [w for w, _ in spans], size, max_font, KARAOKE_MAX_ROWS, draw
+    )
+    line_height = font_size + 3
+
+    # Next-line preview in whatever vertical space is left.
+    next_rows: list[list[str]] = []
+    next_font = get_font(max(6, font_size - 1))
+    if idx + 1 < len(lyrics) and lyrics[idx + 1][1].strip():
+        available = (size - 4) // line_height - len(rows)
+        if available >= 1:
+            next_rows = wrap_to_width(
+                lyrics[idx + 1][1].split(), next_font, size - 4, draw
+            )[: min(2, available)]
+
+    next_height = len(next_rows) * (max(6, font_size - 1) + 3)
+    total_height = len(rows) * line_height + (next_height + 3 if next_rows else 0)
+    y = max(1, (size - 1 - total_height) // 2)
+
+    sung: list[tuple[tuple[int, int], str]] = []
+    unsung: list[tuple[tuple[int, int], str]] = []
+
+    word_index = 0
+    for row in rows:
+        row_text = " ".join(row)
+        row_x = (size - draw.textlength(row_text, font=font)) / 2.0
+        # Position each word by measuring the row prefix, not by summing
+        # per-word advances: the widths of "word " measured separately do not
+        # add up to the width of the joined row, so words creep and overlap.
+        prefix = ""
+        for word in row:
+            x = row_x + draw.textlength(prefix, font=font)
+            start_ms = spans[word_index][1] if word_index < len(spans) else 0
+            target = sung if display_progress >= start_ms else unsung
+            target.append(((int(round(x)), y), word))
+            prefix += word + " "
+            word_index += 1
+        y += line_height
+
+    draw_text_batch(frame, unsung, font, LYRIC_UNSUNG_COLOR, crisp)
+    draw_text_batch(frame, sung, font, accent_color, crisp)
+
+    if next_rows:
+        y += 3
+        preview: list[tuple[tuple[int, int], str]] = []
+        for row in next_rows:
+            row_text = " ".join(row)
+            row_width = draw.textlength(row_text, font=next_font)
+            preview.append((((size - int(row_width)) // 2, y), row_text))
+            y += max(6, font_size - 1) + 3
+        draw_text_batch(frame, preview, next_font, LYRIC_NEXT_COLOR, crisp)
+
+
+def _draw_countdown(
+    frame: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    size: int,
+    remaining_ms: int,
+    accent_color: tuple[int, int, int],
+    crisp: bool,
+) -> None:
+    """Shrinking bar plus dots showing when the next line lands."""
+    total = 5000.0
+    fraction = max(0.0, min(1.0, remaining_ms / total))
+    bar_w = int((size - 16) * fraction)
+    y = size // 2
+
+    if bar_w > 0:
+        draw.rectangle((8, y - 1, 8 + bar_w, y + 1), fill=accent_color)
+
+    # Drawn, not typed: U+2022 is absent from the default PIL font and renders
+    # as a tofu box.
+    dots = max(1, min(3, int(remaining_ms / 1000) + 1))
+    spacing = 7
+    start_x = size // 2 - ((dots - 1) * spacing) // 2
+    for i in range(dots):
+        cx = start_x + i * spacing
+        draw.rectangle((cx - 1, y + 7, cx, y + 8), fill=LYRIC_UNSUNG_COLOR)
+
+
 def render_lyrics(
     size: int,
     lyrics: list[tuple[int, str]] | None,
@@ -1137,6 +1850,10 @@ def render_lyrics(
     is_instrumental: bool = False,
     lyrics_lead_ms: int = 150,
     accent_color: tuple[int, int, int] = SPOTIFY_GREEN,
+    track_key: str | None = None,
+    lyrics_words: list[list[tuple[str, int]]] | None = None,
+    crisp: bool = True,
+    progress_offset_ms: float = 0.0,
 ) -> Image.Image:
     """Render lyrics with smooth scrolling or 3-line pop, with optional smart scroll.
 
@@ -1150,6 +1867,8 @@ def render_lyrics(
     draw = ImageDraw.Draw(frame)
     font = get_font(font_size)
 
+    _lyrics_scroll.sync_track(track_key)
+
     # Calculate estimated progress
     if is_playing and fetch_time > 0:
         elapsed_since_fetch = (time.monotonic() - fetch_time) * 1000
@@ -1160,8 +1879,9 @@ def render_lyrics(
     if duration_ms > 0:
         estimated_progress = min(estimated_progress, duration_ms)
 
-    # Apply lyrics lead offset (read-ahead: see words before they're sung)
-    display_progress = estimated_progress + lyrics_lead_ms
+    # Lead is the user's read-ahead preference; the offset is the measured
+    # correction for Spotify's reporting lag. They serve different purposes.
+    display_progress = estimated_progress + lyrics_lead_ms + int(progress_offset_ms)
 
     if not lyrics:
         if is_instrumental:
@@ -1203,11 +1923,19 @@ def render_lyrics(
             x = (size - tw) // 2
             y = (size - (bbox[3] - bbox[1])) // 2
             draw.text((x, y - bbox[1]), no_lyrics_text, fill=LYRIC_DIM_COLOR, font=font)
-            note = "\u266a"
-            nbbox = draw.textbbox((0, 0), note, font=font)
-            nw = nbbox[2] - nbbox[0]
-            draw.text((x - nw - 3, y - nbbox[1]), note, fill=accent_color, font=font)
-            draw.text((x + tw + 3, y - nbbox[1]), note, fill=accent_color, font=font)
+            # Drawn rather than the U+266A character, which the default PIL
+            # font does not contain and renders as a tofu box on the panel.
+            note_y = y + 2
+            for note_x in (x - 7, x + tw + 4):
+                draw.ellipse(
+                    (note_x, note_y + 3, note_x + 3, note_y + 6), fill=accent_color
+                )
+                draw.line(
+                    (note_x + 3, note_y + 4, note_x + 3, note_y - 2), fill=accent_color
+                )
+                draw.line(
+                    (note_x + 3, note_y - 2, note_x + 5, note_y - 1), fill=accent_color
+                )
     else:
         idx = get_current_lyric_index(lyrics, display_progress)
         now_mono = time.monotonic()
@@ -1223,30 +1951,17 @@ def render_lyrics(
         # Dots pattern for empty active lines (instrumental gaps)
         dots_text = "· · ·"
 
-        if style == "scroll":
+        if style == "karaoke":
+            _render_karaoke(
+                frame, draw, size, lyrics, lyrics_words or [], idx,
+                display_progress, duration_ms, font_size, accent_color, crisp,
+            )
+        elif style == "scroll":
             # Smooth vertical scroll animation
             line_height = max(10, font_size + 4)
             center_y = size // 2 - font_size // 2
 
-            if idx != _lyrics_scroll_state["last_idx"]:
-                _lyrics_scroll_state["last_idx"] = idx
-                _lyrics_scroll_state["target_y"] = float(idx * line_height)
-                _lyrics_scroll_state["transition_start"] = now_mono
-
-            target_y = _lyrics_scroll_state["target_y"]
-            elapsed = now_mono - _lyrics_scroll_state["transition_start"]
-
-            if elapsed < LYRICS_SCROLL_DURATION:
-                t = elapsed / LYRICS_SCROLL_DURATION
-                eased = 1.0 - (1.0 - t) ** 3
-                old_y = _lyrics_scroll_state["scroll_y"]
-                current_y = old_y + (target_y - old_y) * eased
-            else:
-                current_y = target_y
-                _lyrics_scroll_state["scroll_y"] = target_y
-
-            if elapsed >= LYRICS_SCROLL_DURATION:
-                _lyrics_scroll_state["scroll_y"] = target_y
+            current_y = _lyrics_scroll.position(idx, line_height, now_mono)
 
             visible_range = max(3, (size // line_height) // 2 + 1)
             fade_zone = 12
@@ -1300,8 +2015,11 @@ def render_lyrics(
 
                 draw.text((x, y_draw), text, fill=color, font=font)
         else:
-            # Pop mode — 3 fixed lines
-            y_positions = [10, 28, 46]
+            # Pop mode — 3 lines, spaced from the font size. The old fixed
+            # [10, 28, 46] collided once the size slider went past ~11.
+            spacing = max(12, font_size + 6)
+            centre = size // 2 - font_size // 2
+            y_positions = [centre - spacing, centre, centre + spacing]
             line_indices = [idx - 1, idx, idx + 1]
             colors = [LYRIC_DIM_COLOR, accent_color, LYRIC_DIM_COLOR]
 
@@ -1555,8 +2273,9 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
     <div class="card-title">&#9881; Main Settings</div>
     
     <div class="segmented">
-      <div class="seg-btn" id="style-scroll" onclick="setSetting('lyrics-style', 'scroll')">Scroll Mode</div>
-      <div class="seg-btn" id="style-pop" onclick="setSetting('lyrics-style', 'pop')">Pop Mode</div>
+      <div class="seg-btn" id="style-karaoke" onclick="setSetting('lyrics-style', 'karaoke')">Karaoke</div>
+      <div class="seg-btn" id="style-scroll" onclick="setSetting('lyrics-style', 'scroll')">Scroll</div>
+      <div class="seg-btn" id="style-pop" onclick="setSetting('lyrics-style', 'pop')">Pop</div>
     </div>
 
     <div class="slider-group">
@@ -1669,6 +2388,7 @@ let currentState = {};
 let lyricsOpen = false;
 let lyricsData = null;
 let lyricsInterval = null;
+let lastArtKey = undefined;
 
 const COLOR_THEMES = {
   spotify:  {r:30,g:215,b:96},
@@ -1742,16 +2462,27 @@ const COLOR_THEMES = {
   grid.appendChild(customEl);
 })();
 
-function toggleAdv() {
+/* Track the intended state explicitly. Reading style.display broke when
+   Custom Slate mode hid the panel behind our back: the button still said
+   "Hide", so the next click set display:none on an already-hidden panel. */
+let advOpen = false;
+
+function applyAdvVisibility(visible) {
   const adv = document.getElementById('advSettings');
   const btn = document.querySelector('.adv-toggle');
-  if (adv.style.display === 'block') {
-    adv.style.display = 'none';
-    btn.innerHTML = 'Show Advanced Settings &#9662;';
-  } else {
-    adv.style.display = 'block';
-    btn.innerHTML = 'Hide Advanced Settings &#9652;';
-  }
+  if (adv) adv.style.display = visible ? 'block' : 'none';
+  if (btn) btn.innerHTML = visible
+    ? 'Hide Advanced Settings &#9652;'
+    : 'Show Advanced Settings &#9662;';
+}
+
+function toggleAdv() {
+  advOpen = !advOpen;
+  applyAdvVisibility(advOpen);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 async function fetchState() {
@@ -1807,6 +2538,7 @@ function updateUI(s) {
     if(mainSettings) mainSettings.style.display = 'block';
     if(advBtn) advBtn.style.display = 'block';
     if(colorCard) colorCard.style.display = 'block';
+    applyAdvVisibility(advOpen);   // restore whatever the user had chosen
   }
 
   // Segmented lyrics style
@@ -1844,6 +2576,13 @@ function updateUI(s) {
   const instr = document.getElementById('npInstr');
   if (s.is_instrumental) { instr.style.display = 'inline-block'; }
   else { instr.style.display = 'none'; }
+
+  // Refetch lyrics when the track changes, otherwise an open drawer keeps
+  // showing the previous song's words against the new song's timestamps.
+  if (s.art_key !== lastArtKey) {
+    lastArtKey = s.art_key;
+    if (lyricsOpen) fetchLyricsData();
+  }
 }
 
 async function setMode(m) {
@@ -1971,7 +2710,8 @@ function renderLyricsHTML() {
   }
   let html = '<div style="height:80px;"></div>';
   lyricsData.forEach((line, i) => {
-    html += `<div id="line-${i}" style="transition:all 0.3s; padding:4px 0;">${line[1] || '· · ·'}</div>`;
+    const text = line[1] ? escapeHtml(line[1]) : '· · ·';
+    html += `<div id="line-${i}" style="transition:all 0.3s; padding:4px 0;">${text}</div>`;
   });
   html += '<div style="height:100px;"></div>';
   box.innerHTML = html;
@@ -1979,7 +2719,13 @@ function renderLyricsHTML() {
 
 function updateLiveLyricsScroll() {
   if (!lyricsData || !currentState.is_playing) return;
-  const currentMs = currentState.progress_ms + (Date.now() - window.lastStateFetchTime);
+  /* progress_ms is only as fresh as the last Spotify poll, so compensating for
+     the HTTP round-trip alone left the phone up to 5s behind the matrix.
+     progress_age_ms closes that gap; the lead offset keeps both in step. */
+  const currentMs = currentState.progress_ms
+    + (currentState.progress_age_ms || 0)
+    + (Date.now() - window.lastStateFetchTime)
+    + (currentState.lyrics_lead_ms || 0);
   let activeIdx = -1;
   for (let i = lyricsData.length - 1; i >= 0; i--) {
     if (currentMs >= lyricsData[i][0]) {
@@ -2201,7 +2947,12 @@ def start_control_server(
 
         def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
+            self._body_too_large = False
             body = self._read_body()
+
+            if self._body_too_large:
+                self._send_json({"error": "Request body too large"}, 413)
+                return
 
             if parsed.path == "/api/mode":
                 mode = body.get("mode", "")
@@ -2214,34 +2965,38 @@ def start_control_server(
                     self._send_json({"error": "Invalid mode"}, 400)
 
             elif parsed.path == "/api/brightness":
-                val = int(body.get("value", outer_state._default_brightness))
-                val = max(1, min(100, val))
+                val = self._num(body, outer_state._default_brightness, 1, 100)
+                if val is None:
+                    self._send_json({"error": "brightness must be a number 1-100"}, 400)
+                    return
                 with outer_lock:
                     outer_state.brightness = val
-                try:
-                    outer_display.set_brightness(val)
-                except Exception:
-                    pass
+                # Brightness is applied by the render loop so it can ease; setting
+                # it here too would defeat the ramp.
                 log(f"Brightness set to {val}")
                 self._send_json({"ok": True, "brightness": val})
 
             elif parsed.path == "/api/spin-speed":
-                val = float(body.get("value", outer_state._default_spin_speed))
-                val = max(1.0, min(120.0, val))
+                val = self._num(body, outer_state._default_spin_speed, 1.0, 120.0, float)
+                if val is None:
+                    self._send_json({"error": "spin-speed must be a number 1-120"}, 400)
+                    return
                 with outer_lock:
                     outer_state.spin_speed = val
                 self._send_json({"ok": True, "spin_speed": val})
 
             elif parsed.path == "/api/text-speed":
-                val = float(body.get("value", outer_state._default_text_scroll_speed))
-                val = max(1.0, min(100.0, val))
+                val = self._num(body, outer_state._default_text_scroll_speed, 1.0, 100.0, float)
+                if val is None:
+                    self._send_json({"error": "text-speed must be a number 1-100"}, 400)
+                    return
                 with outer_lock:
                     outer_state.text_scroll_speed = val
                 self._send_json({"ok": True, "text_scroll_speed": val})
 
             elif parsed.path == "/api/lyrics-style":
                 style = body.get("value", "scroll")
-                if style in ("scroll", "pop"):
+                if style in ("scroll", "pop", "karaoke"):
                     with outer_lock:
                         outer_state.lyrics_style = style
                     self._send_json({"ok": True, "lyrics_style": style})
@@ -2255,15 +3010,19 @@ def start_control_server(
                 self._send_json({"ok": True, "smart_scroll": val})
 
             elif parsed.path == "/api/scroll-font-size":
-                val = int(body.get("value", 9))
-                val = max(6, min(14, val))
+                val = self._num(body, outer_state._default_scroll_font_size, 6, 14)
+                if val is None:
+                    self._send_json({"error": "font size must be a number 6-14"}, 400)
+                    return
                 with outer_lock:
                     outer_state.scroll_font_size = val
                 self._send_json({"ok": True, "scroll_font_size": val})
 
             elif parsed.path == "/api/pop-font-size":
-                val = int(body.get("value", 8))
-                val = max(6, min(14, val))
+                val = self._num(body, outer_state._default_pop_font_size, 6, 14)
+                if val is None:
+                    self._send_json({"error": "font size must be a number 6-14"}, 400)
+                    return
                 with outer_lock:
                     outer_state.pop_font_size = val
                 self._send_json({"ok": True, "pop_font_size": val})
@@ -2291,9 +3050,12 @@ def start_control_server(
             elif parsed.path == "/api/accent-color":
                 val = body.get("value", "spotify")
                 if val == "custom":
-                    r = int(body.get("r", 255))
-                    g = int(body.get("g", 255))
-                    b = int(body.get("b", 255))
+                    r = self._num(body, 255, 0, 255, int, "r")
+                    g = self._num(body, 255, 0, 255, int, "g")
+                    b = self._num(body, 255, 0, 255, int, "b")
+                    if r is None or g is None or b is None:
+                        self._send_json({"error": "r/g/b must be numbers 0-255"}, 400)
+                        return
                     with outer_lock:
                         outer_state.accent_name = "custom"
                         outer_state.accent_color = (r, g, b)
@@ -2308,8 +3070,10 @@ def start_control_server(
                     self._send_json({"error": "Invalid theme"}, 400)
 
             elif parsed.path == "/api/lyrics-lead":
-                val = int(body.get("value", 180))
-                val = max(0, min(500, val))
+                val = self._num(body, 180, 0, 500)
+                if val is None:
+                    self._send_json({"error": "lyrics-lead must be a number 0-500"}, 400)
+                    return
                 with outer_lock:
                     outer_state.lyrics_lead_ms = val
                 self._send_json({"ok": True, "lyrics_lead_ms": val})
@@ -2328,7 +3092,17 @@ def start_control_server(
                     frames = []
                     delay = 0.1
                     if getattr(img, "is_animated", False):
-                        for frame_idx in range(img.n_frames):
+                        # Cap frame count: an unbounded GIF means N LANCZOS
+                        # resizes plus N retained frames, all on the Pi's RAM.
+                        total = img.n_frames
+                        kept = min(total, MAX_SLATE_FRAMES)
+                        if kept < total:
+                            log(
+                                f"Custom slate: GIF has {total} frames, "
+                                f"keeping the first {kept}.",
+                                "warn",
+                            )
+                        for frame_idx in range(kept):
                             img.seek(frame_idx)
                             frame_rgb = Image.new("RGB", img.size)
                             frame_rgb.paste(img)
@@ -2351,32 +3125,92 @@ def start_control_server(
                 self.wfile.write(b"Not Found")
 
         def _read_body(self) -> dict:
+            """Read and parse a JSON request body, refusing oversized payloads.
+
+            Reading Content-Length bytes unconditionally lets anything on the LAN
+            exhaust the Pi's memory with a single POST.
+            """
             try:
                 length = int(self.headers.get("Content-Length", 0))
-                if length > 0:
-                    raw = self.rfile.read(length)
-                    return json.loads(raw.decode("utf-8"))
+            except (TypeError, ValueError):
+                return {}
+            if length <= 0:
+                return {}
+            if length > MAX_REQUEST_BYTES:
+                # Drain in fixed-size chunks before answering. Replying without
+                # consuming the body resets the connection mid-send, so the
+                # client never gets to read the 413 — it just sees a dropped
+                # socket. Discarding as we go keeps memory flat regardless of
+                # how much was announced.
+                self._body_too_large = True
+                remaining = min(length, MAX_DRAIN_BYTES)
+                while remaining > 0:
+                    chunk = self.rfile.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                return {}
+            try:
+                raw = self.rfile.read(length)
+                parsed = json.loads(raw.decode("utf-8"))
             except Exception:
-                pass
-            return {}
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+
+        def _num(
+            self,
+            body: dict,
+            default: float,
+            lo: float,
+            hi: float,
+            cast: Any = int,
+            key: str = "value",
+        ) -> Any:
+            """Coerce and clamp a numeric field, or None if it is not a number.
+
+            Without this, a non-numeric value raises inside the handler and the
+            client just sees a dropped connection.
+            """
+            raw = body.get(key, default)
+            try:
+                value = cast(raw)
+            except (TypeError, ValueError):
+                return None
+            if value != value or value in (float("inf"), float("-inf")):
+                return None
+            return max(lo, min(hi, value))
 
         def _send_html(self, html: str) -> None:
+            payload = html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            self.wfile.write(html.encode("utf-8"))
+            self.wfile.write(payload)
 
         def _send_json(self, data: Any, status: int = 200) -> None:
+            payload = json.dumps(data).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            self.wfile.write(json.dumps(data).encode("utf-8"))
+            self.wfile.write(payload)
 
         def _send_state(self) -> None:
             with outer_lock:
+                # progress_ms is only as fresh as the last Spotify poll (up to
+                # 5s while playing, 30s when idle). Send its age so the client
+                # can extrapolate properly instead of assuming it is current.
+                fetch_time = outer_state.fetch_time
+                progress_age_ms = (
+                    int((time.monotonic() - fetch_time) * 1000) if fetch_time > 0 else 0
+                )
                 data = {
+                    "art_key": outer_state.art_key,
+                    "is_instrumental": outer_state.is_instrumental,
+                    "progress_age_ms": progress_age_ms,
                     "display_mode": outer_state.display_mode,
                     "effective_mode": outer_state.effective_mode,
                     "brightness": outer_state.brightness,
@@ -2404,7 +3238,10 @@ def start_control_server(
             return
 
     try:
-        server = HTTPServer(("0.0.0.0", port), ControlPanelHandler)
+        # Threaded: the single-threaded HTTPServer serialized every request, so a
+        # slate upload or a stalled phone would block the whole panel.
+        server = ThreadingHTTPServer(("0.0.0.0", port), ControlPanelHandler)
+        server.daemon_threads = True
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         log(f"Web Control Panel: http://0.0.0.0:{port}/")
@@ -2423,18 +3260,22 @@ def poll_spotify(
     state: SharedPlaybackState,
     state_lock: threading.Lock,
     stop_event: threading.Event,
+    args: argparse.Namespace,
 ) -> None:
     first_poll = True
     log("Spotify: Background polling thread started.")
 
-    idle_seconds = 30.0
+    active_seconds = POLL_ACTIVE_SECONDS
+    idle_seconds = POLL_IDLE_SECONDS
     last_playing_time = time.time()
     backoff_multiplier = 1
     last_track_key: str | None = None
+    last_poll_progress = 0
+    last_poll_mono = 0.0
+    progress_offset = 0.0
 
     while not stop_event.is_set():
         try:
-            active_seconds = 5.0
             current_wait = active_seconds
 
             if first_poll:
@@ -2467,11 +3308,38 @@ def poll_spotify(
                 current_wait = idle_seconds
 
             if art:
+                # Measure how far our extrapolation drifted from what Spotify
+                # actually reports, and fold it into a smoothed offset. A large
+                # error means a seek or a track change, not drift — reset there.
+                if (
+                    art.is_playing
+                    and art.key == last_track_key
+                    and last_poll_mono > 0.0
+                ):
+                    predicted = last_poll_progress + (fetch_time - last_poll_mono) * 1000.0
+                    error = art.progress_ms - predicted
+                    if abs(error) < 2000:
+                        progress_offset = 0.85 * progress_offset + 0.15 * error
+                    else:
+                        progress_offset = 0.0
+                    with state_lock:
+                        state.progress_offset_ms = max(-1000.0, min(1000.0, progress_offset))
+                last_poll_progress = art.progress_ms
+                last_poll_mono = fetch_time
+
                 with state_lock:
                     needs_download = art.key != state.art_key or art.image_url != state.image_url
                     is_new_track = art.key != last_track_key
 
-                image = download_image(art.image_url) if needs_download else None
+                image = (
+                    download_image(
+                        art.image_url,
+                        saturation=args.art_saturation,
+                        contrast=args.art_contrast,
+                    )
+                    if needs_download
+                    else None
+                )
 
                 with state_lock:
                     state.art_key = art.key
@@ -2491,11 +3359,16 @@ def poll_spotify(
                     log(f"Track: {art.title} — {art.artist}")
                     with state_lock:
                         state.lyrics = None
+                        state.lyrics_words = []
                         state.lyrics_track_key = None
+                        # Must reset too, or an instrumental followed by a vocal
+                        # track shows the visualizer until LRCLIB answers.
+                        state.is_instrumental = False
                     duration_s = max(1, art.duration_ms // 1000)
                     lyrics_thread = threading.Thread(
                         target=fetch_lyrics_async,
-                        args=(art.artist, art.title, art.album_name, duration_s, state, state_lock, art.key),
+                        args=(art.artist, art.title, art.album_name, duration_s,
+                              state, state_lock, art.key, args.lyrics_cache),
                         daemon=True,
                     )
                     lyrics_thread.start()
@@ -2564,12 +3437,36 @@ def poll_spotify(
 #  MAIN RUN LOOP
 # ═══════════════════════════════════════════════════════════════════
 
+def _install_signal_handlers() -> None:
+    """Turn SIGTERM/SIGINT into KeyboardInterrupt so cleanup actually runs.
+
+    systemd stops the service with SIGTERM, whose default action kills the
+    process outright — the `finally` block that calls display.clear() never
+    runs, so the panel stays frozen on its last frame after `systemctl stop`.
+    """
+    def _raise_interrupt(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    for sig_name in ("SIGTERM", "SIGINT", "SIGHUP"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue  # SIGHUP does not exist on Windows
+        try:
+            signal.signal(sig, _raise_interrupt)
+        except (OSError, ValueError):
+            pass
+
+
 def run(args: argparse.Namespace) -> None:
+    _install_signal_handlers()
+
     try:
         os.nice(-5)
         log("Process priority elevated (nice=-5)")
     except (OSError, PermissionError, AttributeError):
         log("Could not elevate process priority (not root, or Windows?)", "warn")
+
+    set_pixel_font(args.lyrics_font)
 
     if args.preview_frames:
         render_preview_frames(args.preview_frames)
@@ -2607,7 +3504,7 @@ def run(args: argparse.Namespace) -> None:
     display: MatrixDisplay | MockDisplay
     if args.mock_output:
         log("Matrix: Initializing Mock Display...")
-        display = MockDisplay(args.mock_output)
+        display = MockDisplay(args.mock_output, gamma=args.gamma)
     else:
         log("Matrix: Initializing hardware RGB Matrix...")
         display = MatrixDisplay(args)
@@ -2645,9 +3542,11 @@ def run(args: argparse.Namespace) -> None:
         spin_speed=args.rpm,
         text_scroll_speed=args.text_speed,
         brightness=args.brightness,
+        lyrics_style=args.lyrics_style,
         _default_brightness=args.brightness,
         _default_spin_speed=args.rpm,
         _default_text_scroll_speed=args.text_speed,
+        _default_lyrics_style=args.lyrics_style,
     )
     playback_lock = threading.Lock()
     stop_event = threading.Event()
@@ -2656,7 +3555,7 @@ def run(args: argparse.Namespace) -> None:
 
     poll_thread = threading.Thread(
         target=poll_spotify,
-        args=(spotify, playback_state, playback_lock, stop_event),
+        args=(spotify, playback_state, playback_lock, stop_event, args),
         daemon=True,
     )
     poll_thread.start()
@@ -2664,11 +3563,14 @@ def run(args: argparse.Namespace) -> None:
     angle = 0.0
     scroll_x = 0.0
     last_frame = time.monotonic()
+    idle_fps = min(args.fps, args.idle_fps)
 
     prev_art_key: str | None = None
     last_art_image: Image.Image | None = None
+    last_art_key: str | None = None
     last_display_text: str = ""
     old_art_image: Image.Image | None = None
+    old_art_key: str | None = None
     old_angle: float = 0.0
     old_scroll_x: float = 0.0
     old_display_text: str = ""
@@ -2688,6 +3590,7 @@ def run(args: argparse.Namespace) -> None:
     spin_from_rpm: float = 0.0
 
     last_brightness: int = args.brightness
+    eased_brightness: float = float(args.brightness)
 
     # Default mode auto-cycle state
     default_cd_start: float = 0.0  # when the CD phase started
@@ -2715,18 +3618,37 @@ def run(args: argparse.Namespace) -> None:
                 is_instrumental = playback_state.is_instrumental
                 lyrics_lead_ms = playback_state.lyrics_lead_ms
                 accent_color = playback_state.accent_color
+                # These were previously read outside the lock at the render call
+                # sites, inconsistently with every other field here.
+                lyrics_style = playback_state.lyrics_style
+                smart_scroll = playback_state.smart_scroll
+                current_lyrics_words = playback_state.lyrics_words
+                progress_offset_ms = playback_state.progress_offset_ms
+                lyrics_font_size = (
+                    playback_state.scroll_font_size
+                    if playback_state.lyrics_style in ("scroll", "karaoke")
+                    else playback_state.pop_font_size
+                )
 
             now = time.monotonic()
             delta = now - last_frame
             last_frame = now
 
-            # Apply runtime brightness if changed
-            if runtime_brightness != last_brightness:
-                try:
-                    display.set_brightness(runtime_brightness)
-                except Exception:
-                    pass
-                last_brightness = runtime_brightness
+            # Ease brightness toward the target instead of snapping. Also lets
+            # scheduled dimming fade in rather than visibly stepping.
+            if abs(eased_brightness - runtime_brightness) > 0.01:
+                step = BRIGHTNESS_RAMP_PER_SEC * delta
+                gap = runtime_brightness - eased_brightness
+                eased_brightness += max(-step, min(step, gap))
+                if abs(runtime_brightness - eased_brightness) < 0.5:
+                    eased_brightness = float(runtime_brightness)
+                applied = int(round(eased_brightness))
+                if applied != last_brightness:
+                    try:
+                        display.set_brightness(applied)
+                    except Exception:
+                        pass
+                    last_brightness = applied
 
             # ══════════════════════════════════════════════════
             #  MODE ROUTING
@@ -2742,7 +3664,9 @@ def run(args: argparse.Namespace) -> None:
                 display.show(frame)
                 if args.once:
                     break
-                sleep_for = max(0.0, (1.0 / args.fps) - (time.monotonic() - frame_start))
+                # A single still image does not need to be re-sent 20x/second.
+                slate_fps = args.fps if len(frames) > 1 else args.static_fps
+                sleep_for = max(0.0, (1.0 / slate_fps) - (time.monotonic() - frame_start))
                 time.sleep(sleep_for)
                 continue
 
@@ -2754,7 +3678,7 @@ def run(args: argparse.Namespace) -> None:
                 display.show(frame)
                 if args.once:
                     break
-                sleep_for = max(0.0, (1.0 / args.fps) - (time.monotonic() - frame_start))
+                sleep_for = max(0.0, (1.0 / idle_fps) - (time.monotonic() - frame_start))
                 time.sleep(sleep_for)
                 continue
 
@@ -2765,12 +3689,14 @@ def run(args: argparse.Namespace) -> None:
                 frame = render_lyrics(
                     size, current_lyrics, stored_duration_ms,
                     is_playing, fetch_time, stored_progress_ms,
-                    playback_state.lyrics_style,
-                    playback_state.smart_scroll,
-                    playback_state.scroll_font_size if playback_state.lyrics_style == "scroll" else playback_state.pop_font_size,
+                    lyrics_style, smart_scroll, lyrics_font_size,
                     is_instrumental=is_instrumental,
                     lyrics_lead_ms=lyrics_lead_ms,
                     accent_color=accent_color,
+                    track_key=current_art_key,
+                    lyrics_words=current_lyrics_words,
+                    crisp=not args.no_crisp_text,
+                    progress_offset_ms=progress_offset_ms,
                 )
                 display.show(frame)
                 if args.once:
@@ -2804,19 +3730,21 @@ def run(args: argparse.Namespace) -> None:
                     display.show(frame)
                     if args.once:
                         break
-                    sleep_for = max(0.0, (1.0 / args.fps) - (time.monotonic() - frame_start))
+                    sleep_for = max(0.0, (1.0 / idle_fps) - (time.monotonic() - frame_start))
                     time.sleep(sleep_for)
                     continue
                 elif effective == "lyrics":
                     frame = render_lyrics(
                         size, current_lyrics, stored_duration_ms,
                         is_playing, fetch_time, stored_progress_ms,
-                        playback_state.lyrics_style,
-                        playback_state.smart_scroll,
-                        playback_state.scroll_font_size if playback_state.lyrics_style == "scroll" else playback_state.pop_font_size,
+                        lyrics_style, smart_scroll, lyrics_font_size,
                         is_instrumental=is_instrumental,
                         lyrics_lead_ms=lyrics_lead_ms,
                         accent_color=accent_color,
+                        track_key=current_art_key,
+                        lyrics_words=current_lyrics_words,
+                        crisp=not args.no_crisp_text,
+                        progress_offset_ms=progress_offset_ms,
                     )
                     display.show(frame)
                     if args.once:
@@ -2842,6 +3770,7 @@ def run(args: argparse.Namespace) -> None:
             # Detect track change
             if prev_art_key is not None and current_art_key != prev_art_key and args.transition != "none":
                 old_art_image = last_art_image
+                old_art_key = last_art_key
                 old_angle = angle
                 old_scroll_x = scroll_x
                 old_display_text = last_display_text
@@ -2858,6 +3787,7 @@ def run(args: argparse.Namespace) -> None:
                         idle_since = now
                     elif now - idle_since >= 5.0 and not is_idle_state:
                         old_art_image = last_art_image
+                        old_art_key = last_art_key
                         old_angle = angle
                         old_scroll_x = scroll_x
                         old_display_text = last_display_text
@@ -2870,6 +3800,7 @@ def run(args: argparse.Namespace) -> None:
                     idle_since = None
                     if is_idle_state:
                         old_art_image = last_art_image
+                        old_art_key = last_art_key
                         old_angle = angle
                         old_scroll_x = scroll_x
                         old_display_text = last_display_text
@@ -2882,6 +3813,7 @@ def run(args: argparse.Namespace) -> None:
 
             prev_art_key = current_art_key
             last_art_image = current_art_image
+            last_art_key = current_art_key
             last_display_text = display_text
 
             # Spin easing
@@ -2906,11 +3838,11 @@ def run(args: argparse.Namespace) -> None:
                 scroll_x += runtime_text_speed * delta
 
             if is_idle_state:
-                new_frame = render_clock(size, is_connected)
+                new_frame = render_clock(size, is_connected, accent_color)
             else:
                 new_frame = create_full_frame(
                     current_art_image, angle, scroll_x, display_text,
-                    size_x, size_y, args,
+                    size_x, size_y, args, art_key=current_art_key,
                 )
 
             if transition_active and current_transition_mode != "none":
@@ -2923,14 +3855,14 @@ def run(args: argparse.Namespace) -> None:
                     frame = new_frame
                 else:
                     if old_is_idle:
-                        old_frame = render_clock(size)
+                        old_frame = render_clock(size, is_connected, accent_color)
                     else:
                         if is_playing and not is_idle_state:
                             old_angle = (old_angle - 360.0 * (runtime_rpm / 60.0) * delta) % 360.0
                         old_scroll_x += runtime_text_speed * delta
                         old_frame = create_full_frame(
                             old_art_image, old_angle, old_scroll_x, old_display_text,
-                            size_x, size_y, args,
+                            size_x, size_y, args, art_key=old_art_key,
                         )
                     frame = blend_frames(old_frame, new_frame, progress, mode=current_transition_mode)
             else:
@@ -2941,17 +3873,31 @@ def run(args: argparse.Namespace) -> None:
             if args.once:
                 break
 
-            sleep_for = max(0.0, (1.0 / args.fps) - (time.monotonic() - frame_start))
+            # CD mode settled into its idle clock is as static as clock mode.
+            frame_fps = idle_fps if (is_idle_state and not transition_active) else args.fps
+            sleep_for = max(0.0, (1.0 / frame_fps) - (time.monotonic() - frame_start))
             time.sleep(sleep_for)
 
     except KeyboardInterrupt:
-        pass
+        log("Shutting down...")
     finally:
+        # Best-effort: every step here must run even if an earlier one fails,
+        # otherwise a partial shutdown leaves the panel lit.
         stop_event.set()
         if control_server:
-            control_server.shutdown()
-        poll_thread.join(timeout=1)
-        display.clear()
+            try:
+                control_server.shutdown()
+                control_server.server_close()
+            except Exception:
+                pass
+        try:
+            poll_thread.join(timeout=1)
+        except Exception:
+            pass
+        try:
+            display.clear()
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3000,8 +3946,42 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-hardware-pulse", action="store_true",
                         help="Avoid Pi onboard sound conflict.")
     parser.add_argument("--fps", type=positive_float, default=20.0)
-    parser.add_argument("--rpm", type=positive_float, default=10.0)
+    parser.add_argument("--rpm", type=positive_float, default=33.333,
+                        help="Disc rotation speed. 33.333 is a real LP.")
+    parser.add_argument("--idle-fps", type=positive_float, default=10.0,
+                        help="Frame rate for the clock/idle screen. Only the second "
+                             "dot and pulse animate, so full FPS is wasted CPU.")
+    parser.add_argument("--static-fps", type=positive_float, default=2.0,
+                        help="Frame rate for a non-animated Custom Slate image.")
+    parser.add_argument("--gamma", type=float, default=1.0,
+                        help="Gamma correction for the panel (1.0 = off). LEDs are "
+                             "linear but sRGB is not; try 1.8. Leave at 1.0 if your "
+                             "rgbmatrix build already applies CIE1931 correction.")
+    parser.add_argument("--art-saturation", type=float, default=1.15,
+                        help="Saturation multiplier applied to album art at download "
+                             "time (1.0 = off).")
+    parser.add_argument("--art-contrast", type=float, default=1.08,
+                        help="Contrast multiplier applied to album art at download "
+                             "time (1.0 = off).")
     parser.add_argument("--token-cache", type=Path, default=Path(".cache/spotify_token.json"))
+    parser.add_argument("--lyrics-cache", type=Path, default=Path(".cache/lyrics"),
+                        help="Directory for cached LRCLIB responses. Replays become "
+                             "instant and LRCLIB stops being re-queried.")
+    parser.add_argument("--lyrics-font", default=None,
+                        help="Path to a pixel/bitmap TTF (e.g. PixelOperator8.ttf, or "
+                             "a converted 5x7.bdf from rpi-rgb-led-matrix/fonts/). "
+                             "Renders far crisper than the anti-aliased default.")
+    parser.add_argument("--text-threshold", type=int, default=CRISP_THRESHOLD,
+                        help="Alpha cutoff (0-255) when removing font anti-aliasing. "
+                             "Lower keeps more of each stroke; raise it only if your "
+                             "font renders too heavy.")
+    parser.add_argument("--no-crisp-text", action="store_true",
+                        help="Keep font anti-aliasing in lyrics. AA puts glyph edges "
+                             "on half-lit LEDs, so it is thresholded off by default.")
+    parser.add_argument("--lyrics-style", choices=["karaoke", "scroll", "pop"],
+                        default="karaoke",
+                        help="Startup lyrics style. 'karaoke' word-wraps the whole "
+                             "line and lights words as they are sung.")
     parser.add_argument("--mock-output", type=Path,
                         help="Write the current frame PNG instead of using RGB matrix hardware.")
     parser.add_argument("--preview-frames", type=Path,
