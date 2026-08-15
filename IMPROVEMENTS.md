@@ -226,27 +226,10 @@ catches `(TypeError, ValueError)` and returns 400.
 
 ### ⏸️ B16. World-writable token cache
 
-> **Deferred to Phase 5 on purpose.** The atomic-write half of this (B2) is
-> done, but the `chmod` is deliberately held back: `--auth-only` runs as your
-> login user while the systemd service runs as root, and both read and rewrite
-> this file. Tightening to `0600` without *also* making the service non-root
-> would break re-authorization. The code carries a comment saying exactly this,
-> so it cannot be tightened by accident.
-
-`_save_token` (L305–309) chmods the token file to `0o666` and its directory to
-`0o777`. That file holds a **Spotify refresh token** — a long-lived credential.
-Any local user or process can read or replace it.
-
-This is presumably to let both `sudo` runs (via `matrix_control.ps1` manual
-mode) and plain-user runs share the cache. Better: pick one identity. Run the
-service as user `adi` with `AmbientCapabilities=CAP_SYS_NICE` (and the GPIO
-group) instead of root, and chmod `0o600`.
+>dont do this
 
 ### ⬜ B17. Web panel is unauthenticated on `0.0.0.0`
-Bound to all interfaces (L2407) with no auth. Anyone on the LAN can change modes,
-brightness, cast images, and read logs. For a home LAN this is a defensible
-choice — but it should be a *choice*: add `--web-bind` (default `0.0.0.0`) and
-an optional `--web-token` checked against a header or `?k=` query param.
+idc abt this either
 
 ### ✅ B18. LRCLIB 404 is logged as a failure
 `fetch_lyrics` (L980–982) catches everything with a bare `except Exception`.
@@ -573,7 +556,7 @@ display feel reactive to the music.
 ### ⬜ F8. Night mode / scheduled brightness
 Auto-dim (or blank) between configurable hours. For a bedroom device this is the
 difference between usable and unplugged. Add `--night-start`, `--night-end`,
-`--night-brightness`, exposed in the panel.
+`--night-brightness`, exposed in the panel. NOT NEEDED
 
 ### ⬜ F9. Full-bleed album art mode
 A fifth mode: the artwork filling all 64×64 with a 1 px progress bar. No disc
@@ -582,7 +565,7 @@ to render.
 
 ### ⬜ F10. Progress ring around the vinyl
 In CD view, draw a thin arc around the disc showing track position. Uses data
-you already have, adds real information density to the flagship view.
+you already have, adds real information density to the flagship view. YES PLEASE
 
 ### ⬜ F11. Boot / error status screen
 If Spotify auth fails today, the process exits and the matrix goes black — on a
@@ -593,7 +576,7 @@ diagnosis.
 ### ⬜ F12. Actually implement the scrolling text message
 README promises it (B30). A `POST /api/message {text, duration}` that scrolls
 arbitrary text across the matrix is ~30 lines given `draw_scrolling_text`
-already exists, and closes a documentation gap.
+already exists, and closes a documentation gap. NOT NEEDED
 
 ---
 
@@ -734,6 +717,7 @@ they're all direct pixel writes at 64×64:
 Add `--idle-mode {clock,rain,plasma,stars,life,fire,cycle}` plus a web selector,
 where `cycle` rotates every few minutes. Each is 20–40 lines. This is high
 visual payoff for low effort and low risk — nothing else depends on it.
+MAKE it all options available on the website however I want it so that one mode is set to what it is now between the clock, the cd and lyrics, and ther ecan be another mode that does these idle effects, basically somedays i might want clock to be the idle one, in that case i click on this mode (how it works now. clock is idle, when music playing it does cd and then lyrics and when idle agian back to clock when no music) u can add other modes to implement all this and also an option called idle where i can pick one of these idle visuals to show up just how when i click clock or lyrics or smth on the website it perma shows up.
 
 ### ⬜ V7. Weather on the clock face
 Open-Meteo needs **no API key**:
