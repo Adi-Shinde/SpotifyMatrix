@@ -1136,6 +1136,8 @@ def render_record(
     angle: float,
     size: int,
     art_key: str | None = None,
+    progress: float | None = None,
+    accent_color: tuple[int, int, int] = SPOTIFY_GREEN,
 ) -> Image.Image:
     frame = Image.new("RGBA", (size, size), (0, 0, 0, 255))
     if art is None:
@@ -1150,6 +1152,16 @@ def render_record(
 
     draw = ImageDraw.Draw(frame, "RGBA")
     draw.ellipse((0, 0, size - 1, size - 1), outline=(220, 220, 220, 200), width=1)
+
+    # Track position as an arc on the bezel. The disc already has a rim, so
+    # this costs no space — the played portion simply lights up in the accent
+    # colour, which reads at a glance without adding another element.
+    if progress is not None and 0.0 <= progress <= 1.0:
+        draw.arc(
+            (0, 0, size - 1, size - 1),
+            start=-90, end=-90 + 360 * progress,
+            fill=accent_color + (255,), width=2,
+        )
 
     center = size // 2
     label_radius = max(3, size // 16)
@@ -1166,6 +1178,134 @@ def render_record(
         fill=(0, 0, 0, 255),
     )
     return frame.convert("RGB")
+
+
+_accent_extract_cache: dict[str, tuple[int, int, int]] = {}
+
+
+def extract_accent_color(
+    art: Image.Image, art_key: str | None = None
+) -> tuple[int, int, int]:
+    """Pick a vivid, panel-legible accent colour out of the artwork.
+
+    Downscales hard first — at 16x16 the image is already a colour summary, and
+    picking from 256 pixels costs nothing once per track. Scores by saturation
+    times value so a large dull background loses to a small vivid element,
+    which is what the eye picks out of the cover anyway. Value is then floored,
+    because a colour that is legible on a screen can be invisible on LEDs.
+    """
+    if art_key is not None:
+        cached = _accent_extract_cache.get(art_key)
+        if cached is not None:
+            return cached
+
+    thumb = art.convert("RGB").resize((16, 16), Image.Resampling.BILINEAR)
+    buckets: dict[int, list[float]] = {}
+
+    for r, g, b in thumb.getdata():
+        h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+        if v < 0.15:
+            continue  # near-black tells us nothing about the cover's colour
+        # Group by hue so many similar pixels reinforce each other instead of
+        # each competing as an individual candidate.
+        bucket = int(h * 24) % 24
+        weight = s * v
+        entry = buckets.setdefault(bucket, [0.0, 0.0, 0.0, 0.0])
+        entry[0] += weight
+        entry[1] += h * weight
+        entry[2] += s * weight
+        entry[3] += v * weight
+
+    if not buckets:
+        return SPOTIFY_GREEN
+
+    best = max(buckets.values(), key=lambda entry: entry[0])
+    total = best[0] or 1.0
+    hue, sat, val = best[1] / total, best[2] / total, best[3] / total
+
+    # Push toward something the panel can actually show: weak colours read as
+    # grey once they are 64 dim LEDs.
+    sat = max(0.55, min(1.0, sat * 1.25))
+    val = max(0.75, min(1.0, val * 1.3))
+    r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
+    colour = (int(r * 255), int(g * 255), int(b * 255))
+
+    if art_key is not None:
+        if len(_accent_extract_cache) > 32:
+            _accent_extract_cache.clear()
+        _accent_extract_cache[art_key] = colour
+    return colour
+
+
+def render_full_art(
+    art: Image.Image | None,
+    size: int,
+    art_key: str | None = None,
+    progress: float | None = None,
+    accent_color: tuple[int, int, int] = SPOTIFY_GREEN,
+    pan: bool = True,
+    pan_phase: float = 0.0,
+) -> Image.Image:
+    """Artwork filling the whole panel, with a hairline progress bar.
+
+    The simplest mode and often the best-looking one: no disc crop, no
+    rotation, just the cover at the panel's native size. With `pan` it drifts
+    and breathes slowly (Ken Burns), which keeps a paused screen from reading
+    as frozen.
+    """
+    if art is None:
+        return render_idle(size)
+
+    if pan:
+        # Oversample, then crop a slowly moving window out of it. Zoom and
+        # drift are on different periods so the motion never visibly loops.
+        over = int(size * 1.18)
+        big = _get_fitted_art(art, f"{art_key}:pan" if art_key else None, over)
+        zoom = 1.0 + 0.045 * math.sin(pan_phase * 0.10)
+        window = max(size, min(over, int(size * zoom)))
+        slack = over - window
+        offset_x = int(slack * (0.5 + 0.5 * math.sin(pan_phase * 0.07)))
+        offset_y = int(slack * (0.5 + 0.5 * math.cos(pan_phase * 0.045)))
+        crop = big.crop((offset_x, offset_y, offset_x + window, offset_y + window))
+        frame = crop.resize((size, size), Image.Resampling.BILINEAR).convert("RGB")
+    else:
+        frame = _get_fitted_art(art, art_key, size).convert("RGB")
+
+    if progress is not None and 0.0 <= progress <= 1.0:
+        draw = ImageDraw.Draw(frame)
+        y = size - 1
+        # Dim the untravelled part rather than leaving it bare, so the bar is
+        # readable over a light-coloured cover.
+        draw.line((0, y, size - 1, y), fill=(28, 28, 28))
+        filled = int((size - 1) * progress)
+        if filled > 0:
+            draw.line((0, y, filled, y), fill=accent_color)
+    return frame
+
+
+# How long the new-track border pulse lasts.
+TRACK_FLASH_SECONDS = 0.9
+
+
+def apply_track_flash(
+    image: Image.Image, strength: float, accent: tuple[int, int, int]
+) -> Image.Image:
+    """Pulse a 1px accent border — a peripheral "the song changed" cue.
+
+    Drawn on the frame the panel is about to show rather than as a mode of its
+    own, so it works the same whichever view is up. Mutates a copy: the caller
+    may still be holding the original for a transition blend.
+    """
+    if strength <= 0.0:
+        return image
+    # Ease out, so it reads as a flash decaying rather than a border that
+    # switches off.
+    k = max(0.0, min(1.0, strength)) ** 0.6
+    out = image.copy()
+    draw = ImageDraw.Draw(out)
+    colour = tuple(int(c * k) for c in accent)
+    draw.rectangle((0, 0, out.width - 1, out.height - 1), outline=colour, width=1)
+    return out
 
 
 def render_idle(size: int) -> Image.Image:
@@ -1864,6 +2004,8 @@ def create_full_frame(
     size_y: int,
     args: argparse.Namespace,
     art_key: str | None = None,
+    progress: float | None = None,
+    accent_color: tuple[int, int, int] = SPOTIFY_GREEN,
 ) -> Image.Image:
     has_text = bool(display_text) and not args.no_text
     if has_text:
@@ -1877,7 +2019,7 @@ def create_full_frame(
         cd_size = min(size_x, size_y)
 
     cd_img = (
-        render_record(art_image, angle, cd_size, art_key)
+        render_record(art_image, angle, cd_size, art_key, progress, accent_color)
         if art_image
         else render_idle(cd_size)
     )
@@ -3844,6 +3986,18 @@ def start_control_server(
                         outer_state.accent_color = (r, g, b)
                     log(f"Accent color set to custom ({r},{g},{b})")
                     self._send_json({"ok": True, "accent_name": "custom"})
+                elif val == "auto":
+                    # Follow the album art. Resolve immediately from whatever is
+                    # playing so the change is visible now rather than at the
+                    # next track.
+                    with outer_lock:
+                        outer_state.accent_name = "auto"
+                        if outer_state.image is not None:
+                            outer_state.accent_color = extract_accent_color(
+                                outer_state.image, outer_state.art_key
+                            )
+                    log("Accent color following album art")
+                    self._send_json({"ok": True, "accent_name": "auto"})
                 elif val in COLOR_THEMES:
                     with outer_lock:
                         outer_state.accent_name = val
@@ -4134,6 +4288,8 @@ def poll_spotify(
     last_poll_mono = 0.0
     progress_offset = 0.0
     consecutive_failures = 0
+    # One entry, keyed by track: "have we already looked up what follows this".
+    queue_fetched_for: dict[str, bool] = {}
 
     while not stop_event.is_set():
         try:
@@ -4163,6 +4319,26 @@ def poll_spotify(
                 if remaining_ms < 10000:
                     current_wait = max(1.5, remaining_ms / 5000.0)
                     log(f"Spotify: Near track end. Accelerated poll rate: {current_wait:.1f}s", verbose=True)
+                    # Piggyback the queue lookup on the poll we are already
+                    # accelerating, so "up next" costs one extra request per
+                    # track rather than one per poll.
+                    if args.enable_queue_peek and not queue_fetched_for.get(art.key):
+                        queue_fetched_for.clear()
+                        queue_fetched_for[art.key] = True
+                        try:
+                            queue = spotify.get_queue()
+                        except Exception as exc:
+                            queue = []
+                            log(f"Queue peek unavailable: {exc}", verbose=True)
+                        upcoming = ""
+                        if queue:
+                            nxt = queue[0] or {}
+                            name = nxt.get("name") or ""
+                            artists = nxt.get("artists") or []
+                            who = artists[0].get("name", "") if artists else ""
+                            upcoming = f"{name} · {who}".strip(" ·") if name else ""
+                        with state_lock:
+                            state.queue_next = upcoming
                 elif art.progress_ms < 30000 and art.duration_ms > 120000:
                     current_wait = min(10.0, active_seconds * 1.5)
                     log(f"Spotify: Track just started. Backed off poll rate: {current_wait:.1f}s", verbose=True)
@@ -4217,6 +4393,13 @@ def poll_spotify(
                     state.fetch_time = fetch_time
                     if image is not None:
                         state.image = image
+                    # Follow the artwork when the accent is set to "auto".
+                    # Derived here rather than in the render loop because it
+                    # only changes when the artwork does.
+                    if state.accent_name == "auto" and state.image is not None:
+                        state.accent_color = extract_accent_color(
+                            state.image, state.art_key
+                        )
 
                 if is_new_track and art.key:
                     last_track_key = art.key
@@ -4228,6 +4411,8 @@ def poll_spotify(
                         # Must reset too, or an instrumental followed by a vocal
                         # track shows the visualizer until LRCLIB answers.
                         state.is_instrumental = False
+                        # Belongs to the track that just ended.
+                        state.queue_next = ""
                     duration_s = max(1, art.duration_ms // 1000)
                     lyrics_thread = threading.Thread(
                         target=fetch_lyrics_async,
@@ -4478,8 +4663,22 @@ def run(args: argparse.Namespace) -> None:
     )
     poll_thread.start()
 
+    flash_until: float = 0.0
+    flash_last_key: str | None = None
+
     def present(image: Image.Image) -> None:
-        """Push a frame to the panel and keep it for the web preview."""
+        """Push a frame to the panel and keep it for the web preview.
+
+        Also where the new-track flash is applied, so every mode gets it
+        without each render path having to know about it.
+        """
+        if flash_until > 0.0:
+            remaining = flash_until - time.monotonic()
+            if remaining > 0.0:
+                image = apply_track_flash(
+                    image, remaining / TRACK_FLASH_SECONDS,
+                    playback_state.accent_color,
+                )
         display.show(image)
         playback_state.last_frame = image
 
@@ -4566,6 +4765,24 @@ def run(args: argparse.Namespace) -> None:
             now = time.monotonic()
             delta = now - last_frame
             last_frame = now
+
+            # Live track position, extrapolated from the last poll so the ring
+            # and bar advance smoothly instead of stepping once per poll.
+            if stored_duration_ms > 0 and fetch_time > 0:
+                elapsed_ms = (now - fetch_time) * 1000.0 if is_playing else 0.0
+                track_progress: float | None = max(0.0, min(
+                    1.0, (stored_progress_ms + elapsed_ms) / stored_duration_ms
+                ))
+            else:
+                track_progress = None
+            ring_progress = track_progress if show_progress_ring else None
+
+            # Track change, detected once for every mode. The CD path has its
+            # own transition bookkeeping further down; this is only the flash.
+            if current_art_key != flash_last_key:
+                if flash_last_key is not None and current_art_key is not None:
+                    flash_until = now + TRACK_FLASH_SECONDS
+                flash_last_key = current_art_key
 
             # Ease brightness toward the target instead of snapping. Also lets
             # scheduled dimming fade in rather than visibly stepping.
@@ -4671,6 +4888,31 @@ def run(args: argparse.Namespace) -> None:
                 if args.once:
                     break
                 sleep_for = max(0.0, (1.0 / args.fps) - (time.monotonic() - frame_start))
+                time.sleep(sleep_for)
+                continue
+
+            # --- STICKY: Full-bleed album art ---
+            if display_mode == "art":
+                with playback_lock:
+                    playback_state.effective_mode = "art"
+                if current_art_image is None:
+                    frame = idle_screen.render(
+                        size, idle_mode, is_connected, accent_color, delta, now,
+                    )
+                else:
+                    frame = render_full_art(
+                        current_art_image, size, current_art_key,
+                        progress=track_progress,
+                        accent_color=accent_color,
+                        pan=art_pan and is_playing,
+                        pan_phase=now,
+                    )
+                present(frame)
+                if args.once:
+                    break
+                # A still cover needs no frame budget; a panning one does.
+                art_fps = args.fps if (art_pan and is_playing) else args.static_fps
+                sleep_for = max(0.0, (1.0 / art_fps) - (time.monotonic() - frame_start))
                 time.sleep(sleep_for)
                 continue
 
@@ -4819,6 +5061,7 @@ def run(args: argparse.Namespace) -> None:
                 new_frame = create_full_frame(
                     current_art_image, angle, scroll_x, display_text,
                     size_x, size_y, args, art_key=current_art_key,
+                    progress=ring_progress, accent_color=accent_color,
                 )
 
             if transition_active and current_transition_mode != "none":
@@ -4842,6 +5085,7 @@ def run(args: argparse.Namespace) -> None:
                         old_frame = create_full_frame(
                             old_art_image, old_angle, old_scroll_x, old_display_text,
                             size_x, size_y, args, art_key=old_art_key,
+                            progress=ring_progress, accent_color=accent_color,
                         )
                     frame = blend_frames(old_frame, new_frame, progress, mode=current_transition_mode)
             else:
