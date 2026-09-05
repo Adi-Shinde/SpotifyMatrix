@@ -1,0 +1,11 @@
+# The Pi pulls this repo directly. Files it consumes as Linux config or
+# scripts must arrive with LF endings — systemd will not parse a unit file
+# with CRLF, and the failure mode is a cryptic startup error.
+*.service          text eol=lf
+*.service.template text eol=lf
+*.sh               text eol=lf
+requirements.txt   text eol=lf
+*.py               text eol=lf
+
+# Windows-only; leave it alone.
+*.ps1              text eol=crlf

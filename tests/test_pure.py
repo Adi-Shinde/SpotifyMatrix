@@ -202,9 +202,16 @@ def test_settings_round_trip(tmp_path):
     assert restored.cd_duration == 25.0
 
 
+def _write_settings(path, body: dict) -> None:
+    """Write a settings file stamped with the current schema version."""
+    import json
+    body.setdefault("version", sm.SETTINGS_VERSION)
+    path.write_text(json.dumps(body))
+
+
 def test_settings_clamps_out_of_range_values(tmp_path):
     path = tmp_path / "settings.json"
-    path.write_text('{"brightness": 99999, "cd_duration": -5}')
+    _write_settings(path, {"brightness": 99999, "cd_duration": -5})
     state = sm.SharedPlaybackState()
     sm.apply_saved_settings(path, state)
     assert state.brightness == 100
@@ -213,7 +220,7 @@ def test_settings_clamps_out_of_range_values(tmp_path):
 
 def test_settings_rejects_unknown_enum_values(tmp_path):
     path = tmp_path / "settings.json"
-    path.write_text('{"idle_mode": "../../etc/passwd", "lyrics_style": "nope"}')
+    _write_settings(path, {"idle_mode": "../../etc/passwd", "lyrics_style": "nope"})
     state = sm.SharedPlaybackState()
     sm.apply_saved_settings(path, state)
     assert state.idle_mode == "clock"
@@ -223,10 +230,36 @@ def test_settings_rejects_unknown_enum_values(tmp_path):
 def test_settings_never_restores_custom_slate_mode(tmp_path):
     """The slate image is not persisted, so booting into it shows nothing."""
     path = tmp_path / "settings.json"
-    path.write_text('{"display_mode": "custom"}')
+    _write_settings(path, {"display_mode": "custom"})
     state = sm.SharedPlaybackState()
     sm.apply_saved_settings(path, state)
     assert state.display_mode == "default"
+
+
+def test_settings_from_a_foreign_schema_is_ignored_wholesale(tmp_path):
+    """A real file from an earlier experiment was found in .cache/.
+
+    Its keys partly overlap ours ('idle_mode': 'plasma') but 'display_mode'
+    was 'auto_screensaver', which means nothing here. Half-applying it would
+    bring the panel up looking wrong with nothing to explain why.
+    """
+    path = tmp_path / "settings.json"
+    path.write_text(
+        '{"brightness": 82, "display_mode": "auto_screensaver",'
+        ' "idle_mode": "plasma", "spin_speed": 45.0, "saved_at": 1787638199.0}'
+    )
+    state = sm.SharedPlaybackState()
+    assert sm.apply_saved_settings(path, state) is False
+    assert state.idle_mode == "clock"
+    assert state.brightness == 65
+    assert state.spin_speed == 10.0
+
+
+def test_saved_settings_carry_a_version(tmp_path):
+    import json
+    path = tmp_path / "settings.json"
+    sm.save_settings(path, sm.SharedPlaybackState(), threading.Lock())
+    assert json.loads(path.read_text())["version"] == sm.SETTINGS_VERSION
 
 
 def test_settings_survives_a_corrupt_file(tmp_path):

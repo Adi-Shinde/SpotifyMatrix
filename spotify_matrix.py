@@ -271,6 +271,13 @@ PERSISTED_FIELDS: tuple[str, ...] = (
     "art_pan",
 )
 
+# Bumped whenever the meaning of a saved field changes. A file from a
+# different schema is ignored wholesale rather than half-applied: keys that
+# happen to overlap would otherwise restore a display state the rest of the
+# file no longer describes, and the panel comes up looking wrong for reasons
+# nothing explains.
+SETTINGS_VERSION = 1
+
 # How long to wait after the last change before writing. Dragging a slider
 # fires a request per step; without this the SD card takes the whole sweep.
 SETTINGS_DEBOUNCE_SECONDS = 2.0
@@ -320,7 +327,8 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def save_settings(path: Path, state: SharedPlaybackState, lock: threading.Lock) -> None:
     with lock:
-        payload = {name: getattr(state, name) for name in PERSISTED_FIELDS}
+        payload: dict[str, Any] = {name: getattr(state, name) for name in PERSISTED_FIELDS}
+    payload["version"] = SETTINGS_VERSION
     # Tuples survive a round-trip as lists; normalise now so the loader does not
     # have to care which it is reading.
     accent = payload.get("accent_color")
@@ -349,6 +357,15 @@ def apply_saved_settings(path: Path, state: SharedPlaybackState) -> bool:
         return False
 
     if not isinstance(data, dict):
+        return False
+
+    if data.get("version") != SETTINGS_VERSION:
+        log(
+            f"Settings: {path} is from a different format "
+            f"(version {data.get('version')!r}) — starting from defaults. "
+            "It will be overwritten on the next change.",
+            "warn",
+        )
         return False
 
     def _clamp(value: Any, lo: float, hi: float, cast: Any) -> Any | None:
@@ -5192,6 +5209,10 @@ def run(args: argparse.Namespace) -> None:
             if is_sleeping:
                 if not was_sleeping:
                     display.clear()
+                    # Keep the web preview honest: the panel is dark, so the
+                    # preview must be too rather than serving the last frame
+                    # from before the switch.
+                    playback_state.last_frame = Image.new("RGB", (size_x, size_y), (0, 0, 0))
                     was_sleeping = True
                     log("Panel asleep")
                 if args.once:
