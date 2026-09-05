@@ -14,13 +14,21 @@ if (Test-Path ".env") {
     }
 }
 
+# PI_HOST is the ssh target, e.g. adi@matrixspot.local. It used to be
+# required, validated, and then ignored — every ssh call hardcoded the host.
+# PI_PASS is gone entirely: this script authenticates with keys, so storing a
+# plaintext password in .env bought nothing and leaked a credential.
 $PI_HOST = $env:PI_HOST
-$PI_PASS = $env:PI_PASS
 
-if (-not $PI_HOST -or -not $PI_PASS) {
-    Write-Host "Error: PI_HOST or PI_PASS not set in .env" -ForegroundColor Red
+if (-not $PI_HOST) {
+    Write-Host "Error: PI_HOST not set in .env (expected e.g. adi@matrixspot.local)" -ForegroundColor Red
     exit 1
 }
+
+# Accept a bare hostname too, so an existing .env without the user still works.
+if ($PI_HOST -notmatch '@') { $PI_HOST = "adi@$PI_HOST" }
+$PI_USER = ($PI_HOST -split '@')[0]
+$PI_NAME = ($PI_HOST -split '@')[1]
 $PI_DIR = "~/Documents/SpotifyMatrix"
 $SERVICE = "spotifymatrix.service"
 $EXECSTART_BASE = "/home/adi/Documents/SpotifyMatrix/.venv/bin/python3 spotify_matrix.py --rows 64 --cols 64 --chain-length 1 --parallel 1 --gpio-slowdown 5 --no-hardware-pulse --hardware-mapping adafruit-hat-pwm --pwm-bits 9 --limit-refresh-rate-hz 200"
@@ -32,7 +40,8 @@ function Write-Header {
     Write-Host ""
     Write-Host "  +====================================================+" -ForegroundColor Cyan
     Write-Host "  |       [*]  SPOTIFY MATRIX CONTROL PANEL  [*]      |" -ForegroundColor Cyan
-    Write-Host "  |           Pi: matrixspot.local (adi)               |" -ForegroundColor DarkCyan
+    $hostLine = ("  |  Pi: $PI_NAME ($PI_USER)").PadRight(55) + "|"
+    Write-Host $hostLine -ForegroundColor DarkCyan
     Write-Host "  +====================================================+" -ForegroundColor Cyan
     Write-Host ""
 }
@@ -67,7 +76,7 @@ function Open-SshWindow {
     $content = @"
 `$Host.UI.RawUI.WindowTitle = '$WindowTitle'
 `$remoteCmd = '$psEscaped'
-& ssh -o StrictHostKeyChecking=no -t adi@matrixspot.local `$remoteCmd
+& ssh -o StrictHostKeyChecking=no -t $PI_HOST `$remoteCmd
 Write-Host ''
 Write-Host '[Session ended - press Enter to close]' -ForegroundColor DarkGray
 Read-Host
@@ -82,8 +91,26 @@ Read-Host
 # to the remote shell → remote bash handles && and ; natively. No bash -c needed.
 function Invoke-SSH {
     param([string]$Command)
-    $result = & ssh -o StrictHostKeyChecking=no adi@matrixspot.local $Command 2>&1
+    $result = & ssh -o StrictHostKeyChecking=no $PI_HOST $Command 2>&1
     return $result
+}
+
+# ── Brightness prompt ────────────────────────────────────────
+# Was duplicated in both menus, and both copies cast with [int]$val, which
+# throws on anything non-numeric and dumped a PowerShell error at the user.
+# Returns 0 when the input is unusable, so callers just check for > 0.
+function Read-Brightness {
+    $val = Read-Host "  Enter brightness (1-100)"
+    $parsed = 0
+    if (-not [int]::TryParse($val, [ref]$parsed)) {
+        Write-Warn "'$val' is not a number."
+        return 0
+    }
+    if ($parsed -lt 1 -or $parsed -gt 100) {
+        Write-Warn "Must be between 1 and 100."
+        return 0
+    }
+    return $parsed
 }
 
 # ── Pause helper ─────────────────────────────────────────────
@@ -208,10 +235,26 @@ function Update-Code {
     Invoke-SSH -Command "sudo systemctl stop $SERVICE 2>/dev/null" | Out-Null
 
     Write-Info "Pulling latest code from GitHub..."
-    $out = Invoke-SSH -Command "cd $PI_DIR && git pull 2>&1"
+    # Echo a sentinel only when git actually succeeds. Without this a failed
+    # pull (conflict, no network, dirty tree) was indistinguishable from a
+    # good one and the old code was silently restarted as if updated.
+    $out = Invoke-SSH -Command "cd $PI_DIR && git pull 2>&1 && echo __PULL_OK__"
     Write-Host ""
-    Write-Host $out -ForegroundColor Gray
+    Write-Host ($out -replace '__PULL_OK__', '') -ForegroundColor Gray
     Write-Host ""
+
+    if ($out -notmatch "__PULL_OK__") {
+        Write-Err "git pull failed - service NOT restarted."
+        Write-Warn "Fix the problem above on the Pi, then run this again."
+        return
+    }
+
+    if ($out -match "Already up to date") {
+        Write-Info "Already up to date."
+    }
+    else {
+        Write-Success "Code updated."
+    }
 
     Write-Info "Restarting service..."
     Enable-Autoboot
@@ -251,7 +294,7 @@ function Reauth-Spotify {
 
     Write-Info "Opening SSH tunnel window (KEEP THIS OPEN until auth is complete)..."
     Start-Process "powershell.exe" -ArgumentList "-NoExit", "-Command",
-    "`$Host.UI.RawUI.WindowTitle='SSH TUNNEL - KEEP OPEN'; ssh -L 8888:127.0.0.1:8888 adi@matrixspot.local"
+    "`$Host.UI.RawUI.WindowTitle='SSH TUNNEL - KEEP OPEN'; ssh -L 8888:127.0.0.1:8888 $PI_HOST"
 
     Start-Sleep -Seconds 4
 
@@ -323,6 +366,26 @@ function Optimize-AntiFlicker {
         Write-Warn "isolcpus output: $out1"
     }
 
+    # 1b. Pin the service to the core we just reserved.
+    # isolcpus only takes core 3 away from the general scheduler — on its own
+    # it gives that core to nobody, so the matrix keeps competing on 0-2 while
+    # a whole core sits idle. CPUAffinity in the unit is what actually puts the
+    # process there. Check with: taskset -cp $(pgrep -f spotify_matrix.py)
+    Write-Info "Pinning the service to core 3 (CPUAffinity)..."
+    $cmdAff = "grep -q '^CPUAffinity=3' $SERVICE_FILE && echo AFFINITY_SET || " +
+    "(sudo sed -i '/^\[Service\]/a CPUAffinity=3' $SERVICE_FILE && " +
+    "sudo systemctl daemon-reload && echo AFFINITY_DONE)"
+    $outAff = Invoke-SSH -Command $cmdAff
+    if ($outAff -match "AFFINITY_SET") {
+        Write-Info "CPUAffinity=3 already in the unit file."
+    }
+    elseif ($outAff -match "AFFINITY_DONE") {
+        Write-Success "CPUAffinity=3 added - the reserved core is now actually used."
+    }
+    else {
+        Write-Warn "CPUAffinity output: $outAff"
+    }
+
     # 2. Disable audio in /boot/config.txt
     Write-Info "Disabling onboard audio..."
     $cmd2 = "grep -q '^dtparam=audio=off' /boot/config.txt && echo ALREADY_OFF || (sudo sed -i 's/^dtparam=audio=on/dtparam=audio=off/' /boot/config.txt && grep -q '^dtparam=audio=off' /boot/config.txt && echo AUDIO_OFF || (echo 'dtparam=audio=off' | sudo tee -a /boot/config.txt > /dev/null && echo AUDIO_OFF))"
@@ -388,14 +451,8 @@ function Menu-Manual {
             "2" { Run-Manual -Brightness 60; Pause-Menu; return }
             "3" { Run-Manual -Brightness 100; Pause-Menu; return }
             "4" {
-                $val = Read-Host "  Enter brightness (1-100)"
-                $b = [int]$val
-                if ($b -ge 1 -and $b -le 100) {
-                    Run-Manual -Brightness $b; Pause-Menu; return
-                }
-                else {
-                    Write-Warn "Must be between 1 and 100."
-                }
+                $b = Read-Brightness
+                if ($b -gt 0) { Run-Manual -Brightness $b; Pause-Menu; return }
             }
             "0" { return }
             default { Write-Warn "Invalid option." }
@@ -424,14 +481,8 @@ function Menu-Autoboot {
             "3" { Set-ServiceBrightness -Brightness 60; Pause-Menu }
             "4" { Set-ServiceBrightness -Brightness 100; Pause-Menu }
             "5" {
-                $val = Read-Host "  Enter brightness (1-100)"
-                $b = [int]$val
-                if ($b -ge 1 -and $b -le 100) {
-                    Set-ServiceBrightness -Brightness $b; Pause-Menu
-                }
-                else {
-                    Write-Warn "Must be between 1 and 100."
-                }
+                $b = Read-Brightness
+                if ($b -gt 0) { Set-ServiceBrightness -Brightness $b; Pause-Menu }
             }
             "6" { Watch-Logs; Pause-Menu }
             "7" { Show-Status; Pause-Menu }

@@ -1,2 +1,14 @@
-Pillow>=10.0
-python-dotenv>=1.0
+# Pinned deliberately. This runs on an appliance updated with `git pull`, so
+# an unbounded range means a major release can break the display remotely,
+# with no console attached to find out why. Bump these on purpose, then test
+# with --mock-output before deploying.
+#
+# Upper bounds rather than exact pins: patch releases carry security fixes we
+# want, major versions are where the breakage lives.
+Pillow>=10.0,<13.0
+python-dotenv>=1.0,<2.0
+
+# NOT listed here: rgbmatrix. It comes from hzeller/rpi-rgb-led-matrix, is
+# built from source against the Pi's hardware, and is not pip-installable.
+# See that project's README for the build; this program falls back to
+# --mock-output when it is missing.

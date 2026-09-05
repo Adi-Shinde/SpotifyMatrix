@@ -1202,7 +1202,12 @@ def extract_accent_color(
     thumb = art.convert("RGB").resize((16, 16), Image.Resampling.BILINEAR)
     buckets: dict[int, list[float]] = {}
 
-    for r, g, b in thumb.getdata():
+    # tobytes() rather than getdata(): getdata is deprecated for removal in
+    # Pillow 14, and raw bytes avoid building 256 tuples we immediately unpack.
+    raw = thumb.tobytes()
+    pixels = [(raw[i], raw[i + 1], raw[i + 2]) for i in range(0, len(raw), 3)]
+
+    for r, g, b in pixels:
         h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
         if v < 0.15:
             continue  # near-black tells us nothing about the cover's colour
@@ -2057,7 +2062,7 @@ def blend_frames(
     p = max(0.0, min(1.0, progress))
     eased_p = 1.0 - (1.0 - p) ** 3
 
-    if mode in ("slide", "slide-left"):
+    if mode == "slide":
         offset = int(eased_p * size_x)
         out_frame = Image.new("RGB", (size_x, size_y), (0, 0, 0))
         out_frame.paste(old_frame, (-offset, 0))
@@ -2481,8 +2486,7 @@ def _smart_h_scroll_x(
 
 
 def _legacy_h_scroll_x(
-    text_w: int, size: int, now_mono: float, is_active: bool,
-    time_on_screen_ms: int,
+    text_w: int, size: int, is_active: bool, time_on_screen_ms: int,
 ) -> int:
     """Legacy horizontal scroll (non-smart): ping-pong for active, static for inactive."""
     overflow = text_w - size + 4
@@ -2877,7 +2881,7 @@ def render_lyrics(
                 elif smart_scroll:
                     x = _smart_h_scroll_x(text_w, size, time_on_screen_ms, line_dur_ms, text)
                 else:
-                    x = _legacy_h_scroll_x(text_w, size, now_mono, True, time_on_screen_ms)
+                    x = _legacy_h_scroll_x(text_w, size, True, time_on_screen_ms)
 
                 draw.text((x, y_draw), text, fill=color, font=font)
         else:
@@ -2917,7 +2921,7 @@ def render_lyrics(
                     li_time = max(0, display_progress - lyrics[li][0])
                     x = _smart_h_scroll_x(text_w, size, li_time, li_dur, text)
                 else:
-                    x = _legacy_h_scroll_x(text_w, size, now_mono, True, time_on_screen_ms)
+                    x = _legacy_h_scroll_x(text_w, size, True, time_on_screen_ms)
 
                 draw.text((x, y_draw), text, fill=color, font=font)
 
@@ -3721,6 +3725,15 @@ function updateUI(s) {
   const instr = document.getElementById('npInstr');
   if (s.is_instrumental) { instr.style.display = 'inline-block'; }
   else { instr.style.display = 'none'; }
+
+  // has_lyrics was being sent and never read. Mark the Lyrics button when
+  // there is nothing to show, so picking it is not a silent no-op.
+  const lyricsBtn = document.getElementById('mode-lyrics');
+  if (lyricsBtn) {
+    const none = s.is_playing && !s.has_lyrics && !s.is_instrumental;
+    lyricsBtn.textContent = none ? 'Lyrics (none)' : 'Lyrics';
+    lyricsBtn.style.opacity = none ? '0.55' : '1';
+  }
 
   // Refetch lyrics when the track changes, otherwise an open drawer keeps
   // showing the previous song's words against the new song's timestamps.
@@ -5600,7 +5613,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Height in pixels of text banner overlay (0 for auto-fit to text).")
     parser.add_argument("--text-font-size", type=int, default=9,
                         help="Font size in points for scrolling text.")
-    parser.add_argument("--transition", choices=["slide", "slide-right", "fade", "none"],
+    # blend_frames also implements slide-up/slide-down, which the render loop
+    # uses for the idle transition; they are offered here too rather than being
+    # reachable only from inside the code.
+    parser.add_argument("--transition",
+                        choices=["slide", "slide-right", "slide-up", "slide-down",
+                                 "fade", "none"],
                         default="slide",
                         help="Transition animation style when changing tracks.")
     parser.add_argument("--transition-duration", type=positive_float, default=1.5,
