@@ -239,17 +239,25 @@ function Update-Code {
     # pull (conflict, no network, dirty tree) was indistinguishable from a
     # good one and the old code was silently restarted as if updated.
     $out = Invoke-SSH -Command "cd $PI_DIR && git pull 2>&1 && echo __PULL_OK__"
+
+    # Flatten to a single string before testing. Invoke-SSH returns an array of
+    # lines, and against an array PowerShell's -match/-notmatch are FILTERS, not
+    # boolean tests: -notmatch returns every non-matching line, which is almost
+    # always non-empty and therefore truthy. That made a successful pull report
+    # as a failure.
+    $outText = ($out | Out-String)
+
     Write-Host ""
-    Write-Host ($out -replace '__PULL_OK__', '') -ForegroundColor Gray
+    Write-Host ($outText -replace '__PULL_OK__', '').Trim() -ForegroundColor Gray
     Write-Host ""
 
-    if ($out -notmatch "__PULL_OK__") {
+    if ($outText -notmatch "__PULL_OK__") {
         Write-Err "git pull failed - service NOT restarted."
         Write-Warn "Fix the problem above on the Pi, then run this again."
         return
     }
 
-    if ($out -match "Already up to date") {
+    if ($outText -match "Already up to date") {
         Write-Info "Already up to date."
     }
     else {
