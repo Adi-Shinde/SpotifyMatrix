@@ -265,26 +265,26 @@ apart with ~16 px glyphs — they collide.
   `_legacy_h_scroll_x` hardcodes `15.0`.
   **Done:** all four constants removed during the Phase 4 lyrics rewrite.
   **Remaining:** the other dead code in this section (B22, B23) is untouched.
-- ⬜ **B22.** `_legacy_h_scroll_x(now_mono=...)` — parameter never used.
-- ⬜ **B23.** `slide-left` is handled in `blend_frames` (L877) but is not in the
+- ✅ **B22.** `_legacy_h_scroll_x(now_mono=...)` — parameter never used.
+- ✅ **B23.** `slide-left` is handled in `blend_frames` (L877) but is not in the
   `--transition` choices (L3026), so it is unreachable.
-- ⬜ **B24.** `/api/smart-scroll` (L2251) exists and works, but there is **no UI
+- ✅ **B24.** `/api/smart-scroll` (L2251) exists and works, but there is **no UI
   control for it anywhere** in the HTML. The feature is invisible.
-- ⬜ **B25.** GET `/mode` (L2190) accepts `default|cd|lyrics|clock`; POST
+- ✅ **B25.** GET `/mode` (L2190) accepts `default|cd|lyrics|clock`; POST
   `/api/mode` (L2208) also accepts `custom`. Inconsistent.
-- ⬜ **B26.** `effective_mode` is computed and sent in `/api/state` but the web UI
+- ✅ **B26.** `effective_mode` is computed and sent in `/api/state` but the web UI
   never displays it — in Auto mode you can't tell what's actually on screen.
-- ⬜ **B27.** `has_lyrics` is sent in `/api/state` and never read by the JS.
+- ✅ **B27.** `has_lyrics` is sent in `/api/state` and never read by the JS.
 - ✅ **B28.** `renderLyricsHTML()` (L1974) injects `line[1]` via `innerHTML`
   without escaping. The logs page has an `escapeHtml` helper (L2128); the
   control panel does not. Low risk (LRCLIB content), trivial to fix.
   *Done early — the same function was already being edited for B11/B12.*
-- ⬜ **B29.** README says "**8** curated colors" — `COLOR_THEMES` has **7**
+- ✅ **B29.** README says "**8** curated colors" — `COLOR_THEMES` has **7**
   (the 8th swatch is the custom picker).
-- ⬜ **B30.** README claims "send custom **scrolling text** directly to the LED
+- ✅ **B30.** README claims "send custom **scrolling text** directly to the LED
   matrix". No such endpoint exists. The Custom Slate bakes static text into a
   64×64 canvas image; there is no text-message or scrolling-message API.
-- ⬜ **B31.** `matrix_control.ps1` L17–23 requires `PI_HOST` and `PI_PASS` in
+- ✅ **B31.** `matrix_control.ps1` L17–23 requires `PI_HOST` and `PI_PASS` in
   `.env` and validates both — then **never uses either**. Every SSH call
   hardcodes `adi@matrixspot.local` (L70, L85, L254). `PI_PASS` in particular
   makes you store a plaintext password for nothing, since the script relies on
@@ -356,7 +356,7 @@ Clock mode, idle, and single-frame Custom Slate all re-render and re-upload at
 slate at 2. Meaningful idle CPU and power reduction for a device that is idle
 most of the day.
 
-### ⬜ P6. `isolcpus=3` alone probably isn't doing what you think
+### ✅ P6. `isolcpus=3` alone probably isn't doing what you think
 `matrix_control.ps1` `Optimize-AntiFlicker` (L312–318) adds `isolcpus=3` to
 `/boot/cmdline.txt`. That *reserves* core 3 from the general scheduler, but
 nothing in the script or the service file pins the matrix process to it. Unless
@@ -491,37 +491,37 @@ taste control (how far ahead you like to read) rather than a drift patch.
 
 # PART 4 — WEB PANEL
 
-### ⬜ W1. Live matrix preview (highest value, low effort)
+### ✅ W1. Live matrix preview (highest value, low effort)
 Keep the last rendered frame in shared state; add `GET /api/frame.png` that
 encodes that 64×64 image and returns it. Display it in the panel at 4× with
 `image-rendering: pixelated`. You immediately see exactly what the panel shows
 without looking at it, which also makes every other setting easier to tune.
 A 64×64 PNG is ~1–3 KB; 2 FPS over LAN is nothing.
 
-### ⬜ W2. Show what's actually rendering
+### ✅ W2. Show what's actually rendering
 `effective_mode` is already in `/api/state` and unused (B26). In Auto mode,
 label the active button — "Auto (Smart) · now: lyrics".
 
-### ⬜ W3. Playback controls
+### ✅ W3. Playback controls
 Add `user-modify-playback-state` to `SCOPE` (L40) and wire play/pause/next/prev
 to `PUT /me/player/play|pause` and `POST /me/player/next|previous`. Natural fit
 for a device already sitting on your desk. Requires one re-auth (the
 `matrix_control.ps1` Reauth flow already handles this).
 
-### ⬜ W4. Progress bar and elapsed/total time
+### ✅ W4. Progress bar and elapsed/total time
 You already have `progress_ms` and `duration_ms` in `/api/state`; the panel
 doesn't render them. Cheap, makes the Now Playing card feel finished.
 
-### ⬜ W5. Missing controls for existing features
+### ✅ W5. Missing controls for existing features
 - **Smart scroll toggle** — endpoint exists, no UI (B24).
 - **Auto-cycle duration** — `DEFAULT_CD_DURATION` (L2695) is hardcoded to 10 s.
 - **Transition style / duration** — CLI-only today.
 
-### ⬜ W6. `Off` / sleep button
+### ✅ W6. `Off` / sleep button
 A blank-the-panel switch that stops rendering and sleeps the loop, so idle CPU
 goes to near zero. Pairs with F6 below.
 
-### ⬜ W7. Robustness
+### ✅ W7. Robustness
 - Poll `/api/state` with `AbortController` + a timeout so a hung request doesn't
   stall the UI.
 - Show a "disconnected" banner when fetches fail (currently every `catch` is
@@ -536,7 +536,7 @@ goes to near zero. Pairs with F6 below.
 
 Ordered by value-to-effort.
 
-### ⬜ F6. Persist settings across restarts ⭐ *biggest quality-of-life win*
+### ✅ F6. Persist settings across restarts ⭐ *biggest quality-of-life win*
 Nothing is saved. Brightness, accent colour, lyrics style, font sizes, lead,
 spin speed, mode — every one resets to CLI defaults on reboot or
 `systemctl restart`. For something advertised as "plug & play appliance", that's
@@ -546,7 +546,7 @@ Save the runtime-adjustable fields of `SharedPlaybackState` to
 `.cache/settings.json` (debounced ~2 s after a change, atomic write like B2) and
 load at startup with CLI flags still overriding.
 
-### ⬜ F7. Auto accent colour from album art
+### ✅ F7. Auto accent colour from album art
 Extract the dominant vibrant colour from the artwork and use it as the accent —
 an `"auto"` entry alongside the 7 themes. Resize the art to 16×16, convert to
 HSV, pick the highest `saturation × value` cluster, clamp minimum brightness so
@@ -558,16 +558,16 @@ Auto-dim (or blank) between configurable hours. For a bedroom device this is the
 difference between usable and unplugged. Add `--night-start`, `--night-end`,
 `--night-brightness`, exposed in the panel. NOT NEEDED
 
-### ⬜ F9. Full-bleed album art mode
+### ✅ F9. Full-bleed album art mode
 A fifth mode: the artwork filling all 64×64 with a 1 px progress bar. No disc
 crop, no rotation — the simplest and often best-looking mode, and the cheapest
 to render.
 
-### ⬜ F10. Progress ring around the vinyl
+### ✅ F10. Progress ring around the vinyl
 In CD view, draw a thin arc around the disc showing track position. Uses data
 you already have, adds real information density to the flagship view. YES PLEASE
 
-### ⬜ F11. Boot / error status screen
+### ✅ F11. Boot / error status screen
 If Spotify auth fails today, the process exits and the matrix goes black — on a
 headless appliance you have no idea why. Render "No Wi-Fi", "Spotify auth
 needed", "Connecting…" directly on the panel. Turns a black screen into a
@@ -603,7 +603,7 @@ spotify_matrix/
 Serve `static/` from disk (with a `--dev` no-cache flag) and you can edit the
 panel live without restarting the matrix.
 
-### ⬜ S2. Add tests for the pure functions
+### ✅ S2. Add tests for the pure functions
 Several functions are pure and trivially testable, and two of them have bugs
 above that a test would have caught (`parse_lrc` vs enhanced LRC → B19):
 `parse_lrc`, `get_current_lyric_index`, `_smart_h_scroll_x`,
@@ -611,20 +611,20 @@ above that a test would have caught (`parse_lrc` vs enhanced LRC → B19):
 A single `tests/test_pure.py` with pytest is maybe 100 lines and needs no
 hardware.
 
-### ⬜ S3. Commit the systemd unit file
+### ✅ S3. Commit the systemd unit file
 The unit lives only on the Pi and is edited in place by `sed` (L169). It should
 be in the repo as `spotifymatrix.service.template` — right now the service
 config is undocumented, unversioned, and unrecoverable if the SD card dies.
 Include `Restart=always`, `RestartSec=5`, `KillSignal=SIGTERM`,
 `TimeoutStopSec=5`.
 
-### ⬜ S4. Pin dependencies
+### ✅ S4. Pin dependencies
 `requirements.txt` has `Pillow>=10.0`, `python-dotenv>=1.0`. Unbounded upper
 ranges on an appliance you update with `git pull` means a Pillow major bump can
 break the display remotely. Pin exact versions; note that `rgbmatrix` is built
 from source and is not pip-installable.
 
-### ⬜ S5. Fix the PowerShell script
+### ✅ S5. Fix the PowerShell script
 - Use `$PI_HOST` instead of hardcoding `adi@matrixspot.local` (B31).
 - Delete `PI_PASS` — it is required, validated, and never used.
 - Extract the duplicated brightness-prompt block (L390–399, L426–435).
@@ -701,7 +701,7 @@ in unnoticed instead of snapping.
 Right now "not playing" means a clock, forever. This is the biggest missed
 opportunity in the project: it's an always-on light source in your room.
 
-### ⬜ V6. Ambient screensaver modes
+### ✅ V6. Ambient screensaver modes
 A rotating set of generative visuals for idle, cheap enough for a Pi because
 they're all direct pixel writes at 64×64:
 
@@ -727,7 +727,7 @@ Temperature plus a small pixel-art condition icon in the clock's dead space,
 refreshed every 15 minutes and cached. For an always-on desk display this is
 probably the most *used* non-Spotify feature you could add.
 
-### ⬜ V8. Ken Burns pan on full-bleed art
+### ✅ V8. Ken Burns pan on full-bleed art
 Pair with F9: slow drift and zoom over the artwork instead of a static image.
 Stops a paused screen from looking frozen. Reuses the pre-rotated-frame cache
 idea from P1.
@@ -764,7 +764,7 @@ once F7 exists.
 track. Draw a small heart in the corner if it's in your library. Tiny feature,
 disproportionately satisfying.
 
-### ⬜ V13. Up-next / queue peek
+### ✅ V13. Up-next / queue peek
 `GET /v1/me/player/queue` (scope `user-read-playback-state`) → show the next
 track's title during the last 10 seconds of the current one. Natural companion
 to the existing end-of-track poll acceleration
@@ -775,7 +775,7 @@ When a setting changes from the web panel, flash a small overlay on the matrix
 ("Brightness 80", "Karaoke mode"). Confirms you're controlling the device you
 think you are, and makes the panel feel connected rather than fire-and-forget.
 
-### ⬜ V15. Track-change accent flash
+### ✅ V15. Track-change accent flash
 A brief 1px accent-coloured border pulse when a new song starts — a peripheral
 cue that something changed, without needing to read anything.
 
@@ -880,14 +880,14 @@ crash loop. `systemctl stop` → panel goes dark.
 
 **Verify:** one dense rap track, one slow ballad, `--mock-output` both.
 
-## ⬜ Phase 5 — Persistence & appliance polish (~2 h)
+## 🟡 Phase 5 — Persistence & appliance polish (~2 h)
 32. **F6** persisted settings ⭐ (debounced, atomic, CLI still overrides)
 33. **F11** on-matrix status/error screens ("No Wi-Fi", "Spotify auth needed")
 34. **F8** night mode / scheduled brightness (uses V5's ramp)
 35. **S3** commit the systemd unit as a versioned template
 36. **B16** run as non-root, token file `0600`
 
-## ⬜ Phase 6 — Web panel (~3 h)
+## 🟡 Phase 6 — Web panel (~3 h)
 37. **W1** live matrix preview via `/api/frame.png` ⭐
 38. **W2/W4** effective-mode label, progress bar and elapsed/total
 39. **W5** surface hidden settings: smart-scroll toggle (**B24**), cycle
@@ -896,7 +896,7 @@ crash loop. `systemctl stop` → panel goes dark.
 41. **W7** abort timeouts, disconnect banner, self-hosted fonts, escape lyrics
 42. **B17** `--web-bind` and optional `--web-token`
 
-## ⬜ Phase 7 — Display modes & idle (~4 h) ⭐ *highest visual payoff*
+## 🟡 Phase 7 — Display modes & idle (~4 h) ⭐ *highest visual payoff*
 43. **F9** full-bleed album art mode + **V8** Ken Burns pan
 44. **F10** progress ring around the vinyl
 45. **F7** auto accent colour from album art + **V11** palette strip
@@ -906,7 +906,7 @@ crash loop. `systemctl stop` → panel goes dark.
 48. **7.4** new transitions: pixel dissolve, vinyl drop
 49. **V10** authentic 33⅓ RPM default
 
-## ⬜ Phase 8 — Reactive features (~2.5 h)
+## 🟡 Phase 8 — Reactive features (~2.5 h)
 *(**V9** beat sync removed — endpoints are 403 for apps registered after Nov 2024.)*
 
 50. **W3** playback controls (scope change + one re-auth via the existing flow)
@@ -914,7 +914,7 @@ crash loop. `systemctl stop` → panel goes dark.
 52. **V14** on-matrix toast overlay · **V15** track-change accent flash
 53. **F12** scrolling text message endpoint (closes the README's false claim)
 
-## ⬜ Phase 9 — Cleanup & structure (~3 h)
+## 🟡 Phase 9 — Cleanup & structure (~3 h)
 55. **B21–B32** dead constants, unreachable `slide-left`, `/mode` inconsistency,
     unescaped lyric HTML, README corrections (7 themes, no scrolling-message API)
 56. **B31** `matrix_control.ps1`: use `$PI_HOST`, delete unused `PI_PASS`,
