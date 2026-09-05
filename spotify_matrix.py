@@ -4,15 +4,18 @@ from __future__ import annotations
 import argparse
 import base64
 import collections
+import colorsys
 import datetime
 import functools
 from io import BytesIO
 import json
 import math
 import os
+import random
 import re
 import secrets
 import signal
+import socket
 import sys
 import threading
 import time
@@ -38,7 +41,18 @@ except ImportError:
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 CURRENTLY_PLAYING_URL = "https://api.spotify.com/v1/me/player/currently-playing"
-SCOPE = "user-read-currently-playing"
+PLAYER_API_URL = "https://api.spotify.com/v1/me/player"
+QUEUE_API_URL = "https://api.spotify.com/v1/me/player/queue"
+
+# Playback control and queue peek need scopes beyond reading the current track.
+# They are requested unconditionally so a fresh authorization picks them up;
+# an existing token simply lacks them until the next `--auth-only`, and the
+# features that need them report that rather than failing silently.
+SCOPE = " ".join((
+    "user-read-currently-playing",
+    "user-read-playback-state",
+    "user-modify-playback-state",
+))
 
 LRCLIB_API_URL = "https://lrclib.net/api/get"
 LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
@@ -56,6 +70,17 @@ COLOR_THEMES: dict[str, tuple[int, int, int]] = {
     "gold":     (245, 180, 40),
     "crimson":  (220, 40, 60)
 }
+
+# What the panel can be pinned to. "default" is the original appliance
+# behaviour — idle screen when stopped, disc for the first seconds of a track,
+# then lyrics — and stays the default so an upgrade changes nothing on its own.
+DISPLAY_MODES = ("default", "cd", "lyrics", "art", "clock", "custom")
+
+# What fills the screen when nothing is playing. "clock" is the original.
+# "cycle" rotates through the animated ones every IDLE_CYCLE_SECONDS.
+IDLE_MODES = ("clock", "plasma", "rain", "stars", "life", "fire", "cycle")
+IDLE_ANIMATED = ("plasma", "rain", "stars", "life", "fire")
+IDLE_CYCLE_SECONDS = 120.0
 
 # Average ms per spoken word — used to cap scroll speed during instrumental gaps
 AVG_MS_PER_WORD = 350
@@ -163,6 +188,10 @@ class SharedPlaybackState:
     artist: str = ""
     album_name: str = ""
     is_connected: bool = True
+    # Why the panel is not showing music, in words, for the on-matrix status
+    # screen. Empty means "nothing to explain" — the normal case.
+    status_message: str = "Connecting"
+    status_detail: str = ""
     # Time sync fields
     progress_ms: int = 0
     duration_ms: int = 0
@@ -185,16 +214,29 @@ class SharedPlaybackState:
     # Custom Slate mode
     custom_slate_frames: list[Image.Image] = field(default_factory=list)
     custom_slate_frame_delay: float = 0.1
+    # Up-next track title, filled in during the last seconds of the current one.
+    queue_next: str = ""
+    # Last frame handed to the panel, for the web preview. Rebound wholesale by
+    # the render loop (atomic under the GIL), so readers need no lock.
+    last_frame: Image.Image | None = None
     # Runtime-adjustable settings
-    display_mode: str = "default"  # "default", "cd", "lyrics", "clock", "custom"
+    display_mode: str = "default"  # see DISPLAY_MODES
     effective_mode: str = "cd"  # what is actually rendering right now
-    lyrics_style: str = "scroll"  # "scroll" or "pop"
+    # What replaces the clock when nothing is playing. "clock" reproduces the
+    # original appliance behaviour exactly; the rest are ambient animations.
+    idle_mode: str = "clock"  # see IDLE_MODES
+    lyrics_style: str = "scroll"  # "scroll", "pop" or "karaoke"
     smart_scroll: bool = True  # time-proportional horizontal scrolling
     scroll_font_size: int = 9  # font size for scroll mode
     pop_font_size: int = 9  # font size for pop mode
     spin_speed: float = 10.0  # RPM
     text_scroll_speed: float = 20.0  # px/s
     brightness: int = 65  # 1-100
+    # Seconds the auto-cycling "default" mode shows the disc before lyrics.
+    cd_duration: float = 10.0
+    progress_ring: bool = True  # thin arc around the disc showing track position
+    art_pan: bool = True  # Ken Burns drift in full-bleed art mode
+    sleeping: bool = False  # panel blanked on request
     # Boot defaults (for reset)
     _default_brightness: int = 65
     _default_spin_speed: float = 10.0
@@ -202,6 +244,196 @@ class SharedPlaybackState:
     _default_lyrics_style: str = "scroll"
     _default_scroll_font_size: int = 9
     _default_pop_font_size: int = 9
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  SETTINGS PERSISTENCE
+# ═══════════════════════════════════════════════════════════════════
+
+# Fields written to disk and restored at boot. Everything here is something a
+# person can change from the panel; derived and per-track state is excluded on
+# purpose so a stale settings file can never pin the display to an old song.
+PERSISTED_FIELDS: tuple[str, ...] = (
+    "display_mode",
+    "idle_mode",
+    "lyrics_style",
+    "smart_scroll",
+    "scroll_font_size",
+    "pop_font_size",
+    "spin_speed",
+    "text_scroll_speed",
+    "brightness",
+    "lyrics_lead_ms",
+    "accent_name",
+    "accent_color",
+    "cd_duration",
+    "progress_ring",
+    "art_pan",
+)
+
+# How long to wait after the last change before writing. Dragging a slider
+# fires a request per step; without this the SD card takes the whole sweep.
+SETTINGS_DEBOUNCE_SECONDS = 2.0
+
+# POST endpoints whose effect should outlive a restart. Everything else — slate
+# uploads, log clears, playback commands — is deliberately transient.
+PERSISTING_ENDPOINTS: frozenset[str] = frozenset({
+    "/api/mode",
+    "/api/idle-mode",
+    "/api/brightness",
+    "/api/spin-speed",
+    "/api/text-speed",
+    "/api/lyrics-style",
+    "/api/smart-scroll",
+    "/api/scroll-font-size",
+    "/api/pop-font-size",
+    "/api/accent-color",
+    "/api/lyrics-lead",
+    "/api/cd-duration",
+    "/api/progress-ring",
+    "/api/art-pan",
+    "/api/reset",
+})
+
+_settings_dirty = threading.Event()
+
+
+def mark_settings_dirty() -> None:
+    """Flag that a persisted field changed. The saver thread does the write."""
+    _settings_dirty.set()
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Write JSON so a power cut cannot leave a truncated file behind.
+
+    Same reasoning as the token cache: this device is designed to be unplugged,
+    so every write it makes must be all-or-nothing.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def save_settings(path: Path, state: SharedPlaybackState, lock: threading.Lock) -> None:
+    with lock:
+        payload = {name: getattr(state, name) for name in PERSISTED_FIELDS}
+    # Tuples survive a round-trip as lists; normalise now so the loader does not
+    # have to care which it is reading.
+    accent = payload.get("accent_color")
+    if isinstance(accent, tuple):
+        payload["accent_color"] = list(accent)
+    try:
+        _atomic_write_json(path, payload)
+    except OSError as exc:
+        log(f"Settings: could not save to {path}: {exc}", "warn")
+
+
+def apply_saved_settings(path: Path, state: SharedPlaybackState) -> bool:
+    """Load saved settings over `state`. Returns True if anything was applied.
+
+    Every value is validated against the same bounds the web API enforces — a
+    hand-edited or partially-written file must not be able to put the renderer
+    into a state the UI cannot reach.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return False
+    except (OSError, json.JSONDecodeError) as exc:
+        log(f"Settings: ignoring unreadable {path}: {exc}", "warn")
+        return False
+
+    if not isinstance(data, dict):
+        return False
+
+    def _clamp(value: Any, lo: float, hi: float, cast: Any) -> Any | None:
+        try:
+            out = cast(value)
+        except (TypeError, ValueError):
+            return None
+        if out != out:  # NaN
+            return None
+        return max(lo, min(hi, out))
+
+    applied = False
+
+    if data.get("display_mode") in DISPLAY_MODES and data["display_mode"] != "custom":
+        # "custom" is deliberately not restorable: the slate image itself is not
+        # persisted, so booting into it would show an empty screen.
+        state.display_mode = data["display_mode"]
+        applied = True
+    if data.get("idle_mode") in IDLE_MODES:
+        state.idle_mode = data["idle_mode"]
+        applied = True
+    if data.get("lyrics_style") in ("scroll", "pop", "karaoke"):
+        state.lyrics_style = data["lyrics_style"]
+        applied = True
+    if isinstance(data.get("smart_scroll"), bool):
+        state.smart_scroll = data["smart_scroll"]
+        applied = True
+    if isinstance(data.get("progress_ring"), bool):
+        state.progress_ring = data["progress_ring"]
+        applied = True
+    if isinstance(data.get("art_pan"), bool):
+        state.art_pan = data["art_pan"]
+        applied = True
+
+    for name, lo, hi, cast in (
+        ("scroll_font_size", 6, 14, int),
+        ("pop_font_size", 6, 14, int),
+        ("spin_speed", 1.0, 120.0, float),
+        ("text_scroll_speed", 1.0, 100.0, float),
+        ("brightness", 1, 100, int),
+        ("lyrics_lead_ms", 0, 500, int),
+        ("cd_duration", 2.0, 120.0, float),
+    ):
+        if name in data:
+            value = _clamp(data[name], lo, hi, cast)
+            if value is not None:
+                setattr(state, name, value)
+                applied = True
+
+    accent_name = data.get("accent_name")
+    if accent_name in COLOR_THEMES:
+        state.accent_name = accent_name
+        state.accent_color = COLOR_THEMES[accent_name]
+        applied = True
+    elif accent_name in ("custom", "auto"):
+        raw = data.get("accent_color")
+        if isinstance(raw, (list, tuple)) and len(raw) == 3:
+            channels = [_clamp(c, 0, 255, int) for c in raw]
+            if all(c is not None for c in channels):
+                state.accent_name = accent_name
+                state.accent_color = (channels[0], channels[1], channels[2])
+                applied = True
+
+    return applied
+
+
+def settings_saver(
+    path: Path,
+    state: SharedPlaybackState,
+    lock: threading.Lock,
+    stop_event: threading.Event,
+) -> None:
+    """Flush settings SETTINGS_DEBOUNCE_SECONDS after the last change."""
+    while not stop_event.is_set():
+        if not _settings_dirty.wait(timeout=1.0):
+            continue
+        # Coalesce a burst of changes (a slider drag) into one write.
+        while not stop_event.is_set():
+            _settings_dirty.clear()
+            if not _settings_dirty.wait(timeout=SETTINGS_DEBOUNCE_SECONDS):
+                break
+        save_settings(path, state, lock)
+    # Final flush so a change made moments before shutdown is not lost.
+    if _settings_dirty.is_set():
+        save_settings(path, state, lock)
 
 
 @dataclass
@@ -315,6 +547,63 @@ class SpotifyClient:
             raise_http_error(response, "Spotify currently-playing request")
 
         return response.json()
+
+    def playback_command(self, action: str) -> tuple[bool, str]:
+        """Send a transport command. Returns (ok, human-readable message).
+
+        Errors are returned rather than raised: this is driven by a button on
+        a phone, and "no active device" is a normal thing to report, not a
+        failure worth breaking the poll loop over.
+        """
+        endpoints = {
+            "play": ("PUT", f"{PLAYER_API_URL}/play"),
+            "pause": ("PUT", f"{PLAYER_API_URL}/pause"),
+            "next": ("POST", f"{PLAYER_API_URL}/next"),
+            "previous": ("POST", f"{PLAYER_API_URL}/previous"),
+        }
+        if action not in endpoints:
+            return False, f"Unknown action '{action}'"
+
+        method, url = endpoints[action]
+        token = self._valid_access_token()
+        response = http_request(
+            method, url, headers={"Authorization": f"Bearer {token}"}, timeout=5
+        )
+        if response.status == 401:
+            self._refresh_access_token()
+            token = self._valid_access_token()
+            response = http_request(
+                method, url, headers={"Authorization": f"Bearer {token}"}, timeout=5
+            )
+
+        # 204 is the documented success; 202 shows up when the device is still
+        # waking. Both mean the command was accepted.
+        if response.status in (200, 202, 204):
+            return True, action
+        if response.status == 403:
+            return False, "Not authorized — re-run --auth-only to grant playback control"
+        if response.status == 404:
+            return False, "No active Spotify device — start playback somewhere first"
+        if response.status == 429:
+            return False, "Rate limited by Spotify, try again shortly"
+        return False, f"Spotify returned HTTP {response.status}"
+
+    def get_queue(self) -> list[dict[str, Any]]:
+        """Upcoming tracks, or [] if the scope is missing or nothing is queued."""
+        token = self._valid_access_token()
+        response = http_request(
+            "GET", QUEUE_API_URL,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=5,
+        )
+        if response.status != 200:
+            return []
+        try:
+            payload = response.json()
+        except (ValueError, json.JSONDecodeError):
+            return []
+        queue = payload.get("queue")
+        return queue if isinstance(queue, list) else []
 
     def authorize(self) -> None:
         self._valid_access_token()
@@ -889,6 +1178,68 @@ def render_idle(size: int) -> Image.Image:
     return frame
 
 
+def render_status(
+    size: int,
+    headline: str,
+    detail: str = "",
+    accent_color: tuple[int, int, int] = SPOTIFY_GREEN,
+    crisp: bool = True,
+) -> Image.Image:
+    """A readable on-panel explanation of why nothing else is showing.
+
+    On a headless appliance a failure is otherwise indistinguishable from a
+    dead panel: the process exits, the matrix goes black, and there is nothing
+    to diagnose from. Saying "Spotify auth needed" turns that into an
+    instruction.
+    """
+    frame = Image.new("RGB", (size, size), (0, 0, 0))
+    draw = ImageDraw.Draw(frame)
+    font = get_font(8)
+
+    # Breathing dot at the top, so a stalled screen still reads as alive.
+    pulse = (math.sin(time.time() * 2.5) + 1.0) / 2.0
+    dot_color = tuple(int(c * (0.35 + 0.65 * pulse)) for c in accent_color)
+    cx = size / 2.0
+    draw.ellipse((cx - 2, 7, cx + 2, 11), fill=dot_color)
+
+    words = headline.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if draw.textlength(candidate, font=font) <= size - 4 or not current:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+
+    line_h = 10
+    block_h = len(lines) * line_h + (line_h if detail else 0)
+    y = int((size - block_h) / 2) + 4
+
+    items = []
+    for line in lines:
+        width = draw.textlength(line, font=font)
+        items.append(((int((size - width) / 2), y), line))
+        y += line_h
+    draw_text_batch(frame, items, font, (235, 235, 235), crisp=crisp)
+
+    if detail:
+        small = get_font(7)
+        width = draw.textlength(detail, font=small)
+        draw_text_batch(
+            frame,
+            [((int((size - width) / 2), y + 2), detail)],
+            small,
+            LYRIC_DIM_COLOR,
+            crisp=crisp,
+        )
+
+    return frame
+
+
 _clock_face_cache: dict[tuple, Image.Image] = {}
 
 
@@ -1000,6 +1351,379 @@ def _render_clock_face(
 # ═══════════════════════════════════════════════════════════════════
 #  RENDERING — SCROLLING TEXT / FULL FRAME / TRANSITIONS
 # ═══════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════
+#  AMBIENT IDLE SCREENS
+# ═══════════════════════════════════════════════════════════════════
+#
+# These replace the clock while nothing is playing. They exist because the
+# panel is idle most of the day and a static clock wastes it — but "clock" is
+# still the default, so an upgrade changes nothing until you pick otherwise.
+#
+# All of them render on a coarse grid and scale up. At 64x64 a per-pixel Python
+# loop is 4096 round-trips into PIL per frame, which the Pi cannot afford; at
+# 32x32 it is 1024, and everything here is smooth enough that the upscale is
+# invisible.
+
+IDLE_COARSE = 32  # working grid for the pixel-loop animations
+
+
+def _accent_palette(accent: tuple[int, int, int]) -> list[tuple[int, int, int]]:
+    """256-entry cyclic palette centred on the accent hue.
+
+    A straight black→accent→white ramp washes out: plasma values cluster near
+    the middle, so most of the screen lands in the blown-out top half. Rotating
+    hue instead keeps every value fully saturated, which is what makes the
+    classic effect read as colour flow rather than a moving highlight. The
+    rotation is deliberately partial (±60°) so the result still looks like the
+    accent colour rather than a rainbow.
+    """
+    h, _, _ = colorsys.rgb_to_hsv(*(c / 255.0 for c in accent))
+    palette: list[tuple[int, int, int]] = []
+    for i in range(256):
+        phase = i / 255.0 * 2.0 * math.pi
+        hue = (h + math.sin(phase) * 0.17) % 1.0
+        # Keep the darkest point well above black so the panel never looks off.
+        value = 0.35 + 0.65 * (0.5 - 0.5 * math.cos(phase))
+        r, g, b = colorsys.hsv_to_rgb(hue, 0.85, value)
+        palette.append((int(r * 255), int(g * 255), int(b * 255)))
+    return palette
+
+
+_FIRE_PALETTE: list[tuple[int, int, int]] = []
+
+
+def _fire_palette() -> list[tuple[int, int, int]]:
+    """Black → red → orange → yellow → white, the classic heat ramp."""
+    global _FIRE_PALETTE
+    if _FIRE_PALETTE:
+        return _FIRE_PALETTE
+    palette = []
+    for i in range(256):
+        t = i / 255.0
+        if t < 0.33:
+            k = t / 0.33
+            palette.append((int(140 * k), 0, 0))
+        elif t < 0.66:
+            k = (t - 0.33) / 0.33
+            palette.append((140 + int(115 * k), int(130 * k), 0))
+        else:
+            k = (t - 0.66) / 0.34
+            palette.append((255, 130 + int(125 * k), int(200 * k)))
+    _FIRE_PALETTE = palette
+    return palette
+
+
+class IdleScreen:
+    """Renders whichever idle visual is selected, holding its animation state.
+
+    One object owns all of them so switching modes cannot leak state between
+    animations, and so `cycle` can rotate without re-seeding on every frame.
+    """
+
+    def __init__(self) -> None:
+        self._plasma_t = 0.0
+        self._accent_cache: tuple[tuple[int, int, int], list[tuple[int, int, int]]] | None = None
+        self._rain: list[dict[str, Any]] = []
+        self._rain_size = 0
+        self._stars: list[list[float]] = []
+        self._life: list[bytearray] = []
+        self._life_ghost: list[bytearray] = []
+        self._life_next_step = 0.0
+        self._life_history: collections.deque[int] = collections.deque(maxlen=12)
+        self._fire: list[bytearray] = []
+        self._cycle_index = 0
+        self._cycle_started = 0.0
+
+    # ── palette helper ────────────────────────────────────────────
+    def _palette(self, accent: tuple[int, int, int]) -> list[tuple[int, int, int]]:
+        if self._accent_cache is None or self._accent_cache[0] != accent:
+            self._accent_cache = (accent, _accent_palette(accent))
+        return self._accent_cache[1]
+
+    # ── dispatch ──────────────────────────────────────────────────
+    def render(
+        self,
+        size: int,
+        mode: str,
+        is_connected: bool,
+        accent: tuple[int, int, int],
+        delta: float,
+        now: float,
+    ) -> Image.Image:
+        if mode == "cycle":
+            if self._cycle_started == 0.0:
+                self._cycle_started = now
+            if now - self._cycle_started >= IDLE_CYCLE_SECONDS:
+                self._cycle_started = now
+                self._cycle_index = (self._cycle_index + 1) % len(IDLE_ANIMATED)
+            mode = IDLE_ANIMATED[self._cycle_index]
+
+        if mode == "plasma":
+            frame = self._plasma(size, accent, delta)
+        elif mode == "rain":
+            frame = self._rain_frame(size, accent, delta)
+        elif mode == "stars":
+            frame = self._starfield(size, accent, delta)
+        elif mode == "life":
+            frame = self._life_frame(size, accent, now)
+        elif mode == "fire":
+            frame = self._fire_frame(size)
+        else:
+            # "clock" and anything unrecognised fall back to the original face,
+            # which already draws its own connection pulse.
+            return render_clock(size, is_connected, accent)
+
+        if not is_connected:
+            # The clock signals this with a pulsing red dot; the animations get
+            # a quieter version so a dropped connection is still visible.
+            draw = ImageDraw.Draw(frame)
+            pulse = int(80 + 120 * ((math.sin(now * 2.0) + 1.0) / 2.0))
+            draw.ellipse((size - 4, size - 4, size - 2, size - 2), fill=(pulse, 0, 0))
+        return frame
+
+    # ── plasma ────────────────────────────────────────────────────
+    def _plasma(self, size: int, accent: tuple[int, int, int], delta: float) -> Image.Image:
+        self._plasma_t += delta * 0.6
+        t = self._plasma_t
+        n = IDLE_COARSE
+        palette = self._palette(accent)
+        buf = bytearray(n * n * 3)
+        sin = math.sin
+
+        # Three interfering waves — the classic demoscene plasma. Row terms are
+        # hoisted out of the inner loop; that alone roughly halves the work.
+        for y in range(n):
+            sy = sin(y * 0.20 + t * 1.1)
+            sy2 = y * 0.14
+            base = y * n * 3
+            for x in range(n):
+                v = sin(x * 0.18 + t) + sy + sin((x * 0.11 + sy2) + t * 0.7)
+                idx = int((v + 3.0) * 42.5)
+                r, g, b = palette[0 if idx < 0 else 255 if idx > 255 else idx]
+                off = base + x * 3
+                buf[off] = r
+                buf[off + 1] = g
+                buf[off + 2] = b
+
+        small = Image.frombytes("RGB", (n, n), bytes(buf))
+        return small.resize((size, size), Image.Resampling.BILINEAR)
+
+    # ── matrix rain ───────────────────────────────────────────────
+    def _rain_frame(self, size: int, accent: tuple[int, int, int], delta: float) -> Image.Image:
+        col_w = 6
+        columns = max(1, size // col_w)
+        if not self._rain or self._rain_size != size:
+            self._rain_size = size
+            # Seed across the whole height, not above the top edge: starting
+            # every column off-screen leaves the panel nearly empty for the
+            # first few seconds, which is exactly when you are looking at it.
+            self._rain = [
+                {
+                    "y": random.uniform(0.0, float(size)),
+                    "speed": random.uniform(14.0, 40.0),
+                    "length": random.randint(6, 13),
+                    "chars": [random.choice("01ABCDEFXYZ#*+=<>") for _ in range(12)],
+                }
+                for _ in range(columns)
+            ]
+
+        frame = Image.new("RGB", (size, size), (0, 0, 0))
+        font = get_font(7)
+        r, g, b = accent
+        # Bucket the trail into four brightness levels so the whole screen is
+        # four batched text draws instead of one per glyph.
+        buckets: list[list[tuple[tuple[int, int], str]]] = [[], [], [], []]
+        head: list[tuple[tuple[int, int], str]] = []
+
+        for col, stream in enumerate(self._rain):
+            stream["y"] += stream["speed"] * delta
+            if stream["y"] - stream["length"] * 7 > size:
+                stream["y"] = random.uniform(-24.0, -6.0)
+                stream["speed"] = random.uniform(14.0, 40.0)
+                stream["length"] = random.randint(6, 13)
+
+            x = col * col_w
+            for i in range(stream["length"]):
+                y = int(stream["y"]) - i * 7
+                if y < -7 or y > size:
+                    continue
+                glyph = stream["chars"][(i + int(stream["y"]) // 7) % len(stream["chars"])]
+                if i == 0:
+                    head.append(((x, y), glyph))
+                else:
+                    level = min(3, (i * 4) // max(1, stream["length"]))
+                    buckets[level].append(((x, y), glyph))
+
+        for level, items in enumerate(buckets):
+            if not items:
+                continue
+            k = (0.75, 0.5, 0.3, 0.15)[level]
+            draw_text_batch(
+                frame, items, font,
+                (int(r * k), int(g * k), int(b * k)), crisp=True,
+            )
+        if head:
+            draw_text_batch(frame, head, font, (230, 255, 230), crisp=True)
+        return frame
+
+    # ── starfield ─────────────────────────────────────────────────
+    def _starfield(self, size: int, accent: tuple[int, int, int], delta: float) -> Image.Image:
+        if not self._stars:
+            self._stars = [
+                [random.uniform(-1.0, 1.0), random.uniform(-1.0, 1.0), random.uniform(0.05, 1.0)]
+                for _ in range(70)
+            ]
+
+        frame = Image.new("RGB", (size, size), (0, 0, 0))
+        draw = ImageDraw.Draw(frame)
+        half = size / 2.0
+        r, g, b = accent
+
+        for star in self._stars:
+            star[2] -= delta * 0.35
+            if star[2] <= 0.02:
+                star[0] = random.uniform(-1.0, 1.0)
+                star[1] = random.uniform(-1.0, 1.0)
+                star[2] = 1.0
+            k = 1.0 / star[2]
+            x = half + star[0] * k * half * 0.6
+            y = half + star[1] * k * half * 0.6
+            if not (0 <= x < size and 0 <= y < size):
+                continue
+            # Near stars are brighter and bigger — the only depth cue available.
+            depth = min(1.0, (1.0 - star[2]) ** 1.5)
+            colour = (
+                int(r + (255 - r) * depth),
+                int(g + (255 - g) * depth),
+                int(b + (255 - b) * depth),
+            )
+            if depth > 0.75:
+                draw.rectangle((x, y, x + 1, y + 1), fill=colour)
+            else:
+                draw.point((x, y), fill=colour)
+        return frame
+
+    # ── Conway's Game of Life ─────────────────────────────────────
+    def _seed_life(self, n: int) -> None:
+        self._life = [
+            bytearray(1 if random.random() < 0.32 else 0 for _ in range(n))
+            for _ in range(n)
+        ]
+        self._life_ghost = [bytearray(n) for _ in range(n)]
+        self._life_history.clear()
+
+    def _life_frame(self, size: int, accent: tuple[int, int, int], now: float) -> Image.Image:
+        n = IDLE_COARSE
+        if not self._life:
+            self._seed_life(n)
+
+        # Step on a timer, not per frame: Life at 10 FPS is unreadable, and the
+        # step is the expensive part.
+        if now >= self._life_next_step:
+            self._life_next_step = now + 0.18
+            grid = self._life
+            nxt = [bytearray(n) for _ in range(n)]
+            for y in range(n):
+                up = grid[y - 1]
+                mid = grid[y]
+                down = grid[(y + 1) % n]
+                row = nxt[y]
+                for x in range(n):
+                    xl = x - 1
+                    xr = (x + 1) % n
+                    count = (
+                        up[xl] + up[x] + up[xr]
+                        + mid[xl] + mid[xr]
+                        + down[xl] + down[x] + down[xr]
+                    )
+                    row[x] = 1 if (count == 3 or (count == 2 and mid[x])) else 0
+
+            # Decay the ghost layer, then stamp cells that died this step.
+            if not self._life_ghost:
+                self._life_ghost = [bytearray(n) for _ in range(n)]
+            for y in range(n):
+                ghost = self._life_ghost[y]
+                was = grid[y]
+                now_row = nxt[y]
+                for x in range(n):
+                    if was[x] and not now_row[x]:
+                        ghost[x] = 150
+                    elif ghost[x]:
+                        ghost[x] = ghost[x] - 30 if ghost[x] > 30 else 0
+            self._life = nxt
+
+            # Reseed when the board dies out or locks into a short cycle,
+            # otherwise it settles into still lifes and stops being ambient.
+            population = sum(sum(row) for row in nxt)
+            self._life_history.append(population)
+            if population == 0 or (
+                len(self._life_history) == self._life_history.maxlen
+                and len(set(self._life_history)) <= 2
+            ):
+                self._seed_life(n)
+
+        # Live cells at full accent, cells that died recently as a fading
+        # ghost. The trail is what makes gliders legible at 32x32 — without it
+        # the board reads as unrelated blinking dots between steps.
+        live = accent
+        buf = bytearray(n * n * 3)
+        for y in range(n):
+            row = self._life[y]
+            ghost_row = self._life_ghost[y] if self._life_ghost else None
+            base = y * n * 3
+            for x in range(n):
+                if row[x]:
+                    r, g, b = live
+                elif ghost_row is not None and ghost_row[x]:
+                    k = ghost_row[x] / 255.0
+                    r, g, b = (int(live[0] * k), int(live[1] * k), int(live[2] * k))
+                else:
+                    r = g = b = 0
+                off = base + x * 3
+                buf[off] = r
+                buf[off + 1] = g
+                buf[off + 2] = b
+        small = Image.frombytes("RGB", (n, n), bytes(buf))
+        return small.resize((size, size), Image.Resampling.NEAREST)
+
+    # ── fireplace ─────────────────────────────────────────────────
+    def _fire_frame(self, size: int) -> Image.Image:
+        n = IDLE_COARSE
+        if not self._fire:
+            self._fire = [bytearray(n) for _ in range(n)]
+
+        grid = self._fire
+        # Fresh heat along the bottom row, then diffuse upward. Keeping the
+        # source noisy is what makes the flame flicker rather than pulse.
+        bottom = grid[n - 1]
+        for x in range(n):
+            bottom[x] = random.randint(160, 255) if random.random() < 0.8 else random.randint(0, 90)
+
+        palette = _fire_palette()
+        for y in range(n - 2, -1, -1):
+            row = grid[y]
+            below = grid[y + 1]
+            for x in range(n):
+                left = below[x - 1] if x > 0 else below[x]
+                right = below[x + 1] if x < n - 1 else below[x]
+                value = (left + below[x] * 2 + right) // 4
+                decay = 6 if value > 40 else 2
+                row[x] = max(0, value - decay)
+
+        buf = bytearray(n * n * 3)
+        for y in range(n):
+            row = grid[y]
+            base = y * n * 3
+            for x in range(n):
+                r, g, b = palette[row[x]]
+                off = base + x * 3
+                buf[off] = r
+                buf[off + 1] = g
+                buf[off + 2] = b
+        small = Image.frombytes("RGB", (n, n), bytes(buf))
+        return small.resize((size, size), Image.Resampling.BILINEAR)
+
 
 def draw_scrolling_text(
     image: Image.Image,
@@ -2897,6 +3621,7 @@ def start_control_server(
     lock: threading.Lock,
     display: MatrixDisplay | MockDisplay,
     args: argparse.Namespace,
+    spotify: SpotifyClient | None = None,
 ) -> HTTPServer | None:
     if port <= 0:
         return None
@@ -2905,6 +3630,7 @@ def start_control_server(
     outer_lock = lock
     outer_display = display
     outer_args = args
+    outer_spotify = spotify
 
     class ControlPanelHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -2918,6 +3644,8 @@ def start_control_server(
                 self._send_state()
             elif parsed.path == "/api/logs":
                 self._send_json(_log_buffer.get_all())
+            elif parsed.path == "/api/frame.png":
+                self._send_frame_png()
             elif parsed.path == "/api/lyrics":
                 with outer_lock:
                     data = {
@@ -2933,13 +3661,19 @@ def start_control_server(
             elif parsed.path == "/mode":
                 params = urllib.parse.parse_qs(parsed.query)
                 mode = params.get("set", [""])[0]
-                if mode in ("default", "cd", "lyrics", "clock"):
+                # Same vocabulary as POST /api/mode — these used to disagree,
+                # so a mode you could set from the panel 400'd from a URL.
+                if mode in DISPLAY_MODES:
                     with outer_lock:
                         outer_state.display_mode = mode
+                        outer_state.sleeping = False
+                    mark_settings_dirty()
                     log(f"Mode changed to '{mode}' via URL")
                     self._send_json({"ok": True, "mode": mode})
                 else:
-                    self._send_json({"error": "Invalid mode. Use: default, cd, lyrics, clock"}, 400)
+                    self._send_json(
+                        {"error": f"Invalid mode. Use: {', '.join(DISPLAY_MODES)}"}, 400
+                    )
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -2956,13 +3690,18 @@ def start_control_server(
 
             if parsed.path == "/api/mode":
                 mode = body.get("mode", "")
-                if mode in ("default", "cd", "lyrics", "clock", "custom"):
+                if mode in DISPLAY_MODES:
                     with outer_lock:
                         outer_state.display_mode = mode
+                        # Picking a mode is an explicit "show me something",
+                        # so it also wakes a sleeping panel.
+                        outer_state.sleeping = False
                     log(f"Mode changed to '{mode}' via web panel")
                     self._send_json({"ok": True, "mode": mode})
                 else:
-                    self._send_json({"error": "Invalid mode"}, 400)
+                    self._send_json(
+                        {"error": f"Invalid mode. Use: {', '.join(DISPLAY_MODES)}"}, 400
+                    )
 
             elif parsed.path == "/api/brightness":
                 val = self._num(body, outer_state._default_brightness, 1, 100)
@@ -3009,6 +3748,45 @@ def start_control_server(
                     outer_state.smart_scroll = val
                 self._send_json({"ok": True, "smart_scroll": val})
 
+            elif parsed.path == "/api/idle-mode":
+                val = body.get("value", "clock")
+                if val in IDLE_MODES:
+                    with outer_lock:
+                        outer_state.idle_mode = val
+                    log(f"Idle screen set to '{val}'")
+                    self._send_json({"ok": True, "idle_mode": val})
+                else:
+                    self._send_json(
+                        {"error": f"Invalid idle mode. Use: {', '.join(IDLE_MODES)}"}, 400
+                    )
+
+            elif parsed.path == "/api/cd-duration":
+                val = self._num(body, 10.0, 2.0, 120.0, float)
+                if val is None:
+                    self._send_json({"error": "cd-duration must be a number 2-120"}, 400)
+                    return
+                with outer_lock:
+                    outer_state.cd_duration = val
+                self._send_json({"ok": True, "cd_duration": val})
+
+            elif parsed.path == "/api/progress-ring":
+                val = bool(body.get("value", True))
+                with outer_lock:
+                    outer_state.progress_ring = val
+                self._send_json({"ok": True, "progress_ring": val})
+
+            elif parsed.path == "/api/art-pan":
+                val = bool(body.get("value", True))
+                with outer_lock:
+                    outer_state.art_pan = val
+                self._send_json({"ok": True, "art_pan": val})
+
+            elif parsed.path == "/api/sleep":
+                val = bool(body.get("value", False))
+                with outer_lock:
+                    outer_state.sleeping = val
+                self._send_json({"ok": True, "sleeping": val})
+
             elif parsed.path == "/api/scroll-font-size":
                 val = self._num(body, outer_state._default_scroll_font_size, 6, 14)
                 if val is None:
@@ -3040,6 +3818,11 @@ def start_control_server(
                     outer_state.accent_name = "spotify"
                     outer_state.accent_color = COLOR_THEMES["spotify"]
                     outer_state.lyrics_lead_ms = 180
+                    outer_state.idle_mode = "clock"
+                    outer_state.cd_duration = 10.0
+                    outer_state.progress_ring = True
+                    outer_state.art_pan = True
+                    outer_state.sleeping = False
                 try:
                     outer_display.set_brightness(outer_state._default_brightness)
                 except Exception:
@@ -3077,6 +3860,22 @@ def start_control_server(
                 with outer_lock:
                     outer_state.lyrics_lead_ms = val
                 self._send_json({"ok": True, "lyrics_lead_ms": val})
+
+            elif parsed.path == "/api/playback":
+                if outer_spotify is None or not outer_args.enable_playback_control:
+                    self._send_json({"error": "Playback control is disabled"}, 403)
+                    return
+                action = body.get("action", "")
+                try:
+                    ok, message = outer_spotify.playback_command(action)
+                except Exception as exc:
+                    ok, message = False, str(exc)
+                if ok:
+                    log(f"Playback: {message}")
+                    self._send_json({"ok": True, "action": action})
+                else:
+                    log(f"Playback: {message}", "warn")
+                    self._send_json({"error": message}, 400)
 
             elif parsed.path == "/api/logs/clear":
                 _log_buffer.clear()
@@ -3123,6 +3922,13 @@ def start_control_server(
                 self.send_response(404)
                 self.end_headers()
                 self.wfile.write(b"Not Found")
+                return
+
+            # One place to record "a setting changed", rather than a call in
+            # every branch. Validation failures return early and never reach it,
+            # so a rejected request cannot dirty the saved settings.
+            if parsed.path in PERSISTING_ENDPOINTS:
+                mark_settings_dirty()
 
         def _read_body(self) -> dict:
             """Read and parse a JSON request body, refusing oversized payloads.
@@ -3198,6 +4004,29 @@ def start_control_server(
             self.end_headers()
             self.wfile.write(payload)
 
+        def _send_frame_png(self) -> None:
+            """Serve the last frame the matrix was given, as a PNG.
+
+            Lets the panel show exactly what the LEDs show, which makes every
+            other setting tunable without standing over the device. Read
+            without the lock on purpose: the attribute holds an immutable
+            finished frame and rebinding it is atomic, so a reader gets either
+            the previous frame or the next one — never a half-drawn image.
+            """
+            frame = outer_state.last_frame
+            if frame is None:
+                self._send_json({"error": "no frame rendered yet"}, 404)
+                return
+            buffer = BytesIO()
+            frame.save(buffer, format="PNG", optimize=False, compress_level=1)
+            payload = buffer.getvalue()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(payload)
+
         def _send_state(self) -> None:
             with outer_lock:
                 # progress_ms is only as fresh as the last Spotify poll (up to
@@ -3230,7 +4059,17 @@ def start_control_server(
                     "progress_ms": outer_state.progress_ms,
                     "duration_ms": outer_state.duration_ms,
                     "accent_name": outer_state.accent_name,
+                    "accent_rgb": list(outer_state.accent_color),
                     "lyrics_lead_ms": outer_state.lyrics_lead_ms,
+                    "idle_mode": outer_state.idle_mode,
+                    "cd_duration": outer_state.cd_duration,
+                    "progress_ring": outer_state.progress_ring,
+                    "art_pan": outer_state.art_pan,
+                    "sleeping": outer_state.sleeping,
+                    "status_message": outer_state.status_message,
+                    "status_detail": outer_state.status_detail,
+                    "queue_next": outer_state.queue_next,
+                    "can_control": outer_args.enable_playback_control,
                 }
             self._send_json(data)
 
@@ -3255,6 +4094,27 @@ def start_control_server(
 #  SPOTIFY POLLING THREAD
 # ═══════════════════════════════════════════════════════════════════
 
+def _classify_poll_failure(exc: Exception) -> tuple[str, str]:
+    """Turn a poll exception into (headline, detail) for the status screen.
+
+    The detail string doubles as a tag: anything containing "auth" is treated
+    as permanent and shown immediately rather than after repeated failures.
+    """
+    text = str(exc).lower()
+
+    if isinstance(exc, HTTPError) and exc.code in (401, 403):
+        return "Spotify auth needed", "run --auth-only"
+    if isinstance(exc, (socket.gaierror, socket.timeout, TimeoutError)):
+        return "No Wi-Fi", "check network"
+    if isinstance(exc, URLError):
+        return "No Wi-Fi", "check network"
+    if "re-run with --auth-only" in text or "invalid_grant" in text or "refresh" in text:
+        return "Spotify auth needed", "run --auth-only"
+    if any(token in text for token in ("name or service", "unreachable", "timed out", "connection")):
+        return "No Wi-Fi", "check network"
+    return "Spotify error", "see /logs"
+
+
 def poll_spotify(
     spotify: SpotifyClient,
     state: SharedPlaybackState,
@@ -3273,6 +4133,7 @@ def poll_spotify(
     last_poll_progress = 0
     last_poll_mono = 0.0
     progress_offset = 0.0
+    consecutive_failures = 0
 
     while not stop_event.is_set():
         try:
@@ -3288,8 +4149,11 @@ def poll_spotify(
             fetch_time = time.monotonic()
 
             backoff_multiplier = 1
+            consecutive_failures = 0
             with state_lock:
                 state.is_connected = True
+                state.status_message = ""
+                state.status_detail = ""
 
             if art and art.is_playing:
                 last_playing_time = time.time()
@@ -3428,8 +4292,17 @@ def poll_spotify(
             wait_time = active_seconds * backoff_multiplier
             log(f"Spotify API: Backoff: {wait_time}s", "warn")
             backoff_multiplier = min(backoff_multiplier * 2, 64)
+            consecutive_failures += 1
+
+            # Say what is wrong on the panel itself, but only once the failure
+            # looks persistent — a single dropped request should not replace the
+            # clock, which already shows a red pulse while disconnected.
+            message, detail = _classify_poll_failure(exc)
             with state_lock:
                 state.is_connected = False
+                if message and (consecutive_failures >= 3 or "auth" in detail):
+                    state.status_message = message
+                    state.status_detail = detail
             stop_event.wait(wait_time)
 
 
@@ -3455,6 +4328,31 @@ def _install_signal_handlers() -> None:
             signal.signal(sig, _raise_interrupt)
         except (OSError, ValueError):
             pass
+
+
+# CLI flag → the SharedPlaybackState field it seeds. Used to let an explicit
+# flag win over a value restored from settings.json.
+_CLI_STATE_OVERRIDES: tuple[tuple[str, str], ...] = (
+    ("--brightness", "brightness"),
+    ("--rpm", "spin_speed"),
+    ("--text-speed", "text_scroll_speed"),
+    ("--lyrics-style", "lyrics_style"),
+    ("--idle-mode", "idle_mode"),
+    ("--cd-duration", "cd_duration"),
+)
+
+
+def _explicit_cli_overrides(args: argparse.Namespace) -> list[tuple[str, Any]]:
+    """Fields the user set on the command line this run, so they beat settings.
+
+    argparse cannot tell a passed value from a default, so this checks argv
+    directly — the flag being present at all is what makes it an override.
+    """
+    out: list[tuple[str, Any]] = []
+    for flag, dest in _CLI_STATE_OVERRIDES:
+        if any(arg == flag or arg.startswith(f"{flag}=") for arg in sys.argv[1:]):
+            out.append((dest, getattr(args, flag.lstrip("-").replace("-", "_"))))
+    return out
 
 
 def run(args: argparse.Namespace) -> None:
@@ -3548,10 +4446,30 @@ def run(args: argparse.Namespace) -> None:
         _default_text_scroll_speed=args.text_speed,
         _default_lyrics_style=args.lyrics_style,
     )
+    # Saved settings load over the CLI defaults, but anything passed explicitly
+    # on the command line wins — otherwise a stale settings file would silently
+    # override a flag you just typed.
+    playback_state.idle_mode = args.idle_mode
+    playback_state.cd_duration = args.cd_duration
+    if not args.no_settings:
+        if apply_saved_settings(args.settings, playback_state):
+            log(f"Settings: restored from {args.settings}")
+        for dest, value in _explicit_cli_overrides(args):
+            setattr(playback_state, dest, value)
+
     playback_lock = threading.Lock()
     stop_event = threading.Event()
 
-    control_server = start_control_server(args.web_port, playback_state, playback_lock, display, args)
+    if not args.no_settings:
+        threading.Thread(
+            target=settings_saver,
+            args=(args.settings, playback_state, playback_lock, stop_event),
+            daemon=True,
+        ).start()
+
+    control_server = start_control_server(
+        args.web_port, playback_state, playback_lock, display, args, spotify,
+    )
 
     poll_thread = threading.Thread(
         target=poll_spotify,
@@ -3559,6 +4477,11 @@ def run(args: argparse.Namespace) -> None:
         daemon=True,
     )
     poll_thread.start()
+
+    def present(image: Image.Image) -> None:
+        """Push a frame to the panel and keep it for the web preview."""
+        display.show(image)
+        playback_state.last_frame = image
 
     angle = 0.0
     scroll_x = 0.0
@@ -3595,7 +4518,9 @@ def run(args: argparse.Namespace) -> None:
     # Default mode auto-cycle state
     default_cd_start: float = 0.0  # when the CD phase started
     default_last_track_key: str | None = None  # to detect new songs in default mode
-    DEFAULT_CD_DURATION = 10.0  # seconds to show CD before switching to lyrics
+
+    was_sleeping: bool = False
+    idle_screen = IdleScreen()
 
     try:
         while True:
@@ -3624,6 +4549,14 @@ def run(args: argparse.Namespace) -> None:
                 smart_scroll = playback_state.smart_scroll
                 current_lyrics_words = playback_state.lyrics_words
                 progress_offset_ms = playback_state.progress_offset_ms
+                idle_mode = playback_state.idle_mode
+                cd_duration = playback_state.cd_duration
+                show_progress_ring = playback_state.progress_ring
+                art_pan = playback_state.art_pan
+                is_sleeping = playback_state.sleeping
+                status_message = playback_state.status_message
+                status_detail = playback_state.status_detail
+                queue_next = playback_state.queue_next
                 lyrics_font_size = (
                     playback_state.scroll_font_size
                     if playback_state.lyrics_style in ("scroll", "karaoke")
@@ -3654,6 +4587,37 @@ def run(args: argparse.Namespace) -> None:
             #  MODE ROUTING
             # ══════════════════════════════════════════════════
 
+            # --- OVERRIDE: panel asleep ---
+            # Blank and idle down hard. Nothing below this needs to run, and the
+            # point of the switch is that the device stops drawing power.
+            if is_sleeping:
+                if not was_sleeping:
+                    display.clear()
+                    was_sleeping = True
+                    log("Panel asleep")
+                if args.once:
+                    break
+                time.sleep(0.25)
+                continue
+            if was_sleeping:
+                was_sleeping = False
+                log("Panel awake")
+
+            # --- OVERRIDE: something is wrong and nothing is playing ---
+            # Only when idle: a status screen must never interrupt a track that
+            # is still rendering fine from cached state.
+            if status_message and not is_playing and display_mode != "custom":
+                frame = render_status(
+                    size, status_message, status_detail, accent_color,
+                    crisp=not args.no_crisp_text,
+                )
+                present(frame)
+                if args.once:
+                    break
+                sleep_for = max(0.0, (1.0 / idle_fps) - (time.monotonic() - frame_start))
+                time.sleep(sleep_for)
+                continue
+
             # --- STICKY: Custom Slate mode ---
             if display_mode == "custom":
                 with playback_lock:
@@ -3661,7 +4625,7 @@ def run(args: argparse.Namespace) -> None:
                     frames = playback_state.custom_slate_frames
                     delay = playback_state.custom_slate_frame_delay
                 frame = render_custom_slate(size, frames, delay)
-                display.show(frame)
+                present(frame)
                 if args.once:
                     break
                 # A single still image does not need to be re-sent 20x/second.
@@ -3670,15 +4634,20 @@ def run(args: argparse.Namespace) -> None:
                 time.sleep(sleep_for)
                 continue
 
-            # --- STICKY: Clock mode ---
+            # --- STICKY: Idle screen (clock, or the chosen ambient visual) ---
             if display_mode == "clock":
                 with playback_lock:
-                    playback_state.effective_mode = "clock"
-                frame = render_clock(size, is_connected, accent_color)
-                display.show(frame)
+                    playback_state.effective_mode = idle_mode
+                frame = idle_screen.render(
+                    size, idle_mode, is_connected, accent_color, delta, now,
+                )
+                present(frame)
                 if args.once:
                     break
-                sleep_for = max(0.0, (1.0 / idle_fps) - (time.monotonic() - frame_start))
+                # The animations are motion, not a ticking dot — give them the
+                # full frame budget rather than the clock's reduced one.
+                pinned_fps = args.fps if idle_mode != "clock" else idle_fps
+                sleep_for = max(0.0, (1.0 / pinned_fps) - (time.monotonic() - frame_start))
                 time.sleep(sleep_for)
                 continue
 
@@ -3698,7 +4667,7 @@ def run(args: argparse.Namespace) -> None:
                     crisp=not args.no_crisp_text,
                     progress_offset_ms=progress_offset_ms,
                 )
-                display.show(frame)
+                present(frame)
                 if args.once:
                     break
                 sleep_for = max(0.0, (1.0 / args.fps) - (time.monotonic() - frame_start))
@@ -3713,24 +4682,29 @@ def run(args: argparse.Namespace) -> None:
                     default_cd_start = now
 
                 if not is_playing or current_art_key is None:
-                    # Paused or nothing playing → clock
-                    effective = "clock"
-                elif now - default_cd_start < DEFAULT_CD_DURATION:
-                    # Within 10s of track start → CD
+                    # Paused or nothing playing → the idle screen
+                    effective = "idle"
+                elif now - default_cd_start < cd_duration:
+                    # Within the disc window of track start → CD
                     effective = "cd"
                 else:
-                    # After 10s → lyrics
+                    # After it → lyrics
                     effective = "lyrics"
 
                 with playback_lock:
-                    playback_state.effective_mode = effective
+                    playback_state.effective_mode = (
+                        idle_mode if effective == "idle" else effective
+                    )
 
-                if effective == "clock":
-                    frame = render_clock(size, is_connected, accent_color)
-                    display.show(frame)
+                if effective == "idle":
+                    frame = idle_screen.render(
+                        size, idle_mode, is_connected, accent_color, delta, now,
+                    )
+                    present(frame)
                     if args.once:
                         break
-                    sleep_for = max(0.0, (1.0 / idle_fps) - (time.monotonic() - frame_start))
+                    idle_budget = args.fps if idle_mode != "clock" else idle_fps
+                    sleep_for = max(0.0, (1.0 / idle_budget) - (time.monotonic() - frame_start))
                     time.sleep(sleep_for)
                     continue
                 elif effective == "lyrics":
@@ -3746,7 +4720,7 @@ def run(args: argparse.Namespace) -> None:
                         crisp=not args.no_crisp_text,
                         progress_offset_ms=progress_offset_ms,
                     )
-                    display.show(frame)
+                    present(frame)
                     if args.once:
                         break
                     sleep_for = max(0.0, (1.0 / args.fps) - (time.monotonic() - frame_start))
@@ -3838,7 +4812,9 @@ def run(args: argparse.Namespace) -> None:
                 scroll_x += runtime_text_speed * delta
 
             if is_idle_state:
-                new_frame = render_clock(size, is_connected, accent_color)
+                new_frame = idle_screen.render(
+                    size, idle_mode, is_connected, accent_color, delta, now,
+                )
             else:
                 new_frame = create_full_frame(
                     current_art_image, angle, scroll_x, display_text,
@@ -3855,6 +4831,9 @@ def run(args: argparse.Namespace) -> None:
                     frame = new_frame
                 else:
                     if old_is_idle:
+                        # Re-rendering the live animation here would advance it
+                        # twice per frame; a still clock face is the honest
+                        # "what we were showing" for the blend.
                         old_frame = render_clock(size, is_connected, accent_color)
                     else:
                         if is_playing and not is_idle_state:
@@ -3868,13 +4847,18 @@ def run(args: argparse.Namespace) -> None:
             else:
                 frame = new_frame
 
-            display.show(frame)
+            present(frame)
 
             if args.once:
                 break
 
-            # CD mode settled into its idle clock is as static as clock mode.
-            frame_fps = idle_fps if (is_idle_state and not transition_active) else args.fps
+            # CD mode settled into its idle clock is as static as clock mode —
+            # but an animated idle screen still needs the full frame budget.
+            frame_fps = (
+                idle_fps
+                if (is_idle_state and not transition_active and idle_mode == "clock")
+                else args.fps
+            )
             sleep_for = max(0.0, (1.0 / frame_fps) - (time.monotonic() - frame_start))
             time.sleep(sleep_for)
 
@@ -4010,6 +4994,28 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Duration in seconds for track change transition animation.")
     parser.add_argument("--web-port", type=int, default=5000,
                         help="Port for the web control panel (0 to disable).")
+    parser.add_argument("--settings", type=Path, default=Path(".cache/settings.json"),
+                        help="Where panel settings are persisted so brightness, "
+                             "colour and mode survive a restart.")
+    parser.add_argument("--no-settings", action="store_true",
+                        help="Do not load or save settings — start from CLI "
+                             "defaults every time.")
+    parser.add_argument("--idle-mode", choices=list(IDLE_MODES), default="clock",
+                        help="What fills the screen when nothing is playing. "
+                             "'clock' is the original behaviour; 'cycle' rotates "
+                             "through the ambient animations.")
+    parser.add_argument("--no-playback-control", dest="enable_playback_control",
+                        action="store_false",
+                        help="Hide the play/pause/skip buttons in the web panel. "
+                             "They need a token authorized for playback control; "
+                             "re-run --auth-only once after upgrading.")
+    parser.add_argument("--no-queue-peek", dest="enable_queue_peek",
+                        action="store_false",
+                        help="Do not show the next track during the last seconds "
+                             "of the current one.")
+    parser.add_argument("--cd-duration", type=positive_float, default=10.0,
+                        help="Seconds the auto-cycling default mode shows the "
+                             "spinning disc before switching to lyrics.")
     return parser
 
 
