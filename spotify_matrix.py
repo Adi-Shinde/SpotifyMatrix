@@ -2953,7 +2953,9 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>SpotifyMatrix Control</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+  /* No web-font import: this panel is a LAN appliance UI and must render
+     correctly with no internet. The stack below resolves to the platform UI
+     font everywhere, which is what Inter was approximating anyway. */
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -2972,7 +2974,8 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
   body {
     background-color: var(--bg);
     color: var(--text);
-    font-family: 'Inter', -apple-system, sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+                 'Helvetica Neue', Arial, sans-serif;
     -webkit-font-smoothing: antialiased;
     padding: 20px;
     padding-bottom: 60px;
@@ -3004,7 +3007,8 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
     padding: 20px;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
   }
-  .card-title { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: #a1a1aa; font-weight: 600; margin-bottom: 16px; text-shadow: 0 1px 4px rgba(0,0,0,0.8); }
+  .card-title { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: #a1a1aa; font-weight: 600; margin-bottom: 16px; text-shadow: 0 1px 4px rgba(0,0,0,0.8);
+    display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 
   .now-playing { display: flex; gap: 16px; align-items: center; position: relative; overflow: hidden; }
   .album-art { width: 72px; height: 72px; border-radius: 8px; background: #27272a; flex-shrink: 0; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
@@ -3069,6 +3073,77 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
   }
   #advSettings { display: none; }
 
+  /* ── Added controls ──────────────────────────────────────────── */
+  .banner {
+    background: rgba(200,40,50,0.18); border: 1px solid rgba(220,60,70,0.5);
+    color: #ffb4b4; padding: 10px 14px; border-radius: 10px; margin-bottom: 14px;
+    font-size: 13px; font-weight: 500; text-align: center;
+  }
+  .banner.warn {
+    background: rgba(220,160,40,0.16); border-color: rgba(240,180,60,0.5);
+    color: #ffd89b;
+  }
+  .now-label {
+    font-size: 11px; font-weight: 500; color: var(--accent);
+    text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  .mode-hint {
+    color: #a1a1aa; font-size: 11.5px; line-height: 1.45; margin-top: 10px;
+  }
+  .select {
+    width: 100%; background: rgba(0,0,0,0.45); color: white; font-family: inherit;
+    font-size: 14px; padding: 10px 12px; border-radius: 8px;
+    border: 1px solid var(--card-border); outline: none; margin-top: 10px;
+  }
+  .select:focus-visible { border-color: var(--accent); }
+
+  .preview-wrap { display: flex; justify-content: center; padding: 6px 0 2px; }
+  /* Nearest-neighbour and a fixed box: the whole point is to see the pixels. */
+  #matrixPreview {
+    width: 192px; height: 192px; image-rendering: pixelated;
+    border-radius: 10px; border: 1px solid var(--card-border);
+    background: #000; box-shadow: 0 6px 18px rgba(0,0,0,0.55);
+  }
+  .mini-toggle { font-size: 11px; color: #a1a1aa; font-weight: 500; }
+  .mini-toggle input { vertical-align: middle; margin-right: 3px; }
+
+  .progress-track {
+    height: 5px; background: rgba(255,255,255,0.14); border-radius: 3px;
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%; width: 0%; background: var(--accent); border-radius: 3px;
+    transition: width 0.35s linear;
+  }
+  .progress-times {
+    display: flex; justify-content: space-between; margin-top: 7px;
+    font-size: 11.5px; color: #a1a1aa; font-variant-numeric: tabular-nums;
+  }
+  .transport {
+    display: flex; justify-content: center; align-items: center; gap: 18px;
+    margin-top: 14px;
+  }
+  .tp-btn {
+    background: rgba(255,255,255,0.08); border: 1px solid var(--card-border);
+    color: white; width: 42px; height: 42px; border-radius: 50%;
+    font-size: 17px; cursor: pointer; line-height: 1;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .tp-btn:active { transform: scale(0.92); }
+  .tp-btn.tp-main {
+    width: 52px; height: 52px; font-size: 21px;
+    background: var(--accent); border-color: transparent; color: #04140a;
+  }
+  .up-next {
+    font-size: 11px; color: #a1a1aa; margin-top: 5px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .toggle-row { display: flex; flex-direction: column; gap: 12px; margin-top: 18px; }
+  .toggle { display: flex; align-items: flex-start; gap: 9px; cursor: pointer; font-size: 13px; }
+  .toggle input { margin-top: 2px; width: 16px; height: 16px; accent-color: var(--accent); }
+  .toggle em { display: block; font-style: normal; font-size: 11px; color: #8b8b93; margin-top: 1px; }
+  .btn-sleep { background: rgba(80,90,160,0.28); }
+
   /* Color Grid */
   .color-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
   .color-swatch {
@@ -3102,6 +3177,10 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
     <h1>SpotifyMatrix</h1>
   </div>
 
+  <!-- Connection / status banner. Hidden until something is actually wrong,
+       so the normal case costs no vertical space. -->
+  <div id="connBanner" class="banner" style="display:none"></div>
+
   <!-- Now Playing -->
   <div class="card now-playing" onclick="toggleLiveLyrics()" style="cursor: pointer;" title="Tap for Live Lyrics">
     <div class="album-art">
@@ -3111,6 +3190,32 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
       <div id="npTitle" class="track-title" style="color:var(--text-dim)">Not Playing</div>
       <div id="npArtist" class="track-artist">--</div>
       <div id="npInstr" class="instrumental-badge" style="display:none">&#127929; Instrumental</div>
+      <div id="npNext" class="up-next" style="display:none"></div>
+    </div>
+  </div>
+
+  <!-- Progress -->
+  <div class="card" id="progressCard" style="display:none">
+    <div class="progress-track"><div class="progress-fill" id="progFill"></div></div>
+    <div class="progress-times">
+      <span id="progElapsed">0:00</span>
+      <span id="progTotal">0:00</span>
+    </div>
+    <div class="transport" id="transport" style="display:none">
+      <button class="tp-btn" onclick="playback('previous')" title="Previous">&#9198;</button>
+      <button class="tp-btn tp-main" id="tpPlay" onclick="togglePlay()" title="Play/Pause">&#9199;</button>
+      <button class="tp-btn" onclick="playback('next')" title="Next">&#9197;</button>
+    </div>
+  </div>
+
+  <!-- Live matrix preview -->
+  <div class="card">
+    <div class="card-title">
+      <span>&#128250; Live Preview</span>
+      <label class="mini-toggle"><input type="checkbox" id="previewOn" checked onchange="togglePreview()"> on</label>
+    </div>
+    <div class="preview-wrap">
+      <img id="matrixPreview" alt="Live view of the LED matrix" width="64" height="64">
     </div>
   </div>
 
@@ -3124,14 +3229,34 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
 
   <!-- Display Mode -->
   <div class="card">
-    <div class="card-title">&#128242; Display Mode</div>
+    <div class="card-title">
+      <span>&#128242; Display Mode</span>
+      <span class="now-label" id="effectiveLabel"></span>
+    </div>
     <div class="modes">
-      <button class="mode-btn" id="mode-default" onclick="setMode('default')">Auto (Smart)</button>
+      <button class="mode-btn" id="mode-default" onclick="setMode('default')">Original</button>
       <button class="mode-btn" id="mode-cd" onclick="setMode('cd')">CD View</button>
       <button class="mode-btn" id="mode-lyrics" onclick="setMode('lyrics')">Lyrics</button>
-      <button class="mode-btn" id="mode-clock" onclick="setMode('clock')">Clock</button>
-      <button class="mode-btn" id="mode-custom" onclick="setMode('custom')" style="grid-column: span 2;">Custom Slate</button>
+      <button class="mode-btn" id="mode-art" onclick="setMode('art')">Album Art</button>
+      <button class="mode-btn" id="mode-clock" onclick="setMode('clock')">Idle Screen</button>
+      <button class="mode-btn" id="mode-custom" onclick="setMode('custom')">Custom Slate</button>
     </div>
+    <p class="mode-hint" id="modeHint">Original: idle screen when stopped, disc when a track starts, then lyrics.</p>
+  </div>
+
+  <!-- Idle screen -->
+  <div class="card">
+    <div class="card-title">&#127756; Idle Screen</div>
+    <p class="mode-hint">Shown whenever nothing is playing &mdash; and permanently in Idle Screen mode.</p>
+    <select id="idleMode" class="select" onchange="setSetting('idle-mode', this.value)">
+      <option value="clock">Clock (original)</option>
+      <option value="plasma">Plasma</option>
+      <option value="rain">Matrix Rain</option>
+      <option value="stars">Starfield</option>
+      <option value="life">Game of Life</option>
+      <option value="fire">Fireplace</option>
+      <option value="cycle">Cycle through all</option>
+    </select>
   </div>
 
   <!-- Main Settings (Brightness & Lyric Style) -->
@@ -3229,6 +3354,31 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
                onchange="setSetting('text-speed', this.value)">
       </div>
 
+      <div class="slider-group">
+        <div class="slider-label">
+          <span class="name">&#128337; Disc Before Lyrics (s)</span>
+          <span class="value" id="cdDurVal">10</span>
+        </div>
+        <input type="range" id="cdDuration" min="2" max="60" value="10"
+               oninput="document.getElementById('cdDurVal').textContent=this.value"
+               onchange="setSetting('cd-duration', this.value)">
+      </div>
+
+      <div class="toggle-row">
+        <label class="toggle">
+          <input type="checkbox" id="smartScroll" onchange="setSetting('smart-scroll', this.checked)">
+          <span>Smart scroll <em>time-proportional lyric scrolling</em></span>
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="progressRing" onchange="setSetting('progress-ring', this.checked)">
+          <span>Progress ring <em>arc around the disc</em></span>
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="artPan" onchange="setSetting('art-pan', this.checked)">
+          <span>Ken Burns pan <em>slow drift in Album Art mode</em></span>
+        </label>
+      </div>
+
     </div>
   </div>
 
@@ -3241,6 +3391,7 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
   <!-- Actions -->
   <div class="card">
     <div class="btn-row">
+      <button class="btn btn-sleep" id="sleepBtn" onclick="toggleSleep()">&#127769; Sleep</button>
       <button class="btn btn-reset" onclick="resetAll()">&#8635; Reset All</button>
       <button class="btn btn-logs" onclick="window.location='/logs'">&#128196; Logs</button>
     </div>
@@ -3278,6 +3429,17 @@ const COLOR_THEMES = {
     grid.appendChild(el);
   }
   
+  // "Auto" — follow the album art. Its swatch shows whatever colour the
+  // device most recently derived, so it doubles as a readout.
+  const autoEl = document.createElement('div');
+  autoEl.className = 'color-swatch';
+  autoEl.dataset.theme = 'auto';
+  autoEl.title = 'Match the album art';
+  autoEl.style.background = 'linear-gradient(135deg,#ff6b35,#b43cff,#00dcdc)';
+  autoEl.innerHTML = '<span class="check">&#10003;</span>';
+  autoEl.onclick = () => setAccentColor('auto');
+  grid.appendChild(autoEl);
+
   // Custom Color Picker
   const customEl = document.createElement('div');
   customEl.className = 'color-swatch';
@@ -3351,13 +3513,51 @@ function escapeHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+/* Every request goes through here so one hung fetch cannot stall the polling
+   loop. Without the abort a phone that suspends mid-request leaves the panel
+   frozen until TCP eventually gives up. */
+async function apiFetch(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs || 6000);
+  try {
+    return await fetch(url, Object.assign({}, options || {}, {signal: controller.signal}));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+let consecutiveFailures = 0;
+
+function showBanner(text, kind) {
+  const el = document.getElementById('connBanner');
+  if (!el) return;
+  if (!text) { el.style.display = 'none'; return; }
+  el.textContent = text;
+  el.className = 'banner' + (kind ? ' ' + kind : '');
+  el.style.display = 'block';
+}
+
 async function fetchState() {
   try {
-    const res = await fetch('/api/state');
+    const res = await apiFetch('/api/state');
     const s = await res.json();
     currentState = s;
+    consecutiveFailures = 0;
     updateUI(s);
-  } catch(e) {}
+  } catch(e) {
+    // One miss is normal on a phone waking up; say so only if it persists.
+    if (++consecutiveFailures >= 3) {
+      showBanner('Cannot reach the matrix — check that it is powered on.');
+    }
+  }
+}
+
+function fmtTime(ms) {
+  if (!ms || ms < 0) ms = 0;
+  const total = Math.floor(ms / 1000);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return m + ':' + String(s).padStart(2, '0');
 }
 
 function updateUI(s) {
@@ -3382,10 +3582,82 @@ function updateUI(s) {
     document.getElementById('npArtist').textContent = "--";
   }
 
+  // Banner: the device's own words about why nothing is playing beat any
+  // guess the browser could make.
+  if (s.status_message) {
+    showBanner(s.status_message + (s.status_detail ? ' — ' + s.status_detail : ''));
+  } else if (!s.is_connected) {
+    showBanner('Matrix is online but Spotify is unreachable.', 'warn');
+  } else if (s.sleeping) {
+    showBanner('Panel is asleep.', 'warn');
+  } else {
+    showBanner('');
+  }
+
+  // Up next
+  const nextEl = document.getElementById('npNext');
+  if (nextEl) {
+    if (s.queue_next) {
+      nextEl.textContent = '\\u23ED Next: ' + s.queue_next;
+      nextEl.style.display = 'block';
+    } else {
+      nextEl.style.display = 'none';
+    }
+  }
+
+  updateProgress(s);
+
   // Update modes visibility
   document.querySelectorAll('.mode-btn').forEach(el => el.classList.remove('active'));
   const mBtn = document.getElementById('mode-' + s.display_mode);
   if (mBtn) mBtn.classList.add('active');
+
+  // What is actually on the panel right now. In Auto/Original the chosen mode
+  // does not tell you that, which made the button misleading.
+  const effLabel = document.getElementById('effectiveLabel');
+  if (effLabel) {
+    const names = {
+      cd: 'CD view', lyrics: 'Lyrics', art: 'Album art', clock: 'Clock',
+      custom: 'Custom slate', plasma: 'Plasma', rain: 'Matrix rain',
+      stars: 'Starfield', life: 'Game of Life', fire: 'Fireplace'
+    };
+    const eff = names[s.effective_mode] || s.effective_mode || '';
+    effLabel.textContent = (s.display_mode === 'default' && eff) ? 'now: ' + eff : '';
+  }
+
+  const hint = document.getElementById('modeHint');
+  if (hint) {
+    const hints = {
+      default: 'Original: idle screen when stopped, disc when a track starts, then lyrics.',
+      cd: 'Always the spinning disc.',
+      lyrics: 'Always lyrics.',
+      art: 'Cover art filling the panel, with a progress bar.',
+      clock: 'Always the idle screen selected below.',
+      custom: 'Your uploaded image or GIF.'
+    };
+    hint.textContent = hints[s.display_mode] || '';
+  }
+
+  const idleSel = document.getElementById('idleMode');
+  if (idleSel && document.activeElement !== idleSel && s.idle_mode) {
+    idleSel.value = s.idle_mode;
+  }
+
+  function setChk(id, val) {
+    const el = document.getElementById(id);
+    if (el && document.activeElement !== el) el.checked = !!val;
+  }
+  setChk('smartScroll', s.smart_scroll);
+  setChk('progressRing', s.progress_ring);
+  setChk('artPan', s.art_pan);
+
+  const sleepBtn = document.getElementById('sleepBtn');
+  if (sleepBtn) sleepBtn.innerHTML = s.sleeping ? '\\u2600 Wake' : '\\u{1F319} Sleep';
+
+  const transport = document.getElementById('transport');
+  if (transport) transport.style.display = s.can_control ? 'flex' : 'none';
+  const tpPlay = document.getElementById('tpPlay');
+  if (tpPlay) tpPlay.innerHTML = s.is_playing ? '\\u23F8' : '\\u25B6';
 
   const customCard = document.getElementById('customSlateCard');
   const mainSettings = document.getElementById('mainSettingsCard');
@@ -3427,12 +3699,19 @@ function updateUI(s) {
   setSld('scrollFont', 'scrollFontVal', s.scroll_font_size);
   setSld('popFont', 'popFontVal', s.pop_font_size);
   setSld('leadTime', 'leadVal', s.lyrics_lead_ms);
+  setSld('cdDuration', 'cdDurVal', Math.round(s.cd_duration));
 
-  // Colors
-  const t = COLOR_THEMES[s.accent_name] || COLOR_THEMES.spotify;
+  // Colors. Prefer the exact RGB the device reports — a named theme lookup
+  // cannot express 'custom' or the art-derived 'auto'.
+  const rgb = s.accent_rgb || [];
+  const t = (rgb.length === 3)
+    ? {r: rgb[0], g: rgb[1], b: rgb[2]}
+    : (COLOR_THEMES[s.accent_name] || COLOR_THEMES.spotify);
   document.documentElement.style.setProperty('--accent', `rgb(${t.r},${t.g},${t.b})`);
   document.documentElement.style.setProperty('--accent-dim', `rgba(${t.r},${t.g},${t.b},0.15)`);
   document.documentElement.style.setProperty('--accent-glow', `rgba(${t.r},${t.g},${t.b},0.3)`);
+  const autoSw = document.querySelector('.color-swatch[data-theme="auto"]');
+  if (autoSw && s.accent_name === 'auto') autoSw.style.background = `rgb(${t.r},${t.g},${t.b})`;
   
   document.querySelectorAll('.color-swatch').forEach(el => {
     el.classList.toggle('active', el.dataset.theme === s.accent_name);
@@ -3451,9 +3730,84 @@ function updateUI(s) {
   }
 }
 
+/* ── Progress bar ───────────────────────────────────────────────── */
+/* progress_ms is only as fresh as the last Spotify poll, so add its reported
+   age plus our own round-trip rather than treating it as current. */
+function updateProgress(s) {
+  const card = document.getElementById('progressCard');
+  if (!card) return;
+  if (!s.duration_ms) { card.style.display = 'none'; return; }
+  card.style.display = 'block';
+
+  let elapsed = s.progress_ms + (s.progress_age_ms || 0);
+  if (s.is_playing) elapsed += (Date.now() - (window.lastStateFetchTime || Date.now()));
+  elapsed = Math.max(0, Math.min(s.duration_ms, elapsed));
+
+  document.getElementById('progFill').style.width =
+    (elapsed / s.duration_ms * 100).toFixed(2) + '%';
+  document.getElementById('progElapsed').textContent = fmtTime(elapsed);
+  document.getElementById('progTotal').textContent = fmtTime(s.duration_ms);
+}
+
+/* ── Live matrix preview ────────────────────────────────────────── */
+/* Reloaded on a timer with a cache-busting query. A 64x64 PNG is 1-3 KB, so
+   2 FPS over the LAN is nothing; it pauses when the tab is hidden. */
+let previewTimer = null;
+
+function refreshPreview() {
+  const img = document.getElementById('matrixPreview');
+  const on = document.getElementById('previewOn');
+  if (!img || !on || !on.checked || document.hidden) return;
+  img.src = '/api/frame.png?t=' + Date.now();
+}
+
+function togglePreview() {
+  const on = document.getElementById('previewOn');
+  const img = document.getElementById('matrixPreview');
+  if (on && on.checked) {
+    refreshPreview();
+  } else if (img) {
+    img.removeAttribute('src');
+  }
+}
+
+/* ── Transport ──────────────────────────────────────────────────── */
+async function playback(action) {
+  try {
+    const res = await apiFetch('/api/playback', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action: action})
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      showBanner(err.error || 'Playback command failed.', 'warn');
+    }
+    setTimeout(fetchState, 350);
+  } catch(e) {
+    showBanner('Playback command did not reach the matrix.', 'warn');
+  }
+}
+
+function togglePlay() {
+  playback(currentState.is_playing ? 'pause' : 'play');
+}
+
+async function toggleSleep() {
+  const next = !currentState.sleeping;
+  try {
+    await apiFetch('/api/sleep', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({value: next})
+    });
+    setTimeout(fetchState, 150);
+  } catch(e) {}
+}
+
 async function setMode(m) {
   try {
-    await fetch('/api/mode', {
+    await apiFetch('/api/mode', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({mode: m})
@@ -3464,7 +3818,7 @@ async function setMode(m) {
 
 async function setSetting(key, value) {
   try {
-    await fetch('/api/' + key, {
+    await apiFetch('/api/' + key, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({value: value})
@@ -3475,7 +3829,7 @@ async function setSetting(key, value) {
 
 async function setAccentColor(name) {
   try {
-    await fetch('/api/accent-color', {
+    await apiFetch('/api/accent-color', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({value: name})
@@ -3487,7 +3841,7 @@ async function setAccentColor(name) {
 async function resetAll() {
   if (!confirm('Reset all settings to defaults?')) return;
   try {
-    await fetch('/api/reset', { method: 'POST' });
+    await apiFetch('/api/reset', { method: 'POST' });
     setTimeout(fetchState, 300);
   } catch(e) {}
 }
@@ -3628,6 +3982,20 @@ setInterval(() => {
   window.lastStateFetchTime = Date.now();
   fetchState();
 }, 2000);
+
+// Advance the progress bar between state fetches so it moves smoothly rather
+// than stepping once every two seconds.
+setInterval(() => {
+  if (currentState && currentState.is_playing) updateProgress(currentState);
+}, 500);
+
+// Live preview, paused while the tab is hidden so a backgrounded phone is not
+// pulling frames it cannot show.
+previewTimer = setInterval(refreshPreview, 500);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) { refreshPreview(); fetchState(); }
+});
+refreshPreview();
 </script>
 </body>
 </html>
@@ -3645,12 +4013,13 @@ LOGS_PAGE_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SpotifyMatrix Logs</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap');
+  /* Self-contained for the same reason as the control panel. */
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
   body {
-    font-family: 'JetBrains Mono', monospace;
+    font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas,
+                 'Liberation Mono', monospace;
     background: #0a0a0a;
     color: #a1a1aa;
     min-height: 100vh;
