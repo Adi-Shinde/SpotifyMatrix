@@ -202,6 +202,21 @@ def test_settings_round_trip(tmp_path):
     assert restored.cd_duration == 25.0
 
 
+def test_settings_round_trip_contrast(tmp_path):
+    path = tmp_path / "settings_contrast.json"
+    state = sm.SharedPlaybackState()
+    state.accent_name = "contrast"
+    state.contrast_accent_color = (0, 240, 250)
+    state.accent_color = (0, 240, 250)
+    sm.save_settings(path, state, threading.Lock())
+
+    restored = sm.SharedPlaybackState()
+    assert sm.apply_saved_settings(path, restored) is True
+    assert restored.accent_name == "contrast"
+    assert restored.contrast_accent_color == (0, 240, 250)
+    assert restored.accent_color == (0, 240, 250)
+
+
 def _write_settings(path, body: dict) -> None:
     """Write a settings file stamped with the current schema version."""
     import json
@@ -305,6 +320,106 @@ def test_extract_accent_color_caches_by_track_key():
     # Same key, different art: the cached value must win.
     second = sm.extract_accent_color(Image.new("RGB", (8, 8), (30, 30, 200)), "k1")
     assert first == second
+
+
+def test_extract_contrast_accent_color_against_red():
+    """Red album art must contrast cleanly with a vivid cyan/aqua."""
+    from PIL import Image
+    red_art = Image.new("RGB", (64, 64), (210, 25, 25))
+    r, g, b = sm.extract_contrast_accent_color(red_art, None)
+    assert max(g, b) > r, "should complementary shift away from red toward cyan"
+    assert max(r, g, b) >= 190, "must be vivid and bright enough to read clearly"
+
+
+def test_extract_contrast_accent_color_against_blue():
+    """Blue album art must contrast cleanly with a warm gold/amber."""
+    from PIL import Image
+    blue_art = Image.new("RGB", (64, 64), (25, 45, 210))
+    r, g, b = sm.extract_contrast_accent_color(blue_art, None)
+    assert r > b, "should shift away from blue toward warm gold"
+    assert max(r, g, b) >= 190, "must be vivid and bright"
+
+
+def test_extract_contrast_accent_color_handles_monochrome():
+    """Dark monochrome yields bright cyan, light yields cobalt."""
+    from PIL import Image
+    black = Image.new("RGB", (64, 64), (0, 0, 0))
+    white = Image.new("RGB", (64, 64), (255, 255, 255))
+    c_black = sm.extract_contrast_accent_color(black, None)
+    c_white = sm.extract_contrast_accent_color(white, None)
+    assert c_black == (0, 225, 235), "black art yields vivid electric cyan"
+    assert c_white == (35, 75, 220), "white art yields deep cobalt"
+
+
+def test_extract_contrast_accent_color_caches_by_track_key():
+    from PIL import Image
+    first = sm.extract_contrast_accent_color(Image.new("RGB", (8, 8), (200, 30, 30)), "ck1")
+    second = sm.extract_contrast_accent_color(Image.new("RGB", (8, 8), (30, 30, 200)), "ck1")
+    assert first == second
+
+
+def test_render_record_with_border_color():
+    from PIL import Image
+    art = Image.new("RGB", (64, 64), (200, 20, 20))
+    img = sm.render_record(art, 0.0, 64, border_color=(0, 240, 250), progress=0.4, line_width=3)
+    assert isinstance(img, Image.Image)
+    assert img.size == (64, 64)
+
+
+def test_render_full_art_with_progress_color():
+    from PIL import Image
+    art = Image.new("RGB", (64, 64), (200, 20, 20))
+    img = sm.render_full_art(art, 64, progress=0.5, progress_color=(0, 240, 250), line_width=3)
+    assert isinstance(img, Image.Image)
+    assert img.size == (64, 64)
+
+
+def test_get_contained_art_square():
+    from PIL import Image
+    art = Image.new("RGB", (300, 300), (255, 0, 0))
+    contained = sm._get_contained_art(art, "sq1", 64)
+    assert contained.size == (64, 64)
+    assert contained.getpixel((0, 0)) == (255, 0, 0)
+    assert contained.getpixel((63, 63)) == (255, 0, 0)
+
+
+def test_get_contained_art_wide_landscape_with_black_bars():
+    from PIL import Image
+    # 120x60 (2:1 aspect ratio) inside 64x64 -> should scale to 64x32 with 16px top & bottom black bars
+    art = Image.new("RGB", (120, 60), (255, 0, 0))
+    contained = sm._get_contained_art(art, "wide1", 64)
+    assert contained.size == (64, 64)
+    # Top and bottom rows must be black bars
+    assert contained.getpixel((32, 5)) == (0, 0, 0)
+    assert contained.getpixel((32, 60)) == (0, 0, 0)
+    # Center must be red
+    assert contained.getpixel((32, 32)) == (255, 0, 0)
+
+
+def test_get_contained_art_tall_portrait_with_black_bars():
+    from PIL import Image
+    # 60x120 (1:2 aspect ratio) inside 64x64 -> should scale to 32x64 with 16px left & right black bars
+    art = Image.new("RGB", (60, 120), (0, 0, 255))
+    contained = sm._get_contained_art(art, "tall1", 64)
+    assert contained.size == (64, 64)
+    # Left and right columns must be black bars
+    assert contained.getpixel((5, 32)) == (0, 0, 0)
+    assert contained.getpixel((60, 32)) == (0, 0, 0)
+    # Center must be blue
+    assert contained.getpixel((32, 32)) == (0, 0, 255)
+
+
+def test_settings_round_trip_line_width(tmp_path):
+    path = tmp_path / "settings.json"
+    state = sm.SharedPlaybackState()
+    state.line_width = 3
+    state.art_pan = False
+    sm.save_settings(path, state, threading.Lock())
+
+    loaded = sm.SharedPlaybackState()
+    assert sm.apply_saved_settings(path, loaded) is True
+    assert loaded.line_width == 3
+    assert loaded.art_pan is False
 
 
 # ── poll failure classification ──────────────────────────────────────

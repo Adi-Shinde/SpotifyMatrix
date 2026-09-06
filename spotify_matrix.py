@@ -211,6 +211,8 @@ class SharedPlaybackState:
     # Accent color
     accent_color: tuple[int, int, int] = (30, 215, 96)  # default SPOTIFY_GREEN
     accent_name: str = "spotify"
+    # Contrast color derived from artwork (used for CD borders, hairline progress bar, or globally when chosen)
+    contrast_accent_color: tuple[int, int, int] = (0, 220, 220)
     # Custom Slate mode
     custom_slate_frames: list[Image.Image] = field(default_factory=list)
     custom_slate_frame_delay: float = 0.1
@@ -235,7 +237,8 @@ class SharedPlaybackState:
     # Seconds the auto-cycling "default" mode shows the disc before lyrics.
     cd_duration: float = 10.0
     progress_ring: bool = True  # thin arc around the disc showing track position
-    art_pan: bool = True  # Ken Burns drift in full-bleed art mode
+    art_pan: bool = False  # Ken Burns drift in full-bleed art mode (disabled by default)
+    line_width: int = 1  # 1-5 px border/progress line width for CD and full art
     sleeping: bool = False  # panel blanked on request
     # Boot defaults (for reset)
     _default_brightness: int = 65
@@ -244,6 +247,7 @@ class SharedPlaybackState:
     _default_lyrics_style: str = "scroll"
     _default_scroll_font_size: int = 9
     _default_pop_font_size: int = 9
+    _default_line_width: int = 1
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -266,6 +270,8 @@ PERSISTED_FIELDS: tuple[str, ...] = (
     "lyrics_lead_ms",
     "accent_name",
     "accent_color",
+    "contrast_accent_color",
+    "line_width",
     "cd_duration",
     "progress_ring",
     "art_pan",
@@ -299,6 +305,8 @@ PERSISTING_ENDPOINTS: frozenset[str] = frozenset({
     "/api/cd-duration",
     "/api/progress-ring",
     "/api/art-pan",
+    "/api/line-width",
+    "/api/border-width",
     "/api/reset",
 })
 
@@ -334,6 +342,9 @@ def save_settings(path: Path, state: SharedPlaybackState, lock: threading.Lock) 
     accent = payload.get("accent_color")
     if isinstance(accent, tuple):
         payload["accent_color"] = list(accent)
+    contrast = payload.get("contrast_accent_color")
+    if isinstance(contrast, tuple):
+        payload["contrast_accent_color"] = list(contrast)
     try:
         _atomic_write_json(path, payload)
     except OSError as exc:
@@ -408,12 +419,20 @@ def apply_saved_settings(path: Path, state: SharedPlaybackState) -> bool:
         ("brightness", 1, 100, int),
         ("lyrics_lead_ms", 0, 500, int),
         ("cd_duration", 2.0, 120.0, float),
+        ("line_width", 1, 5, int),
     ):
         if name in data:
             value = _clamp(data[name], lo, hi, cast)
             if value is not None:
                 setattr(state, name, value)
                 applied = True
+
+    raw_contrast = data.get("contrast_accent_color")
+    if isinstance(raw_contrast, (list, tuple)) and len(raw_contrast) == 3:
+        channels = [_clamp(c, 0, 255, int) for c in raw_contrast]
+        if all(c is not None for c in channels):
+            state.contrast_accent_color = (channels[0], channels[1], channels[2])
+            applied = True
 
     accent_name = data.get("accent_name")
     if accent_name in COLOR_THEMES:
@@ -428,6 +447,10 @@ def apply_saved_settings(path: Path, state: SharedPlaybackState) -> bool:
                 state.accent_name = accent_name
                 state.accent_color = (channels[0], channels[1], channels[2])
                 applied = True
+    elif accent_name == "contrast":
+        state.accent_name = "contrast"
+        state.accent_color = state.contrast_accent_color
+        applied = True
 
     return applied
 
@@ -1148,6 +1171,44 @@ def _get_fitted_art(art: Image.Image, art_key: str | None, size: int) -> Image.I
     return fitted
 
 
+_contained_art_cache: dict[tuple[str, int], Image.Image] = {}
+
+
+def _get_contained_art(art: Image.Image, art_key: str | None, size: int) -> Image.Image:
+    """Fit the album art cleanly into (size, size) preserving aspect ratio without crop or stretch.
+
+    If the artwork is non-square, letterbox or pillarbox black bars are added so the entire
+    artwork fits as much as it can within the matrix display, perfectly steady without bouncing.
+    """
+    if art_key is None:
+        w, h = art.size
+        scale = min(size / max(1, w), size / max(1, h))
+        nw = max(1, min(size, int(round(w * scale))))
+        nh = max(1, min(size, int(round(h * scale))))
+        resized = art.resize((nw, nh), Image.Resampling.LANCZOS).convert("RGB")
+        frame = Image.new("RGB", (size, size), (0, 0, 0))
+        frame.paste(resized, ((size - nw) // 2, (size - nh) // 2))
+        return frame
+
+    cache_key = (art_key, size)
+    cached = _contained_art_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if len(_contained_art_cache) >= 4:
+        _contained_art_cache.clear()
+
+    w, h = art.size
+    scale = min(size / max(1, w), size / max(1, h))
+    nw = max(1, min(size, int(round(w * scale))))
+    nh = max(1, min(size, int(round(h * scale))))
+    resized = art.resize((nw, nh), Image.Resampling.LANCZOS).convert("RGB")
+    frame = Image.new("RGB", (size, size), (0, 0, 0))
+    frame.paste(resized, ((size - nw) // 2, (size - nh) // 2))
+    _contained_art_cache[cache_key] = frame
+    return frame
+
+
 def render_record(
     art: Image.Image | None,
     angle: float,
@@ -1155,6 +1216,8 @@ def render_record(
     art_key: str | None = None,
     progress: float | None = None,
     accent_color: tuple[int, int, int] = SPOTIFY_GREEN,
+    border_color: tuple[int, int, int] | None = None,
+    line_width: int = 1,
 ) -> Image.Image:
     frame = Image.new("RGBA", (size, size), (0, 0, 0, 255))
     if art is None:
@@ -1168,16 +1231,21 @@ def render_record(
     frame.paste(rotated.convert("RGBA"), (0, 0), disc_mask)
 
     draw = ImageDraw.Draw(frame, "RGBA")
-    draw.ellipse((0, 0, size - 1, size - 1), outline=(220, 220, 220, 200), width=1)
+    rim_color = border_color if border_color is not None else accent_color
+    lw = max(1, min(line_width, max(1, size // 8)))
+    # Subtle bezel ring in dimmed contrast color so the border is cleanly defined against the artwork
+    dim_rim = tuple(int(c * 0.5) for c in rim_color) + (180,)
+    draw.ellipse((0, 0, size - 1, size - 1), outline=dim_rim, width=lw)
 
     # Track position as an arc on the bezel. The disc already has a rim, so
-    # this costs no space — the played portion simply lights up in the accent
+    # this costs no space — the played portion simply lights up in the accent/contrast
     # colour, which reads at a glance without adding another element.
     if progress is not None and 0.0 <= progress <= 1.0:
+        arc_w = max(lw, lw + 1 if lw == 1 else lw)
         draw.arc(
             (0, 0, size - 1, size - 1),
             start=-90, end=-90 + 360 * progress,
-            fill=accent_color + (255,), width=2,
+            fill=rim_color + (255,), width=arc_w,
         )
 
     center = size // 2
@@ -1259,49 +1327,155 @@ def extract_accent_color(
     return colour
 
 
+_contrast_extract_cache: dict[str, tuple[int, int, int]] = {}
+
+
+def extract_contrast_accent_color(
+    art: Image.Image, art_key: str | None = None
+) -> tuple[int, int, int]:
+    """Pick an aesthetically harmonious, high-contrast accent colour against the artwork.
+
+    Designed for the CD border, the song length line, and the full album hairline
+    progress bar (or globally when the 'contrast' accent theme is chosen).
+
+    Unlike naive RGB inversion which yields muddy or washed out tones, this uses
+    color harmony in HSV space:
+    1. Analyzes the dominant hue and saturation of the artwork.
+    2. Calculates the perceptual average luminance (Luma).
+    3. Shifts the dominant hue by 180° (complementary) for maximum chromatic contrast.
+    4. Enforces clean, vibrant saturation so it never looks washed out.
+    5. Sets value / brightness based on the artwork's luma to guarantee sharp contrast
+       (e.g. bright vivid aqua on deep red; radiant gold on dark cobalt; rich indigo
+       on pale/white covers).
+    6. For monochrome or grayscale covers, falls back to a crisp electric cyan or
+       bright gold rather than a dull gray.
+    """
+    if art_key is not None:
+        cached = _contrast_extract_cache.get(art_key)
+        if cached is not None:
+            return cached
+
+    thumb = art.convert("RGB").resize((16, 16), Image.Resampling.BILINEAR)
+    raw = thumb.tobytes()
+    pixels = [(raw[i], raw[i + 1], raw[i + 2]) for i in range(0, len(raw), 3)]
+
+    if not pixels:
+        return (0, 220, 220)
+
+    # Average perceptual luminance (0.0 to 255.0)
+    avg_luma = sum(0.299 * r + 0.587 * g + 0.114 * b for r, g, b in pixels) / len(pixels)
+
+    buckets: dict[int, list[float]] = {}
+    total_sat = 0.0
+
+    for r, g, b in pixels:
+        h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+        total_sat += s
+        if v < 0.15:
+            continue
+        bucket = int(h * 24) % 24
+        weight = s * v
+        entry = buckets.setdefault(bucket, [0.0, 0.0, 0.0, 0.0])
+        entry[0] += weight
+        entry[1] += h * weight
+        entry[2] += s * weight
+        entry[3] += v * weight
+
+    mean_sat = total_sat / len(pixels)
+
+    # If the artwork is mostly monochrome / grayscale
+    if not buckets or mean_sat < 0.12:
+        if avg_luma < 128:
+            colour = (0, 225, 235)  # Electric Cyan on dark monochrome
+        else:
+            colour = (35, 75, 220)  # Deep Cobalt Indigo on light monochrome
+    else:
+        best = max(buckets.values(), key=lambda entry: entry[0])
+        total = best[0] or 1.0
+        dom_hue = best[1] / total
+
+        # Shift 180° for complementary contrast
+        contrast_hue = (dom_hue + 0.5) % 1.0
+
+        # Fine-tune aesthetic pairings:
+        # - Red -> Cyan/Aqua
+        # - Blue -> Warm Gold
+        # - Green -> Rose/Magenta
+        # - Purple -> Mint
+        if dom_hue < 0.07 or dom_hue > 0.93:
+            contrast_hue = 0.50
+        elif 0.56 <= dom_hue <= 0.68:
+            contrast_hue = 0.12
+        elif 0.22 <= dom_hue <= 0.40:
+            contrast_hue = 0.90
+        elif 0.70 <= dom_hue <= 0.82:
+            contrast_hue = 0.27
+
+        sat = 0.85
+        if avg_luma < 100:
+            val = 0.98
+        elif avg_luma < 170:
+            val = 0.92
+        else:
+            sat = 0.95
+            val = 0.72
+
+        r, g, b = colorsys.hsv_to_rgb(contrast_hue, sat, val)
+        c_r, c_g, c_b = int(r * 255), int(g * 255), int(b * 255)
+
+        # Ensure luminance separation of at least 50 units
+        contrast_luma = 0.299 * c_r + 0.587 * c_g + 0.114 * c_b
+        if abs(contrast_luma - avg_luma) < 50:
+            if avg_luma > 128:
+                c_r, c_g, c_b = int(c_r * 0.75), int(c_g * 0.75), int(c_b * 0.75)
+            else:
+                c_r = min(255, int(c_r * 1.25) or 220)
+                c_g = min(255, int(c_g * 1.25) or 220)
+                c_b = min(255, int(c_b * 1.25) or 220)
+
+        colour = (c_r, c_g, c_b)
+
+    if art_key is not None:
+        if len(_contrast_extract_cache) > 32:
+            _contrast_extract_cache.clear()
+        _contrast_extract_cache[art_key] = colour
+
+    return colour
+
+
 def render_full_art(
     art: Image.Image | None,
     size: int,
     art_key: str | None = None,
     progress: float | None = None,
     accent_color: tuple[int, int, int] = SPOTIFY_GREEN,
-    pan: bool = True,
+    pan: bool = False,
     pan_phase: float = 0.0,
+    progress_color: tuple[int, int, int] | None = None,
+    line_width: int = 1,
 ) -> Image.Image:
-    """Artwork filling the whole panel, with a hairline progress bar.
+    """Artwork cleanly fitted into the panel with aspect ratio preserved, and a progress bar.
 
-    The simplest mode and often the best-looking one: no disc crop, no
-    rotation, just the cover at the panel's native size. With `pan` it drifts
-    and breathes slowly (Ken Burns), which keeps a paused screen from reading
-    as frozen.
+    Never stretches, crops or forces zoom. Non-square covers have black bars.
     """
     if art is None:
         return render_idle(size)
 
-    if pan:
-        # Oversample, then crop a slowly moving window out of it. Zoom and
-        # drift are on different periods so the motion never visibly loops.
-        over = int(size * 1.18)
-        big = _get_fitted_art(art, f"{art_key}:pan" if art_key else None, over)
-        zoom = 1.0 + 0.045 * math.sin(pan_phase * 0.10)
-        window = max(size, min(over, int(size * zoom)))
-        slack = over - window
-        offset_x = int(slack * (0.5 + 0.5 * math.sin(pan_phase * 0.07)))
-        offset_y = int(slack * (0.5 + 0.5 * math.cos(pan_phase * 0.045)))
-        crop = big.crop((offset_x, offset_y, offset_x + window, offset_y + window))
-        frame = crop.resize((size, size), Image.Resampling.BILINEAR).convert("RGB")
-    else:
-        frame = _get_fitted_art(art, art_key, size).convert("RGB")
+    # Cleanly fit the artwork into (size, size) preserving aspect ratio
+    frame = _get_contained_art(art, art_key, size).copy()
 
-    if progress is not None and 0.0 <= progress <= 1.0:
+    if progress is not None and 0.0 <= progress <= 1.0 and line_width > 0:
         draw = ImageDraw.Draw(frame)
-        y = size - 1
+        lw = max(1, min(line_width, size // 4))
+        y0 = size - lw
+        y1 = size - 1
         # Dim the untravelled part rather than leaving it bare, so the bar is
         # readable over a light-coloured cover.
-        draw.line((0, y, size - 1, y), fill=(28, 28, 28))
+        draw.rectangle((0, y0, size - 1, y1), fill=(28, 28, 28))
         filled = int((size - 1) * progress)
+        bar_color = progress_color if progress_color is not None else accent_color
         if filled > 0:
-            draw.line((0, y, filled, y), fill=accent_color)
+            draw.rectangle((0, y0, filled, y1), fill=bar_color)
     return frame
 
 
@@ -2028,6 +2202,8 @@ def create_full_frame(
     art_key: str | None = None,
     progress: float | None = None,
     accent_color: tuple[int, int, int] = SPOTIFY_GREEN,
+    border_color: tuple[int, int, int] | None = None,
+    line_width: int = 1,
 ) -> Image.Image:
     has_text = bool(display_text) and not args.no_text
     if has_text:
@@ -2041,7 +2217,11 @@ def create_full_frame(
         cd_size = min(size_x, size_y)
 
     cd_img = (
-        render_record(art_image, angle, cd_size, art_key, progress, accent_color)
+        render_record(
+            art_image, angle, cd_size, art_key, progress,
+            accent_color, border_color=border_color,
+            line_width=line_width,
+        )
         if art_image
         else render_idle(cd_size)
     )
@@ -3166,7 +3346,7 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
   .btn-sleep { background: rgba(80,90,160,0.28); }
 
   /* Color Grid */
-  .color-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .color-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
   .color-swatch {
     aspect-ratio: 1; border-radius: 50%; cursor: pointer; position: relative;
     border: 2px solid transparent; transition: transform 0.2s; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
@@ -3385,6 +3565,16 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
                onchange="setSetting('cd-duration', this.value)">
       </div>
 
+      <div class="slider-group">
+        <div class="slider-label">
+          <span class="name">&#9899; Line Width (CD &amp; Art)</span>
+          <span class="value" id="lineWidthVal">1</span>
+        </div>
+        <input type="range" id="lineWidth" min="1" max="5" value="1"
+               oninput="document.getElementById('lineWidthVal').textContent=this.value"
+               onchange="setSetting('line-width', this.value)">
+      </div>
+
       <div class="toggle-row">
         <label class="toggle">
           <input type="checkbox" id="smartScroll" onchange="setSetting('smart-scroll', this.checked)">
@@ -3460,6 +3650,16 @@ const COLOR_THEMES = {
   autoEl.innerHTML = '<span class="check">&#10003;</span>';
   autoEl.onclick = () => setAccentColor('auto');
   grid.appendChild(autoEl);
+
+  // "Contrast" — aesthetically complement the album art.
+  const contrastEl = document.createElement('div');
+  contrastEl.className = 'color-swatch';
+  contrastEl.dataset.theme = 'contrast';
+  contrastEl.title = 'Contrast against album art (clean complementary)';
+  contrastEl.style.background = 'linear-gradient(135deg,#00f2fe,#4facfe,#fa709a)';
+  contrastEl.innerHTML = '<span class="check">&#10003;</span>';
+  contrastEl.onclick = () => setAccentColor('contrast');
+  grid.appendChild(contrastEl);
 
   // Custom Color Picker
   const customEl = document.createElement('div');
@@ -3721,6 +3921,7 @@ function updateUI(s) {
   setSld('popFont', 'popFontVal', s.pop_font_size);
   setSld('leadTime', 'leadVal', s.lyrics_lead_ms);
   setSld('cdDuration', 'cdDurVal', Math.round(s.cd_duration));
+  setSld('lineWidth', 'lineWidthVal', s.line_width || 1);
 
   // Colors. Prefer the exact RGB the device reports — a named theme lookup
   // cannot express 'custom' or the art-derived 'auto'.
@@ -3733,6 +3934,11 @@ function updateUI(s) {
   document.documentElement.style.setProperty('--accent-glow', `rgba(${t.r},${t.g},${t.b},0.3)`);
   const autoSw = document.querySelector('.color-swatch[data-theme="auto"]');
   if (autoSw && s.accent_name === 'auto') autoSw.style.background = `rgb(${t.r},${t.g},${t.b})`;
+  const contrastSw = document.querySelector('.color-swatch[data-theme="contrast"]');
+  const cRgb = s.contrast_accent_rgb || [];
+  if (contrastSw && cRgb.length === 3) {
+    contrastSw.style.background = `rgb(${cRgb[0]},${cRgb[1]},${cRgb[2]})`;
+  }
   
   document.querySelectorAll('.color-swatch').forEach(el => {
     el.classList.toggle('active', el.dataset.theme === s.accent_name);
@@ -4322,6 +4528,16 @@ def start_control_server(
                     outer_state.art_pan = val
                 self._send_json({"ok": True, "art_pan": val})
 
+            elif parsed.path in ("/api/line-width", "/api/border-width"):
+                val = self._num(body, 1, 1, 5, int, "value")
+                if val is None:
+                    self._send_json({"error": "line-width must be an integer 1-5"}, 400)
+                    return
+                with outer_lock:
+                    outer_state.line_width = val
+                log(f"Line width set to {val}px")
+                self._send_json({"ok": True, "line_width": val})
+
             elif parsed.path == "/api/sleep":
                 val = bool(body.get("value", False))
                 with outer_lock:
@@ -4358,11 +4574,13 @@ def start_control_server(
                     outer_state.text_scroll_speed = outer_state._default_text_scroll_speed
                     outer_state.accent_name = "spotify"
                     outer_state.accent_color = COLOR_THEMES["spotify"]
+                    outer_state.contrast_accent_color = (0, 220, 220)
+                    outer_state.line_width = outer_state._default_line_width
                     outer_state.lyrics_lead_ms = 180
                     outer_state.idle_mode = "clock"
                     outer_state.cd_duration = 10.0
                     outer_state.progress_ring = True
-                    outer_state.art_pan = True
+                    outer_state.art_pan = False
                     outer_state.sleeping = False
                 try:
                     outer_display.set_brightness(outer_state._default_brightness)
@@ -4397,6 +4615,17 @@ def start_control_server(
                             )
                     log("Accent color following album art")
                     self._send_json({"ok": True, "accent_name": "auto"})
+                elif val == "contrast":
+                    # Contrast against album art.
+                    with outer_lock:
+                        outer_state.accent_name = "contrast"
+                        if outer_state.image is not None:
+                            outer_state.contrast_accent_color = extract_contrast_accent_color(
+                                outer_state.image, outer_state.art_key
+                            )
+                        outer_state.accent_color = outer_state.contrast_accent_color
+                    log("Accent color set to contrast against album art")
+                    self._send_json({"ok": True, "accent_name": "contrast"})
                 elif val in COLOR_THEMES:
                     with outer_lock:
                         outer_state.accent_name = val
@@ -4613,11 +4842,13 @@ def start_control_server(
                     "duration_ms": outer_state.duration_ms,
                     "accent_name": outer_state.accent_name,
                     "accent_rgb": list(outer_state.accent_color),
+                    "contrast_accent_rgb": list(outer_state.contrast_accent_color),
                     "lyrics_lead_ms": outer_state.lyrics_lead_ms,
                     "idle_mode": outer_state.idle_mode,
                     "cd_duration": outer_state.cd_duration,
                     "progress_ring": outer_state.progress_ring,
                     "art_pan": outer_state.art_pan,
+                    "line_width": outer_state.line_width,
                     "sleeping": outer_state.sleeping,
                     "status_message": outer_state.status_message,
                     "status_detail": outer_state.status_detail,
@@ -4792,13 +5023,16 @@ def poll_spotify(
                     state.fetch_time = fetch_time
                     if image is not None:
                         state.image = image
-                    # Follow the artwork when the accent is set to "auto".
-                    # Derived here rather than in the render loop because it
-                    # only changes when the artwork does.
-                    if state.accent_name == "auto" and state.image is not None:
-                        state.accent_color = extract_accent_color(
+                    if state.image is not None:
+                        state.contrast_accent_color = extract_contrast_accent_color(
                             state.image, state.art_key
                         )
+                        if state.accent_name == "auto":
+                            state.accent_color = extract_accent_color(
+                                state.image, state.art_key
+                            )
+                        elif state.accent_name == "contrast":
+                            state.accent_color = state.contrast_accent_color
 
                 if is_new_track and art.key:
                     last_track_key = art.key
@@ -4923,6 +5157,7 @@ _CLI_STATE_OVERRIDES: tuple[tuple[str, str], ...] = (
     ("--lyrics-style", "lyrics_style"),
     ("--idle-mode", "idle_mode"),
     ("--cd-duration", "cd_duration"),
+    ("--line-width", "line_width"),
 )
 
 
@@ -5025,10 +5260,12 @@ def run(args: argparse.Namespace) -> None:
         text_scroll_speed=args.text_speed,
         brightness=args.brightness,
         lyrics_style=args.lyrics_style,
+        line_width=getattr(args, "line_width", 1),
         _default_brightness=args.brightness,
         _default_spin_speed=args.rpm,
         _default_text_scroll_speed=args.text_speed,
         _default_lyrics_style=args.lyrics_style,
+        _default_line_width=getattr(args, "line_width", 1),
     )
     # Saved settings load over the CLI defaults, but anything passed explicitly
     # on the command line wins — otherwise a stale settings file would silently
@@ -5141,6 +5378,7 @@ def run(args: argparse.Namespace) -> None:
                 is_instrumental = playback_state.is_instrumental
                 lyrics_lead_ms = playback_state.lyrics_lead_ms
                 accent_color = playback_state.accent_color
+                contrast_accent_color = playback_state.contrast_accent_color
                 # These were previously read outside the lock at the render call
                 # sites, inconsistently with every other field here.
                 lyrics_style = playback_state.lyrics_style
@@ -5151,6 +5389,7 @@ def run(args: argparse.Namespace) -> None:
                 cd_duration = playback_state.cd_duration
                 show_progress_ring = playback_state.progress_ring
                 art_pan = playback_state.art_pan
+                line_width = playback_state.line_width
                 is_sleeping = playback_state.sleeping
                 status_message = playback_state.status_message
                 status_detail = playback_state.status_detail
@@ -5309,6 +5548,8 @@ def run(args: argparse.Namespace) -> None:
                         accent_color=accent_color,
                         pan=art_pan and is_playing,
                         pan_phase=now,
+                        progress_color=contrast_accent_color,
+                        line_width=line_width,
                     )
                 present(frame)
                 if args.once:
@@ -5465,6 +5706,8 @@ def run(args: argparse.Namespace) -> None:
                     current_art_image, angle, scroll_x, display_text,
                     size_x, size_y, args, art_key=current_art_key,
                     progress=ring_progress, accent_color=accent_color,
+                    border_color=contrast_accent_color,
+                    line_width=line_width,
                 )
 
             if transition_active and current_transition_mode != "none":
@@ -5489,6 +5732,8 @@ def run(args: argparse.Namespace) -> None:
                             old_art_image, old_angle, old_scroll_x, old_display_text,
                             size_x, size_y, args, art_key=old_art_key,
                             progress=ring_progress, accent_color=accent_color,
+                            border_color=contrast_accent_color,
+                            line_width=line_width,
                         )
                     frame = blend_frames(old_frame, new_frame, progress, mode=current_transition_mode)
             else:
@@ -5668,6 +5913,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cd-duration", type=positive_float, default=10.0,
                         help="Seconds the auto-cycling default mode shows the "
                              "spinning disc before switching to lyrics.")
+    parser.add_argument("--line-width", type=int, default=1, choices=range(1, 6),
+                        help="Line width in pixels for CD border and album art progress bar (1-5, default: 1).")
     return parser
 
 
