@@ -42,11 +42,23 @@ TimeoutStopSec=5
 Restart=always
 RestartSec=5
 
-# Pin to the core reserved by isolcpus=3 in /boot/cmdline.txt. Reserving a
-# core without pinning anything to it takes it away from the scheduler and
-# gives it to nobody — these two settings only work as a pair.
-# Verify with: taskset -cp $(pgrep -f spotify_matrix.py)
-CPUAffinity=3
+# Deliberately NO CPUAffinity= here. An earlier version pinned the service to
+# CPUAffinity=3 to "use" the core reserved by isolcpus=3, on the assumption that
+# nothing else claims it. That assumption is wrong: the library claims it
+# itself. lib/gpio.cc Timers::Init() sets cpu3's governor to `performance` and
+# runs its update thread there, and lib/thread.cc applies a
+# pthread_setaffinity_np to the realtime thread.
+#
+# systemd's CPUAffinity= constrains EVERY thread in the process, so setting it
+# dragged the Python renderer, the web server and the Spotify poller onto core 3
+# alongside the SCHED_FIFO refresh thread that needs that core to itself. With
+# sched_rt_runtime_us at 990000 the RT thread must yield 10ms every second, and
+# with three starved threads queued behind it, that yield is when the panel
+# visibly flickers.
+#
+# Keep isolcpus=3 in cmdline.txt — that is what reserves the core for the
+# library to claim. Verify one FF 99 thread sits alone on psr=3 with:
+#   ps -eLo pid,tid,cls,rtprio,psr,comm | grep python3
 
 # Journal only; the SD card should not be filling up with our stdout.
 StandardOutput=journal

@@ -366,6 +366,23 @@ from the scheduler and given it to nobody.
 **Fix:** verify with `taskset -cp <pid>` and, if needed, add
 `CPUAffinity=3` to the systemd unit or launch under `taskset -c 3`.
 
+> **⚠️ CORRECTION (2026-09-07) — the `CPUAffinity=3` fix was wrong and has been
+> reverted.** The hedge above ("unless the hzeller library's own affinity logic
+> picks it up") is exactly what happens: it does pick it up. `lib/gpio.cc`
+> `Timers::Init()` sets cpu3's governor to `performance` and runs its update
+> thread there; `lib/thread.cc` applies `pthread_setaffinity_np` to the realtime
+> thread.
+>
+> systemd's `CPUAffinity=` constrains *every* thread in the process, so setting
+> it to `3` pulled the Python renderer, web server and Spotify poller onto core 3
+> alongside the `SCHED_FIFO` refresh thread, which then had to contend for the
+> core it is supposed to own. Confirmed on hardware — with the setting, all five
+> threads reported `psr=3`; without it, only the `FF 99` thread sits on core 3
+> and the rest spread across 0–2.
+>
+> Keep `isolcpus=3`; do not pin the service. See
+> [userguidefinal.md Chapter 7](userguidefinal.md#chapter-7-flicker--performance-tuning).
+
 ---
 
 # PART 3 — LYRICS: FIXING READABILITY (your main complaint)
