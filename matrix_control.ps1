@@ -347,82 +347,202 @@ function Cap-Logs {
 }
 
 # ── Anti-flicker system optimization (one-time) ────────────────
+# ── Where the real boot partition is mounted ─────────────────────
+# Raspberry Pi OS Bookworm moved the FAT boot partition from /boot to
+# /boot/firmware. Writing to the wrong one is either a silent no-op (a file
+# on the ext4 root that the bootloader never reads) or, worse, an edit to a
+# file the firmware DOES read while you think it is inert.
+function Get-BootPath {
+    $probe = Invoke-SSH -Command "if [ -f /boot/firmware/cmdline.txt ]; then echo /boot/firmware; elif [ -f /boot/cmdline.txt ]; then echo /boot; else echo NONE; fi"
+    return ($probe | Out-String).Trim()
+}
+
+# ── Restore boot files from the backups this script makes ────────
+function Restore-BootConfig {
+    Write-Section "RESTORE BOOT CONFIG FROM BACKUP"
+    $bootPath = Get-BootPath
+    if ($bootPath -eq "NONE") { Write-Err "Could not locate the boot partition."; return }
+
+    $listing = (Invoke-SSH -Command "ls -la $bootPath/*.matrixbak 2>/dev/null || echo NO_BACKUPS" | Out-String)
+    if ($listing -match "NO_BACKUPS") {
+        Write-Warn "No backups found in $bootPath."
+        Write-Info "If the Pi will not boot, see BOOT_RECOVERY.md - you can fix"
+        Write-Info "this from any PC with the SD card, without reflashing."
+        return
+    }
+    Write-Host $listing.Trim() -ForegroundColor Gray
+    Write-Host ""
+    if ((Read-Host "  Restore these? Type YES") -ne "YES") { Write-Info "Cancelled."; return }
+
+    $cmd = "for f in $bootPath/*.matrixbak; do sudo cp `"`$f`" `"`${f%.matrixbak}`"; done; sync; echo RESTORED"
+    $out = (Invoke-SSH -Command $cmd | Out-String)
+    if ($out -match "RESTORED") {
+        Write-Success "Boot files restored. Reboot to apply."
+    }
+    else {
+        Write-Warn "Restore output: $($out.Trim())"
+    }
+}
+
 function Optimize-AntiFlicker {
     Write-Section "ANTI-FLICKER OPTIMIZATION"
-    Write-Info "This applies system-level tweaks to reduce LED flicker."
-    Write-Info "These only need to be run ONCE (they persist across reboots)."
+
+    # This function edits files the Pi needs in order to boot at all. A bad
+    # cmdline.txt means a kernel that cannot find its root filesystem, which
+    # looks like a solid green ACT LED and no boot. So: back everything up,
+    # write in a way that preserves the FAT directory entry, validate before
+    # committing, and sync before any reboot.
+    $bootPath = Get-BootPath
+    if ($bootPath -eq "NONE") {
+        Write-Err "Could not find cmdline.txt in /boot or /boot/firmware."
+        Write-Warn "Aborting rather than guessing at boot-critical paths."
+        return
+    }
+    Write-Info "Boot partition detected at: $bootPath"
+
+    $cores = 0
+    [void][int]::TryParse((Invoke-SSH -Command "nproc" | Out-String).Trim(), [ref]$cores)
+    Write-Info "CPU cores reported: $cores"
+
+    $doIsolate = $cores -ge 4
+    if (-not $doIsolate) {
+        Write-Warn "Fewer than 4 cores - skipping isolcpus=3 and CPUAffinity=3."
+        Write-Warn "Isolating a core that does not exist breaks the service."
+    }
+
     Write-Host ""
     Write-Host "  What will be done:" -ForegroundColor White
-    Write-Host "  - Isolate CPU core 3 for the matrix (isolcpus=3)" -ForegroundColor DarkGray
+    if ($doIsolate) {
+        Write-Host "  - Back up cmdline.txt and config.txt (*.matrixbak)" -ForegroundColor DarkGray
+        Write-Host "  - Isolate CPU core 3 for the matrix (isolcpus=3)" -ForegroundColor DarkGray
+        Write-Host "  - Pin the service to core 3 (CPUAffinity=3)" -ForegroundColor DarkGray
+    }
     Write-Host "  - Disable onboard audio (conflicts with PWM timing)" -ForegroundColor DarkGray
     Write-Host "  - Disable Bluetooth service (frees resources)" -ForegroundColor DarkGray
     Write-Host ""
-    $confirm = Read-Host "  Apply optimizations? Type YES to confirm"
-    if ($confirm -ne "YES") { Write-Info "Cancelled."; return }
-
-    # 1. isolcpus=3 in /boot/cmdline.txt (if not already present)
-    Write-Info "Setting isolcpus=3 in /boot/cmdline.txt..."
-    $cmd1 = "grep -q 'isolcpus=3' /boot/cmdline.txt && echo ALREADY_SET || sudo sed -i 's/$/ isolcpus=3/' /boot/cmdline.txt && echo ISOLCPUS_DONE"
-    $out1 = Invoke-SSH -Command $cmd1
-    if ($out1 -match "ALREADY_SET") {
-        Write-Info "isolcpus=3 already configured."
+    Write-Warn "Boot files are backed up first. If the Pi ever fails to boot,"
+    Write-Warn "BOOT_RECOVERY.md shows how to fix it from a PC - no reflash."
+    Write-Host ""
+    if ((Read-Host "  Apply optimizations? Type YES to confirm") -ne "YES") {
+        Write-Info "Cancelled."; return
     }
-    elseif ($out1 -match "ISOLCPUS_DONE") {
-        Write-Success "isolcpus=3 added to boot config."
+
+    # ── 0. Back up both boot files ───────────────────────────────
+    Write-Info "Backing up boot files..."
+    $bk = "sudo cp -a $bootPath/cmdline.txt $bootPath/cmdline.txt.matrixbak; " +
+    "[ -f $bootPath/config.txt ] && sudo cp -a $bootPath/config.txt $bootPath/config.txt.matrixbak; " +
+    "sync; echo BACKUP_OK"
+    if ((Invoke-SSH -Command $bk | Out-String) -match "BACKUP_OK") {
+        Write-Success "Backups written (*.matrixbak)."
     }
     else {
-        Write-Warn "isolcpus output: $out1"
+        Write-Err "Backup failed - refusing to edit boot files."
+        return
     }
 
-    # 1b. Pin the service to the core we just reserved.
-    # isolcpus only takes core 3 away from the general scheduler — on its own
-    # it gives that core to nobody, so the matrix keeps competing on 0-2 while
-    # a whole core sits idle. CPUAffinity in the unit is what actually puts the
-    # process there. Check with: taskset -cp $(pgrep -f spotify_matrix.py)
-    Write-Info "Pinning the service to core 3 (CPUAffinity)..."
-    $cmdAff = "grep -q '^CPUAffinity=3' $SERVICE_FILE && echo AFFINITY_SET || " +
-    "(sudo sed -i '/^\[Service\]/a CPUAffinity=3' $SERVICE_FILE && " +
-    "sudo systemctl daemon-reload && echo AFFINITY_DONE)"
-    $outAff = Invoke-SSH -Command $cmdAff
-    if ($outAff -match "AFFINITY_SET") {
-        Write-Info "CPUAffinity=3 already in the unit file."
-    }
-    elseif ($outAff -match "AFFINITY_DONE") {
-        Write-Success "CPUAffinity=3 added - the reserved core is now actually used."
-    }
-    else {
-        Write-Warn "CPUAffinity output: $outAff"
+    # ── 1. isolcpus=3, written safely ────────────────────────────
+    if ($doIsolate) {
+        Write-Info "Setting isolcpus=3 in $bootPath/cmdline.txt..."
+
+        # Built from single-quoted chunks so PowerShell leaves the shell's own
+        # $ variables alone. Three things make this safe where `sed -i` was not:
+        #   * `tr -d '\r\n'` collapses the file to exactly one line, so a stray
+        #     trailing blank line cannot become a second kernel-args line and a
+        #     CRLF file cannot smuggle a CR into the middle of the arguments.
+        #   * the result is validated (one line, still has root=) BEFORE it is
+        #     allowed to replace the live file.
+        #   * `cp` truncates the existing file in place instead of unlinking
+        #     and recreating it the way `sed -i` does, so the FAT directory
+        #     entry is never rewritten. Then sync.
+        $cl = "$bootPath/cmdline.txt"
+        $iso = 'CL="' + $cl + '"; ' +
+        'if grep -q "isolcpus=" "$CL"; then echo ALREADY_SET; else ' +
+        'NEW="$(tr -d ''\r\n'' < "$CL") isolcpus=3"; ' +
+        'printf ''%s\n'' "$NEW" > /tmp/cmdline.new; ' +
+        'if [ "$(wc -l < /tmp/cmdline.new)" -eq 1 ] && grep -q "root=" /tmp/cmdline.new; then ' +
+        'sudo cp /tmp/cmdline.new "$CL"; sync; echo ISOLCPUS_DONE; ' +
+        'else echo VALIDATION_FAILED; fi; ' +
+        'rm -f /tmp/cmdline.new; fi'
+
+        $out1 = (Invoke-SSH -Command $iso | Out-String)
+        if ($out1 -match "ALREADY_SET") {
+            Write-Info "isolcpus already configured."
+        }
+        elseif ($out1 -match "ISOLCPUS_DONE") {
+            Write-Success "isolcpus=3 added."
+        }
+        elseif ($out1 -match "VALIDATION_FAILED") {
+            Write-Err "New cmdline.txt failed validation - original left untouched."
+            return
+        }
+        else {
+            Write-Warn "isolcpus output: $($out1.Trim())"
+        }
+
+        # Show the operator the actual line that will boot the Pi.
+        $shown = (Invoke-SSH -Command "cat $cl" | Out-String).Trim()
+        Write-Host ""
+        Write-Host "  cmdline.txt is now:" -ForegroundColor White
+        Write-Host "  $shown" -ForegroundColor Gray
+        Write-Host ""
+        if ($shown -notmatch "root=") {
+            Write-Err "cmdline.txt has no root= parameter. Restoring backup!"
+            Invoke-SSH -Command "sudo cp $cl.matrixbak $cl; sync" | Out-Null
+            Write-Warn "Backup restored. Nothing further applied."
+            return
+        }
+
+        # ── 1b. Pin the service to the core we reserved ──────────
+        # isolcpus only takes core 3 away from the scheduler; on its own it
+        # gives that core to nobody. This lives on the ext4 root, not the boot
+        # partition, so it cannot affect booting.
+        Write-Info "Pinning the service to core 3 (CPUAffinity)..."
+        $cmdAff = "grep -q '^CPUAffinity=3' $SERVICE_FILE && echo AFFINITY_SET || " +
+        "(sudo sed -i '/^\[Service\]/a CPUAffinity=3' $SERVICE_FILE && " +
+        "sudo systemctl daemon-reload && echo AFFINITY_DONE)"
+        $outAff = (Invoke-SSH -Command $cmdAff | Out-String)
+        if ($outAff -match "AFFINITY_SET") { Write-Info "CPUAffinity=3 already set." }
+        elseif ($outAff -match "AFFINITY_DONE") { Write-Success "CPUAffinity=3 added." }
+        else { Write-Warn "CPUAffinity output: $($outAff.Trim())" }
     }
 
-    # 2. Disable audio in /boot/config.txt
+    # ── 2. Disable onboard audio ─────────────────────────────────
     Write-Info "Disabling onboard audio..."
-    $cmd2 = "grep -q '^dtparam=audio=off' /boot/config.txt && echo ALREADY_OFF || (sudo sed -i 's/^dtparam=audio=on/dtparam=audio=off/' /boot/config.txt && grep -q '^dtparam=audio=off' /boot/config.txt && echo AUDIO_OFF || (echo 'dtparam=audio=off' | sudo tee -a /boot/config.txt > /dev/null && echo AUDIO_OFF))"
-    $out2 = Invoke-SSH -Command $cmd2
-    if ($out2 -match "ALREADY_OFF") {
-        Write-Info "Audio already disabled."
-    }
-    elseif ($out2 -match "AUDIO_OFF") {
-        Write-Success "Onboard audio disabled."
-    }
-    else {
-        Write-Warn "Audio output: $out2"
-    }
+    $cfg = "$bootPath/config.txt"
+    $aud = 'CF="' + $cfg + '"; ' +
+    'if grep -q "^dtparam=audio=off" "$CF"; then echo ALREADY_OFF; else ' +
+    'sudo cp "$CF" /tmp/config.new 2>/dev/null || cp "$CF" /tmp/config.new; ' +
+    'if grep -q "^dtparam=audio=on" /tmp/config.new; then ' +
+    'sed -i "s/^dtparam=audio=on/dtparam=audio=off/" /tmp/config.new; ' +
+    'else printf ''dtparam=audio=off\n'' >> /tmp/config.new; fi; ' +
+    'sudo cp /tmp/config.new "$CF"; sync; rm -f /tmp/config.new; echo AUDIO_OFF; fi'
+    $out2 = (Invoke-SSH -Command $aud | Out-String)
+    if ($out2 -match "ALREADY_OFF") { Write-Info "Audio already disabled." }
+    elseif ($out2 -match "AUDIO_OFF") { Write-Success "Onboard audio disabled." }
+    else { Write-Warn "Audio output: $($out2.Trim())" }
 
-    # 3. Disable Bluetooth
+    # ── 3. Disable Bluetooth (systemd only, no boot files) ───────
     Write-Info "Disabling Bluetooth service..."
-    $cmd3 = "sudo systemctl disable bluetooth.service 2>/dev/null; sudo systemctl stop bluetooth.service 2>/dev/null; echo BT_DONE"
-    $out3 = Invoke-SSH -Command $cmd3
-    if ($out3 -match "BT_DONE") {
-        Write-Success "Bluetooth disabled."
-    }
+    $out3 = (Invoke-SSH -Command "sudo systemctl disable bluetooth.service 2>/dev/null; sudo systemctl stop bluetooth.service 2>/dev/null; echo BT_DONE" | Out-String)
+    if ($out3 -match "BT_DONE") { Write-Success "Bluetooth disabled." }
 
     Write-Host ""
-    Write-Success "All optimizations applied!"
-    Write-Warn "A REBOOT is required for isolcpus and audio changes to take effect."
+    Write-Success "All optimizations applied."
+    Write-Info "Backups kept at $bootPath/*.matrixbak (menu option 9 restores them)."
+    Write-Warn "A REBOOT is required for isolcpus and audio to take effect."
+    Write-Host ""
     $reboot = Read-Host "  Reboot now? (yes/no)"
     if ($reboot -eq "yes") {
+        # sync twice and pause: the boot partition is FAT, and a reboot that
+        # races an unflushed write is how boot files get truncated.
+        Invoke-SSH -Command "sync; sleep 1; sync" | Out-Null
+        Write-Info "Filesystems synced. Rebooting..."
         Invoke-SSH -Command "sudo reboot" | Out-Null
-        Write-Success "Rebooting... wait ~30s then reconnect."
+        Write-Success "Rebooting - wait ~30s then reconnect."
+        Write-Info "If it does not come back, see BOOT_RECOVERY.md."
+    }
+    else {
+        Write-Info "Not rebooting. Changes apply on the next boot."
     }
 }
 
@@ -532,6 +652,7 @@ function Menu-Maintenance {
         Write-Host "  6)  Cap log storage      - limit to 30MB / 2 days (SD card safe)" -ForegroundColor White
         Write-Host "  7)  Anti-flicker setup   - isolcpus + disable audio & BT (one-time)" -ForegroundColor White
         Write-Host "  8)  Check resources      - open htop to monitor CPU/RAM usage" -ForegroundColor White
+        Write-Host "  9)  Restore boot config  - undo option 7 from its backups" -ForegroundColor White
         Write-Host "  0)  Back" -ForegroundColor DarkGray
         Write-Host ""
         $choice = Read-Host "  Select"
@@ -544,6 +665,7 @@ function Menu-Maintenance {
             "6" { Cap-Logs; Pause-Menu }
             "7" { Optimize-AntiFlicker; Pause-Menu }
             "8" { Check-Resources; Pause-Menu }
+            "9" { Restore-BootConfig; Pause-Menu }
             "0" { return }
             default { Write-Warn "Invalid option." }
         }
