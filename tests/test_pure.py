@@ -461,3 +461,32 @@ def test_idle_modes_and_display_modes_match_the_api():
         assert mode in sm.CONTROL_PANEL_HTML, f"{mode} has no UI option"
     for mode in sm.DISPLAY_MODES:
         assert f"mode-{mode}" in sm.CONTROL_PANEL_HTML, f"{mode} has no UI button"
+
+
+# ── numeric overflow (found by the live edge-case sweep) ─────────────
+
+def test_settings_survives_infinity_values(tmp_path):
+    """JSON 1e400 parses as float inf, and int(inf) raises OverflowError.
+
+    That is not a ValueError, so it escaped the guard here and crashed the
+    process during startup -- before the web panel existed to fix it from.
+    """
+    path = tmp_path / "settings.json"
+    _write_settings(path, {"brightness": 1e400, "spin_speed": -1e400,
+                           "cd_duration": float("nan")})
+    state = sm.SharedPlaybackState()
+    sm.apply_saved_settings(path, state)      # must not raise
+    assert state.brightness == 65
+    assert state.spin_speed == 10.0
+    assert state.cd_duration == 10.0
+
+
+@pytest.mark.parametrize("value", [1e400, -1e400, float("nan")])
+def test_settings_rejects_non_finite_numbers(tmp_path, value):
+    import json
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"version": sm.SETTINGS_VERSION,
+                                "brightness": value}).replace("NaN", "1e400"))
+    state = sm.SharedPlaybackState()
+    sm.apply_saved_settings(path, state)
+    assert state.brightness == 65, "a non-finite value must be ignored, not applied"

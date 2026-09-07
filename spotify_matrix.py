@@ -380,11 +380,15 @@ def apply_saved_settings(path: Path, state: SharedPlaybackState) -> bool:
         return False
 
     def _clamp(value: Any, lo: float, hi: float, cast: Any) -> Any | None:
+        # OverflowError matters more here than anywhere else: this runs during
+        # startup, so a settings file containing 1e400 (which JSON parses as
+        # float inf, and int(inf) rejects) would take the whole appliance down
+        # before the web panel exists to fix it from.
         try:
             out = cast(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
-        if out != out:  # NaN
+        if out != out or out in (float("inf"), float("-inf")):  # NaN or inf
             return None
         return max(lo, min(hi, out))
 
@@ -4760,9 +4764,12 @@ def start_control_server(
             client just sees a dropped connection.
             """
             raw = body.get(key, default)
+            # OverflowError is not a ValueError: JSON parses 1e400 as float
+            # inf, and int(inf) raises OverflowError, which escaped this
+            # handler mid-response and dropped the client's connection.
             try:
                 value = cast(raw)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return None
             if value != value or value in (float("inf"), float("-inf")):
                 return None
