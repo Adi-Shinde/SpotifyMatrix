@@ -3350,9 +3350,10 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
   .btn-sleep { background: rgba(80,90,160,0.28); }
 
   /* Color Grid */
-  .color-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
+  .color-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px 10px; }
+  .color-option { display: flex; flex-direction: column; align-items: center; gap: 6px; min-width: 0; }
   .color-swatch {
-    aspect-ratio: 1; border-radius: 50%; cursor: pointer; position: relative;
+    width: 100%; aspect-ratio: 1; border-radius: 50%; cursor: pointer; position: relative;
     border: 2px solid transparent; transition: transform 0.2s; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
   }
   .color-swatch:active { transform: scale(0.9); }
@@ -3362,6 +3363,13 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
   }
   .color-swatch.active { border-color: white; transform: scale(1.1); }
   .color-swatch.active .check { opacity: 1; }
+  /* The swatch scales up when active; the label must not shift with it, so the
+     transform stays on the circle and only the text colour tracks selection. */
+  .color-label {
+    font-size: 10px; line-height: 1.2; color: #8b8b93; text-align: center;
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .color-option.active .color-label { color: var(--text); font-weight: 600; }
 
   .btn-row { display: flex; gap: 12px; }
   .btn {
@@ -3632,47 +3640,69 @@ const COLOR_THEMES = {
   crimson:  {r:220,g:40,b:60}
 };
 
+// Every swatch is a colour with no inherent meaning, so each one carries a
+// visible label. Only 'auto' and 'contrast' used to hint at what they did, and
+// they did it through a hover title, which does not exist on a phone — where
+// this panel is mostly used.
+const ACCENT_LABELS = {
+  spotify: 'Spotify', sunset: 'Sunset', neon: 'Neon', rose: 'Rose',
+  arctic: 'Arctic', gold: 'Gold', crimson: 'Crimson',
+  auto: 'Album Art', contrast: 'Contrast', custom: 'Custom'
+};
+
 (function buildSwatches() {
   const grid = document.getElementById('colorGrid');
-  for (const [name, c] of Object.entries(COLOR_THEMES)) {
-    const el = document.createElement('div');
-    el.className = 'color-swatch';
-    el.dataset.theme = name;
-    el.style.background = `rgb(${c.r},${c.g},${c.b})`;
-    el.innerHTML = '<span class="check">&#10003;</span>';
-    el.onclick = () => setAccentColor(name);
-    grid.appendChild(el);
+
+  // The circle keeps .color-swatch and data-theme: the state sync selects on
+  // both, so wrapping it in a labelled container must not move either.
+  function addOption(theme, background, title) {
+    const wrap = document.createElement('div');
+    wrap.className = 'color-option';
+
+    const sw = document.createElement('div');
+    sw.className = 'color-swatch';
+    sw.dataset.theme = theme;
+    sw.style.background = background;
+    sw.innerHTML = '<span class="check">&#10003;</span>';
+    if (title) { sw.title = title; wrap.title = title; }
+
+    const label = document.createElement('div');
+    label.className = 'color-label';
+    label.textContent = ACCENT_LABELS[theme] || theme;
+
+    wrap.appendChild(sw);
+    wrap.appendChild(label);
+    grid.appendChild(wrap);
+    return sw;
   }
-  
+
+  for (const [name, c] of Object.entries(COLOR_THEMES)) {
+    addOption(name, `rgb(${c.r},${c.g},${c.b})`).onclick = () => setAccentColor(name);
+  }
+
   // "Auto" — follow the album art. Its swatch shows whatever colour the
   // device most recently derived, so it doubles as a readout.
-  const autoEl = document.createElement('div');
-  autoEl.className = 'color-swatch';
-  autoEl.dataset.theme = 'auto';
-  autoEl.title = 'Match the album art';
-  autoEl.style.background = 'linear-gradient(135deg,#ff6b35,#b43cff,#00dcdc)';
-  autoEl.innerHTML = '<span class="check">&#10003;</span>';
-  autoEl.onclick = () => setAccentColor('auto');
-  grid.appendChild(autoEl);
+  addOption(
+    'auto',
+    'linear-gradient(135deg,#ff6b35,#b43cff,#00dcdc)',
+    'Match the album art'
+  ).onclick = () => setAccentColor('auto');
 
   // "Contrast" — aesthetically complement the album art.
-  const contrastEl = document.createElement('div');
-  contrastEl.className = 'color-swatch';
-  contrastEl.dataset.theme = 'contrast';
-  contrastEl.title = 'Contrast against album art (clean complementary)';
-  contrastEl.style.background = 'linear-gradient(135deg,#00f2fe,#4facfe,#fa709a)';
-  contrastEl.innerHTML = '<span class="check">&#10003;</span>';
-  contrastEl.onclick = () => setAccentColor('contrast');
-  grid.appendChild(contrastEl);
+  addOption(
+    'contrast',
+    'linear-gradient(135deg,#00f2fe,#4facfe,#fa709a)',
+    'Contrast against album art (clean complementary)'
+  ).onclick = () => setAccentColor('contrast');
 
   // Custom Color Picker
-  const customEl = document.createElement('div');
-  customEl.className = 'color-swatch';
-  customEl.dataset.theme = 'custom';
-  customEl.style.position = 'relative';
+  const customEl = addOption(
+    'custom',
+    'conic-gradient(red, yellow, lime, aqua, blue, magenta, red)',
+    'Pick any colour'
+  );
   customEl.style.overflow = 'hidden';
-  customEl.style.background = 'conic-gradient(red, yellow, lime, aqua, blue, magenta, red)';
-  
+
   const pickerInput = document.createElement('input');
   pickerInput.type = 'color';
   pickerInput.style.position = 'absolute';
@@ -3707,12 +3737,9 @@ const COLOR_THEMES = {
     } catch(err) {}
   });
   
+  // addOption already built the check mark and placed the swatch in the grid;
+  // only the hidden colour input still needs to go inside the circle.
   customEl.appendChild(pickerInput);
-  const check = document.createElement('span');
-  check.className = 'check';
-  check.innerHTML = '&#10003;';
-  customEl.appendChild(check);
-  grid.appendChild(customEl);
 })();
 
 /* Track the intended state explicitly. Reading style.display broke when
@@ -3943,9 +3970,18 @@ function updateUI(s) {
   if (contrastSw && cRgb.length === 3) {
     contrastSw.style.background = `rgb(${cRgb[0]},${cRgb[1]},${cRgb[2]})`;
   }
-  
+  // Same readout treatment as auto/contrast: a reloaded page was showing the
+  // rainbow placeholder even when a custom colour was the active accent.
+  const customSw = document.querySelector('.color-swatch[data-theme="custom"]');
+  if (customSw && s.accent_name === 'custom') {
+    customSw.style.background = `rgb(${t.r},${t.g},${t.b})`;
+  }
+
   document.querySelectorAll('.color-swatch').forEach(el => {
-    el.classList.toggle('active', el.dataset.theme === s.accent_name);
+    const on = el.dataset.theme === s.accent_name;
+    el.classList.toggle('active', on);
+    // The label lives on the wrapper, not the circle, so it needs the flag too.
+    if (el.parentElement) el.parentElement.classList.toggle('active', on);
   });
   
   // Badges

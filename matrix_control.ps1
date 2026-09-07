@@ -30,8 +30,12 @@ if ($PI_HOST -notmatch '@') { $PI_HOST = "adi@$PI_HOST" }
 $PI_USER = ($PI_HOST -split '@')[0]
 $PI_NAME = ($PI_HOST -split '@')[1]
 $PI_DIR = "~/Documents/SpotifyMatrix"
+# systemd needs an absolute path; $PI_DIR's ~ is only expanded by a shell.
+$PI_ABS_DIR = "/home/$PI_USER/Documents/SpotifyMatrix"
 $SERVICE = "spotifymatrix.service"
-$EXECSTART_BASE = "/home/adi/Documents/SpotifyMatrix/.venv/bin/python3 spotify_matrix.py --rows 64 --cols 64 --chain-length 1 --parallel 1 --gpio-slowdown 5 --no-hardware-pulse --hardware-mapping adafruit-hat-pwm --pwm-bits 9 --limit-refresh-rate-hz 200"
+# Derived from $PI_USER rather than hardcoding /home/adi — the whole point of
+# honouring PI_HOST is that the user is configurable.
+$EXECSTART_BASE = "$PI_ABS_DIR/.venv/bin/python3 spotify_matrix.py --rows 64 --cols 64 --chain-length 1 --parallel 1 --gpio-slowdown 5 --no-hardware-pulse --hardware-mapping adafruit-hat-pwm --pwm-bits 9 --limit-refresh-rate-hz 200"
 $SERVICE_FILE = "/etc/systemd/system/spotifymatrix.service"
 
 # ── Colour helpers ──────────────────────────────────────────
@@ -133,7 +137,7 @@ function Run-Manual {
     Invoke-SSH -Command "sudo systemctl stop $SERVICE 2>/dev/null; echo DONE" | Out-Null
 
     Write-Info "Launching matrix in a new terminal window. Press Ctrl+C in that window to stop."
-    $cmd = "cd /home/adi/Documents/SpotifyMatrix ; sudo -E .venv/bin/python3 spotify_matrix.py " +
+    $cmd = "cd $PI_DIR ; sudo -E .venv/bin/python3 spotify_matrix.py " +
     "--rows 64 --cols 64 --chain-length 1 --parallel 1 " +
     "--gpio-slowdown 5 --no-hardware-pulse " +
     "--hardware-mapping adafruit-hat-pwm " +
@@ -314,8 +318,32 @@ function Reauth-Spotify {
     Write-Host ""
     Write-Success "Both windows are open."
     Write-Info "In the auth window, copy the long URL and paste it into your browser."
-    Write-Info "After clicking Agree, the auth window will confirm the token is saved."
-    Write-Info "Then close both new windows and use option 2 to re-enable autoboot."
+    Write-Warn "Do NOT refresh the browser tab after it says 'authorization complete'."
+    Write-Warn "That page is printed before the code is checked, so a reload can"
+    Write-Warn "wipe the captured code and leave the Pi waiting forever."
+    Write-Host ""
+    Read-Host "  Press Enter once you have clicked Agree in the browser"
+
+    # The browser's success page is not evidence: the callback handler prints it
+    # before verifying a code actually arrived. The token file on the Pi is the
+    # only thing that proves the auth worked.
+    Write-Info "Verifying the token actually landed on the Pi..."
+    $tokenCheck = (Invoke-SSH -Command "test -f $PI_DIR/.cache/spotify_token.json && echo TOKEN_OK || echo TOKEN_MISSING" | Out-String)
+
+    if ($tokenCheck -match "TOKEN_OK") {
+        Write-Success "Token saved. Locking down its permissions..."
+        Invoke-SSH -Command "chmod 700 $PI_DIR/.cache; chmod 600 $PI_DIR/.cache/spotify_token.json; echo DONE" | Out-Null
+        Write-Info "Close the two auth windows, then restarting the service..."
+        $out = Invoke-SSH -Command "sudo systemctl start $SERVICE && echo STARTED"
+        if ($out -match "STARTED") { Write-Success "Service restarted. Re-auth complete." }
+        else { Write-Warn "Could not restart: $out" }
+    }
+    else {
+        Write-Err "No token file on the Pi - the authorization did NOT work."
+        Write-Warn "Ignore what the browser said; it reports success either way."
+        Write-Warn "Close both windows and run this option again. The URL contains a"
+        Write-Warn "one-time 'state' value, so an old link will never work."
+    }
 }
 
 # ── Cap journal logs (SD card protection) ────────────────────
@@ -406,7 +434,7 @@ function Optimize-AntiFlicker {
 
     $doIsolate = $cores -ge 4
     if (-not $doIsolate) {
-        Write-Warn "Fewer than 4 cores - skipping isolcpus=3 and CPUAffinity=3."
+        Write-Warn "Fewer than 4 cores - skipping isolcpus=3."
         Write-Warn "Isolating a core that does not exist breaks the service."
     }
 
@@ -415,7 +443,7 @@ function Optimize-AntiFlicker {
     if ($doIsolate) {
         Write-Host "  - Back up cmdline.txt and config.txt (*.matrixbak)" -ForegroundColor DarkGray
         Write-Host "  - Isolate CPU core 3 for the matrix (isolcpus=3)" -ForegroundColor DarkGray
-        Write-Host "  - Pin the service to core 3 (CPUAffinity=3)" -ForegroundColor DarkGray
+        Write-Host "  - Remove any stale CPUAffinity pin (the library pins itself)" -ForegroundColor DarkGray
     }
     Write-Host "  - Disable onboard audio (conflicts with PWM timing)" -ForegroundColor DarkGray
     Write-Host "  - Disable Bluetooth service (frees resources)" -ForegroundColor DarkGray
@@ -492,17 +520,21 @@ function Optimize-AntiFlicker {
             return
         }
 
-        # ── 1b. Pin the service to the core we reserved ──────────
-        # isolcpus only takes core 3 away from the scheduler; on its own it
-        # gives that core to nobody. This lives on the ext4 root, not the boot
-        # partition, so it cannot affect booting.
-        Write-Info "Pinning the service to core 3 (CPUAffinity)..."
-        $cmdAff = "grep -q '^CPUAffinity=3' $SERVICE_FILE && echo AFFINITY_SET || " +
-        "(sudo sed -i '/^\[Service\]/a CPUAffinity=3' $SERVICE_FILE && " +
-        "sudo systemctl daemon-reload && echo AFFINITY_DONE)"
+        # ── 1b. Make sure the service is NOT pinned ──────────────
+        # This used to add CPUAffinity=3, on the theory that isolcpus reserves
+        # a core and nothing claims it. The library claims it itself:
+        # lib/gpio.cc runs its update thread on cpu3 and lib/thread.cc pins the
+        # realtime thread there. systemd's CPUAffinity constrains EVERY thread,
+        # so pinning dragged the renderer, web server and poller onto core 3 to
+        # fight the SCHED_FIFO refresh thread — which is a flicker source, not a
+        # fix. Strip it if an older run of this script left it behind.
+        Write-Info "Ensuring the service is not CPU-pinned (it must not be)..."
+        $cmdAff = "grep -q '^CPUAffinity=' $SERVICE_FILE && " +
+        "(sudo sed -i '/^CPUAffinity=/d' $SERVICE_FILE && sudo systemctl daemon-reload && echo AFFINITY_REMOVED) || " +
+        "echo AFFINITY_ABSENT"
         $outAff = (Invoke-SSH -Command $cmdAff | Out-String)
-        if ($outAff -match "AFFINITY_SET") { Write-Info "CPUAffinity=3 already set." }
-        elseif ($outAff -match "AFFINITY_DONE") { Write-Success "CPUAffinity=3 added." }
+        if ($outAff -match "AFFINITY_ABSENT") { Write-Info "No CPUAffinity set (correct)." }
+        elseif ($outAff -match "AFFINITY_REMOVED") { Write-Success "Removed stale CPUAffinity pin." }
         else { Write-Warn "CPUAffinity output: $($outAff.Trim())" }
     }
 
