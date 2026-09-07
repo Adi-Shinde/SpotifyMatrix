@@ -1375,7 +1375,10 @@ def extract_contrast_accent_color(
     for r, g, b in pixels:
         h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
         total_sat += s
-        if v < 0.15:
+        # colorsys reports hue 0.0 for anything achromatic, so grey and white
+        # pixels would otherwise vote as "red" and drag the complement to cyan.
+        # They still count toward total_sat and avg_luma, just not toward hue.
+        if v < 0.15 or s < 0.10:
             continue
         bucket = int(h * 24) % 24
         weight = s * v
@@ -1387,33 +1390,52 @@ def extract_contrast_accent_color(
 
     mean_sat = total_sat / len(pixels)
 
-    # If the artwork is mostly monochrome / grayscale
-    if not buckets or mean_sat < 0.12:
+    # Only a cover with nothing lit enough to carry a hue at all falls back to a
+    # constant. The old code also took this path whenever mean_sat < 0.12, which
+    # swallowed every moody or desaturated cover — a large slice of a real
+    # library — and returned one hardcoded cyan for all of them. Near-grey art
+    # still has a colour cast (sepia versus cool grey), and that cast is enough
+    # to harmonise against; the saturation boost below makes it legible.
+    if not buckets:
         if avg_luma < 128:
-            colour = (0, 225, 235)  # Electric Cyan on dark monochrome
+            colour = (0, 225, 235)  # Electric Cyan on a near-black cover
         else:
-            colour = (35, 75, 220)  # Deep Cobalt Indigo on light monochrome
+            colour = (35, 75, 220)  # Deep Cobalt Indigo on a near-white cover
     else:
-        best = max(buckets.values(), key=lambda entry: entry[0])
+        ranked = sorted(buckets.values(), key=lambda entry: entry[0], reverse=True)
+        best = ranked[0]
         total = best[0] or 1.0
         dom_hue = best[1] / total
 
-        # Shift 180° for complementary contrast
-        contrast_hue = (dom_hue + 0.5) % 1.0
+        # Split-complementary, not a hard 180° flip snapped to fixed hues.
+        #
+        # The previous version mapped whole input ranges onto four exact output
+        # hues (0.50, 0.12, 0.90, 0.27). Most album art is warm, and every warm
+        # cover therefore returned the *same* cyan — measured at 73% cyan/blue
+        # across 59 real covers, with two exact values accounting for a third of
+        # them.
+        #
+        # Leaning off the true complement restores per-cover variation, and
+        # choosing the side further from the artwork's second-most-dominant hue
+        # keeps that choice grounded in the art rather than arbitrary: a cover
+        # whose secondary is teal leans violet, and vice versa.
+        opposite = (dom_hue + 0.5) % 1.0
+        second_hue: float | None = None
+        if len(ranked) > 1:
+            second_total = ranked[1][0] or 1.0
+            second_hue = ranked[1][1] / second_total
 
-        # Fine-tune aesthetic pairings:
-        # - Red -> Cyan/Aqua
-        # - Blue -> Warm Gold
-        # - Green -> Rose/Magenta
-        # - Purple -> Mint
-        if dom_hue < 0.07 or dom_hue > 0.93:
-            contrast_hue = 0.50
-        elif 0.56 <= dom_hue <= 0.68:
-            contrast_hue = 0.12
-        elif 0.22 <= dom_hue <= 0.40:
-            contrast_hue = 0.90
-        elif 0.70 <= dom_hue <= 0.82:
-            contrast_hue = 0.27
+        if second_hue is None:
+            contrast_hue = opposite
+        else:
+            def _hue_gap(a: float, b: float) -> float:
+                d = abs(a - b) % 1.0
+                return min(d, 1.0 - d)
+
+            contrast_hue = max(
+                ((opposite - 0.13) % 1.0, (opposite + 0.13) % 1.0),
+                key=lambda cand: _hue_gap(cand, second_hue),
+            )
 
         sat = 0.85
         if avg_luma < 100:
@@ -1423,6 +1445,11 @@ def extract_contrast_accent_color(
         else:
             sat = 0.95
             val = 0.72
+
+        # A near-grey cover only has a faint cast to derive a hue from, so the
+        # answer has to be forced vivid or it reads as another grey on the panel.
+        if mean_sat < 0.12:
+            sat = min(1.0, sat + 0.12)
 
         r, g, b = colorsys.hsv_to_rgb(contrast_hue, sat, val)
         c_r, c_g, c_b = int(r * 255), int(g * 255), int(b * 255)
