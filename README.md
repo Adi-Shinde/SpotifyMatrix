@@ -8,6 +8,11 @@ Everything is managed via an intuitive, mobile-friendly Web Control Panel access
 
 ## Documentation
 
+**Setting up directly on the Pi with an HDMI monitor?** Follow
+[Run on the Pi locally — complete setup and startup guide](RUN_ON_PI_LOCAL.md).
+It covers the Pi's Terminal/browser, installation, Spotify login, CPU/audio
+setup, saved settings, and automatic startup without HDMI. No SSH is required.
+
 This README serves as a brief summary. For full instructions on setup, installation, and usage, please read the definitive user guide:
 
 👉 **[Complete User Guide (userguidefinal.md)](userguidefinal.md)**
