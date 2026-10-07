@@ -584,6 +584,31 @@ http://matrixspot.local:5000
 **Now Playing** — track, artist, playback state, over a glassmorphism blur of
 the album art.
 
+**Saving your choices** — every configuration change automatically saves on
+the Pi in `~/Documents/SpotifyMatrix/.cache/settings.json`. Wait for **Saved on
+Pi** before turning off power. **Save now** also flushes any pending editor
+text, and retries if the disk was temporarily unable to save. An error is shown
+instead of claiming success. Disconnecting HDMI has no effect on these settings.
+
+Saved choices include Original or another display mode, idle screen, lyric
+style, both font sizes, smart scrolling, lyric lead, brightness, spin/text
+speeds, disc duration, line width, progress ring, art pan, accent choice and
+custom color, and Sleep. Custom images/GIFs and the last cast restore too.
+The editor's draft image, text, color, preview switch, and expanded advanced
+settings/live lyrics choices are also stored on the Pi. Editing a draft does
+not replace the last cast until you press **Cast to Matrix**. Browsers cannot
+restore a local file-picker selection, but its saved image is restored in the
+canvas. An empty Custom Slate without saved media falls back to Original.
+
+**Reset All** saves the defaults and clears saved custom media/drafts. Play,
+pause, skip, and clearing logs are actions rather than configuration to repeat
+at boot. Spotify's current song and playback progress are fetched fresh.
+
+Install the current service template from Step 10 and restart the service after
+updating an existing installation. Its `--prefer-saved-settings` flag lets web
+choices take priority over boot defaults. Manual command-line runs can still
+override a saved setting with an explicit flag.
+
 **🎤 Live Lyrics** — synced lyrics streamed to your phone, drift-corrected
 against the matrix, with the active line in your accent colour.
 

@@ -35,7 +35,7 @@ $PI_ABS_DIR = "/home/$PI_USER/Documents/SpotifyMatrix"
 $SERVICE = "spotifymatrix.service"
 # Derived from $PI_USER rather than hardcoding /home/adi — the whole point of
 # honouring PI_HOST is that the user is configurable.
-$EXECSTART_BASE = "$PI_ABS_DIR/.venv/bin/python3 spotify_matrix.py --rows 64 --cols 64 --chain-length 1 --parallel 1 --gpio-slowdown 5 --no-hardware-pulse --hardware-mapping adafruit-hat-pwm --pwm-bits 9 --limit-refresh-rate-hz 200"
+$EXECSTART_BASE = "$PI_ABS_DIR/.venv/bin/python3 spotify_matrix.py --rows 64 --cols 64 --chain-length 1 --parallel 1 --gpio-slowdown 5 --no-hardware-pulse --hardware-mapping adafruit-hat-pwm --pwm-bits 9 --limit-refresh-rate-hz 200 --prefer-saved-settings"
 $SERVICE_FILE = "/etc/systemd/system/spotifymatrix.service"
 
 # ── Colour helpers ──────────────────────────────────────────
@@ -190,30 +190,18 @@ function Stop-AutobootTemp {
     }
 }
 
-# ── Change brightness in service file + restart ─────────────
+# ── Change brightness and persist it through the web API ─────
 function Set-ServiceBrightness {
     param([int]$Brightness)
-    Write-Section "SET AUTOBOOT BRIGHTNESS TO $Brightness"
-    Write-Info "Editing service file..."
-
-    $newExec = "$EXECSTART_BASE --brightness $Brightness"
-    $sedCmd = "sudo sed -i 's|^ExecStart=.*|ExecStart=$newExec|' $SERVICE_FILE"
-    $out = Invoke-SSH -Command "$sedCmd && echo DONE"
-
-    if ($out -match "DONE") {
-        Write-Success "Service file updated with --brightness $Brightness."
-    }
-    else {
-        Write-Warn "sed output: $out"
-    }
-
-    Write-Info "Reloading & restarting service..."
-    $out2 = Invoke-SSH -Command "sudo systemctl daemon-reload && sudo systemctl enable $SERVICE && sudo systemctl restart $SERVICE && echo RESTARTED"
-    if ($out2 -match "RESTARTED") {
-        Write-Success "Service restarted at brightness $Brightness!"
-    }
-    else {
-        Write-Warn "Output: $out2"
+    Write-Section "SAVE BRIGHTNESS TO $Brightness"
+    $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((@{value=$Brightness} | ConvertTo-Json -Compress)))
+    $remoteCommand = "printf %s '$payload' | base64 -d | curl --fail --silent --show-error -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:5000/api/brightness"
+    $out = Invoke-SSH -Command $remoteCommand
+    if (($out -join "`n") -match '"saved"\s*:\s*true') {
+        Write-Success "Brightness applied and saved on the Pi for the next boot."
+    } else {
+        Write-Err "Could not save brightness. Make sure SpotifyMatrix is running."
+        Write-Host ($out -join "`n") -ForegroundColor Gray
     }
 }
 

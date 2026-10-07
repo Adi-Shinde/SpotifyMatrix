@@ -40,7 +40,15 @@ This README serves as a brief summary. For full instructions on setup, installat
 ## Upgrading
 
 Settings now persist to `.cache/settings.json`, so the first boot after an
-upgrade keeps whatever you had set. Two notes:
+upgrade keeps whatever you had set. The panel shows **Saved on Pi** only after
+the write finishes; **Save now** also flushes any pending editor text. Mode,
+brightness, both font sizes, speeds, colors, idle screens, Sleep, custom images
+and GIFs, editor drafts, and panel preferences all restore after a restart.
+HDMI is not needed for saving or restoring them. Use the updated service template
+(`--prefer-saved-settings`) so boot flags cannot replace your web choices.
+For an existing installation, reinstall the service as described in
+[Step 10](userguidefinal.md#step-10--install-the-systemd-service), then restart it.
+Two notes:
 
 - **Playback control and up-next need a re-authorization.** They use Spotify
   scopes the old token does not carry. Run `--auth-only` once (menu option 2 in

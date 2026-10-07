@@ -26,12 +26,13 @@ User=root
 
 # --gamma stays at 1.0 while the rgbmatrix build applies its own CIE1931
 # curve; raise it to ~1.8 only if you measure that it does not.
+# Saved web settings take precedence over service defaults on every boot.
 ExecStart=@DIR@/.venv/bin/python3 spotify_matrix.py \
     --rows 64 --cols 64 --chain-length 1 --parallel 1 \
     --gpio-slowdown 5 --no-hardware-pulse \
     --hardware-mapping adafruit-hat-pwm \
     --pwm-bits 9 --limit-refresh-rate-hz 200 \
-    --brightness 65
+    --prefer-saved-settings
 
 # SIGTERM is turned into a clean shutdown inside the process so the finally
 # block runs display.clear(). Without this the panel keeps showing its last

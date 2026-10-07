@@ -240,6 +240,14 @@ class SharedPlaybackState:
     art_pan: bool = False  # Ken Burns drift in full-bleed art mode (disabled by default)
     line_width: int = 1  # 1-5 px border/progress line width for CD and full art
     sleeping: bool = False  # panel blanked on request
+    # The editor draft and the last cast are separate: editing must not change
+    # what is currently displayed until the user presses Cast to Matrix.
+    custom_slate_media: str = ""
+    slate_draft_media: str = ""
+    panel_preferences: dict[str, Any] = field(default_factory=lambda: {
+        "preview_on": True, "advanced_open": False, "lyrics_open": False,
+        "slate_text": "", "slate_color": "#ffffff",
+    })
     # Boot defaults (for reset)
     _default_brightness: int = 65
     _default_spin_speed: float = 10.0
@@ -275,6 +283,10 @@ PERSISTED_FIELDS: tuple[str, ...] = (
     "cd_duration",
     "progress_ring",
     "art_pan",
+    "sleeping",
+    "custom_slate_media",
+    "slate_draft_media",
+    "panel_preferences",
 )
 
 # Bumped whenever the meaning of a saved field changes. A file from a
@@ -284,12 +296,8 @@ PERSISTED_FIELDS: tuple[str, ...] = (
 # nothing explains.
 SETTINGS_VERSION = 1
 
-# How long to wait after the last change before writing. Dragging a slider
-# fires a request per step; without this the SD card takes the whole sweep.
-SETTINGS_DEBOUNCE_SECONDS = 2.0
-
-# POST endpoints whose effect should outlive a restart. Everything else — slate
-# uploads, log clears, playback commands — is deliberately transient.
+# POST endpoints whose successful response confirms a durable settings write.
+# Playback commands and log clears remain actions, rather than boot settings.
 PERSISTING_ENDPOINTS: frozenset[str] = frozenset({
     "/api/mode",
     "/api/idle-mode",
@@ -308,14 +316,57 @@ PERSISTING_ENDPOINTS: frozenset[str] = frozenset({
     "/api/line-width",
     "/api/border-width",
     "/api/reset",
+    "/api/sleep",
+    "/api/custom-media",
+    "/api/panel-preferences",
+    "/api/save-settings",
 })
 
-_settings_dirty = threading.Event()
+_settings_write_lock = threading.Lock()
 
 
-def mark_settings_dirty() -> None:
-    """Flag that a persisted field changed. The saver thread does the write."""
-    _settings_dirty.set()
+def prepare_slate_media(value: Any) -> tuple[str, list[Image.Image], float]:
+    """Validate media, cap its frames, and persist only matrix-sized images."""
+    if not isinstance(value, str) or len(value) > MAX_REQUEST_BYTES:
+        raise ValueError("Slate image is missing or too large")
+    encoded = value.split(",", 1)[1] if value.startswith("data:image/") else value
+    decoded = base64.b64decode(encoded, validate=True)
+    frames: list[Image.Image] = []
+    with Image.open(BytesIO(decoded)) as img:
+        delay = max(0.02, min(60.0, float(img.info.get("duration", 100)) / 1000.0))
+        for index in range(min(getattr(img, "n_frames", 1), MAX_SLATE_FRAMES)):
+            img.seek(index)
+            frames.append(img.convert("RGB").resize((64, 64), Image.Resampling.LANCZOS))
+    buffer = BytesIO()
+    if len(frames) > 1:
+        frames[0].save(buffer, format="GIF", save_all=True, append_images=frames[1:],
+                       duration=round(delay * 1000), loop=0)
+        mime = "gif"
+    else:
+        frames[0].save(buffer, format="PNG")
+        mime = "png"
+    media = f"data:image/{mime};base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+    return media, frames, delay
+
+
+def validate_panel_preferences(values: Any) -> dict[str, Any]:
+    if not isinstance(values, dict):
+        raise ValueError("Panel preferences must be an object")
+    result: dict[str, Any] = {}
+    for name in ("preview_on", "advanced_open", "lyrics_open"):
+        if name in values:
+            if not isinstance(values[name], bool):
+                raise ValueError(f"{name} must be true or false")
+            result[name] = values[name]
+    if "slate_text" in values:
+        if not isinstance(values["slate_text"], str) or len(values["slate_text"]) > 500:
+            raise ValueError("Slate text must be at most 500 characters")
+        result["slate_text"] = values["slate_text"]
+    if "slate_color" in values:
+        if not isinstance(values["slate_color"], str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", values["slate_color"]):
+            raise ValueError("Slate color must be a six-digit hex color")
+        result["slate_color"] = values["slate_color"]
+    return result
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -331,11 +382,27 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp, path)
+    # Persist the directory entry as well as the file before acknowledging a
+    # save. Windows does not support opening directories this way.
+    if os.name == "posix":
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
 
-def save_settings(path: Path, state: SharedPlaybackState, lock: threading.Lock) -> None:
+def save_settings(path: Path, state: SharedPlaybackState, lock: threading.Lock) -> bool:
+    # Serialize snapshot + replace, so concurrent HTTP requests cannot overwrite
+    # a newer save with an older snapshot or share a temporary file.
+    with _settings_write_lock:
+        return _save_settings(path, state, lock)
+
+
+def _save_settings(path: Path, state: SharedPlaybackState, lock: threading.Lock) -> bool:
     with lock:
         payload: dict[str, Any] = {name: getattr(state, name) for name in PERSISTED_FIELDS}
+        payload["panel_preferences"] = dict(state.panel_preferences)
     payload["version"] = SETTINGS_VERSION
     # Tuples survive a round-trip as lists; normalise now so the loader does not
     # have to care which it is reading.
@@ -347,8 +414,10 @@ def save_settings(path: Path, state: SharedPlaybackState, lock: threading.Lock) 
         payload["contrast_accent_color"] = list(contrast)
     try:
         _atomic_write_json(path, payload)
+        return True
     except OSError as exc:
         log(f"Settings: could not save to {path}: {exc}", "warn")
+        return False
 
 
 def apply_saved_settings(path: Path, state: SharedPlaybackState) -> bool:
@@ -394,9 +463,34 @@ def apply_saved_settings(path: Path, state: SharedPlaybackState) -> bool:
 
     applied = False
 
-    if data.get("display_mode") in DISPLAY_MODES and data["display_mode"] != "custom":
-        # "custom" is deliberately not restorable: the slate image itself is not
-        # persisted, so booting into it would show an empty screen.
+    for name in ("custom_slate_media", "slate_draft_media"):
+        if data.get(name):
+            try:
+                media, frames, delay = prepare_slate_media(data[name])
+                setattr(state, name, media)
+                if name == "custom_slate_media":
+                    state.custom_slate_frames = frames
+                    state.custom_slate_frame_delay = delay
+                applied = True
+            except (ValueError, OSError, OverflowError, Image.DecompressionBombError):
+                log(f"Settings: ignoring invalid {name}", "warn")
+    if isinstance(data.get("panel_preferences"), dict):
+        # Validate each independently so one bad editor field cannot discard
+        # otherwise usable display settings.
+        for name, value in data["panel_preferences"].items():
+            try:
+                validated = validate_panel_preferences({name: value})
+                state.panel_preferences.update(validated)
+                applied = applied or bool(validated)
+            except ValueError:
+                pass
+    if isinstance(data.get("sleeping"), bool):
+        state.sleeping = data["sleeping"]
+        applied = True
+    if data.get("display_mode") in DISPLAY_MODES and (
+        data["display_mode"] != "custom" or state.custom_slate_frames
+    ):
+        # Older settings without saved media still fall back from empty Custom.
         state.display_mode = data["display_mode"]
         applied = True
     if data.get("idle_mode") in IDLE_MODES:
@@ -457,27 +551,6 @@ def apply_saved_settings(path: Path, state: SharedPlaybackState) -> bool:
         applied = True
 
     return applied
-
-
-def settings_saver(
-    path: Path,
-    state: SharedPlaybackState,
-    lock: threading.Lock,
-    stop_event: threading.Event,
-) -> None:
-    """Flush settings SETTINGS_DEBOUNCE_SECONDS after the last change."""
-    while not stop_event.is_set():
-        if not _settings_dirty.wait(timeout=1.0):
-            continue
-        # Coalesce a burst of changes (a slider drag) into one write.
-        while not stop_event.is_set():
-            _settings_dirty.clear()
-            if not _settings_dirty.wait(timeout=SETTINGS_DEBOUNCE_SECONDS):
-                break
-        save_settings(path, state, lock)
-    # Final flush so a change made moments before shutdown is not lost.
-    if _settings_dirty.is_set():
-        save_settings(path, state, lock)
 
 
 @dataclass
@@ -3421,6 +3494,11 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
        so the normal case costs no vertical space. -->
   <div id="connBanner" class="banner" style="display:none"></div>
 
+  <div class="card" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+    <span id="saveStatus" role="status" aria-live="polite" style="flex:1;font-size:13px">Changes save automatically on the Pi.</span>
+    <button class="btn btn-logs" style="flex:0 0 auto" onclick="saveAllSettings()">Save now</button>
+  </div>
+
   <!-- Now Playing -->
   <div class="card now-playing" onclick="toggleLiveLyrics()" style="cursor: pointer;" title="Tap for Live Lyrics">
     <div class="album-art">
@@ -3456,6 +3534,7 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
     </div>
     <div class="preview-wrap">
       <img id="matrixPreview" alt="Live view of the LED matrix" width="64" height="64">
+      <span id="previewOff" style="display:none;color:var(--text-dim)">Preview is off</span>
     </div>
   </div>
 
@@ -3527,7 +3606,7 @@ CONTROL_PANEL_HTML = """<!DOCTYPE html>
     <input type="file" id="slateUpload" accept="image/*" style="margin-bottom:10px; width:100%; color: white; background: rgba(0,0,0,0.4); padding: 5px; border-radius:4px; border: 1px solid var(--card-border);">
     
     <div class="msg-input-row" style="margin-bottom:10px;">
-      <input type="text" class="msg-input" id="slateText" placeholder="Add text...">
+      <input type="text" class="msg-input" id="slateText" maxlength="500" placeholder="Add text...">
       <input type="color" id="slateColor" value="#ffffff" style="width:30px; border:none; padding:0; background:none;">
       <button class="msg-btn" onclick="addSlateText()">Add</button>
     </div>
@@ -3755,7 +3834,7 @@ const ACCENT_LABELS = {
     const g = parseInt(hex.substr(3,2), 16);
     const b = parseInt(hex.substr(5,2), 16);
     try {
-      await fetch('/api/accent-color', {
+      await apiFetch('/api/accent-color', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({value: 'custom', r: r, g: g, b: b})
@@ -3786,6 +3865,7 @@ function applyAdvVisibility(visible) {
 function toggleAdv() {
   advOpen = !advOpen;
   applyAdvVisibility(advOpen);
+  savePanelPreferences({advanced_open: advOpen});
 }
 
 function escapeHtml(s) {
@@ -3795,14 +3875,59 @@ function escapeHtml(s) {
 /* Every request goes through here so one hung fetch cannot stall the polling
    loop. Without the abort a phone that suspends mid-request leaves the panel
    frozen until TCP eventually gives up. */
-async function apiFetch(url, options, timeoutMs) {
+let settingQueue = Promise.resolve();
+let pendingSaves = 0;
+let saveError = '';
+
+function showSaveStatus(text, failed) {
+  const el = document.getElementById('saveStatus');
+  el.textContent = text;
+  el.style.color = failed ? '#f87171' : '';
+}
+
+async function timedFetch(url, options, timeoutMs) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs || 6000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs || 15000);
   try {
     return await fetch(url, Object.assign({}, options || {}, {signal: controller.signal}));
-  } finally {
-    clearTimeout(timer);
-  }
+  } finally { clearTimeout(timer); }
+}
+
+function apiFetch(url, options, timeoutMs) {
+  const persists = options && options.method === 'POST'
+    && url !== '/api/playback' && url !== '/api/logs/clear';
+  if (!persists) return timedFetch(url, options, timeoutMs);
+  pendingSaves++;
+  showSaveStatus('Saving on Pi…', false);
+  const request = settingQueue.then(async () => {
+    try {
+      const res = await timedFetch(url, options, timeoutMs);
+      const result = await res.clone().json();
+      if (!res.ok || !result.saved) throw new Error(result.error || 'Saving is disabled for this run.');
+      saveError = '';
+      return res;
+    } catch(e) {
+      saveError = e.message || 'Could not save changes. Retry Save now.';
+      throw e;
+    } finally {
+      pendingSaves--;
+      showSaveStatus(saveError || (pendingSaves ? 'Saving on Pi…' : 'Saved on Pi'), Boolean(saveError));
+    }
+  });
+  settingQueue = request.catch(() => {});
+  return request;
+}
+
+function savePanelPreferences(values) {
+  return apiFetch('/api/panel-preferences', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(values)
+  }).catch(() => {});
+}
+
+async function saveAllSettings() {
+  clearTimeout(slateDraftTimer);
+  do { if (!await saveSlateDraft()) return; } while (slateEditorDirty);
+  try { await apiFetch('/api/save-settings', {method: 'POST'}); } catch(e) {}
 }
 
 let consecutiveFailures = 0;
@@ -3840,6 +3965,20 @@ function fmtTime(ms) {
 }
 
 function updateUI(s) {
+  const prefs = s.panel_preferences || {};
+  const preview = document.getElementById('previewOn');
+  preview.checked = prefs.preview_on !== false;
+  document.getElementById('matrixPreview').style.display = preview.checked ? '' : 'none';
+  document.getElementById('previewOff').style.display = preview.checked ? 'none' : 'block';
+  if (!preview.checked) document.getElementById('matrixPreview').removeAttribute('src');
+  advOpen = Boolean(prefs.advanced_open);
+  setLiveLyricsOpen(Boolean(prefs.lyrics_open));
+  if (!slateEditorDirty) {
+    for (const [id, key] of [['slateText', 'slate_text'], ['slateColor', 'slate_color']]) {
+      const el = document.getElementById(id);
+      if (document.activeElement !== el && prefs[key] !== undefined) el.value = prefs[key];
+    }
+  }
   // Update Background Image
   const appBg = document.getElementById('appBackground');
   if (s.image_url) {
@@ -4065,8 +4204,11 @@ function refreshPreview() {
 }
 
 function togglePreview() {
+  savePanelPreferences({preview_on: document.getElementById('previewOn').checked});
   const on = document.getElementById('previewOn');
   const img = document.getElementById('matrixPreview');
+  if (img && on) img.style.display = on.checked ? '' : 'none';
+  document.getElementById('previewOff').style.display = on && on.checked ? 'none' : 'block';
   if (on && on.checked) {
     refreshPreview();
   } else if (img) {
@@ -4145,6 +4287,8 @@ async function resetAll() {
   if (!confirm('Reset all settings to defaults?')) return;
   try {
     await apiFetch('/api/reset', { method: 'POST' });
+    slateEditorDirty = false;
+    await loadSlateDraft();
     setTimeout(fetchState, 300);
   } catch(e) {}
 }
@@ -4154,6 +4298,54 @@ const slateInput = document.getElementById('slateUpload');
 const slateCanvas = document.getElementById('slateCanvas');
 const slateCtx = slateCanvas.getContext('2d', { willReadFrequently: true });
 let customImageBase64 = null;
+let slateDraftTimer = null;
+let slateEditorDirty = false;
+
+async function saveSlateDraft() {
+  if (!slateEditorDirty) return true;
+  const values = {
+    slate_text: document.getElementById('slateText').value,
+    slate_color: document.getElementById('slateColor').value,
+    image_base64: customImageBase64 || ''
+  };
+  try {
+    await apiFetch('/api/panel-preferences', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(values)
+    });
+    // A newer edit made while this save was running must remain dirty.
+    if (values.slate_text === document.getElementById('slateText').value
+        && values.slate_color === document.getElementById('slateColor').value
+        && values.image_base64 === (customImageBase64 || '')) slateEditorDirty = false;
+    if (!pendingSaves && !saveError) showSaveStatus(slateEditorDirty ? 'Unsaved editor changes…' : 'Saved on Pi', false);
+    return true;
+  } catch(e) { return false; /* Keep the draft dirty so Save now can retry. */ }
+}
+
+function scheduleSlateSave() {
+  slateEditorDirty = true;
+  showSaveStatus('Unsaved editor changes…', false);
+  clearTimeout(slateDraftTimer);
+  slateDraftTimer = setTimeout(saveSlateDraft, 500);
+}
+
+async function loadSlateDraft() {
+  try {
+    const res = await apiFetch('/api/slate-draft');
+    const data = await res.json();
+    if (slateEditorDirty) return;
+    customImageBase64 = data.image_base64 || null;
+    slateCtx.clearRect(0, 0, 64, 64);
+    if (customImageBase64) {
+      const img = new Image();
+      img.onload = () => { if (!slateEditorDirty) slateCtx.drawImage(img, 0, 0, 64, 64); };
+      img.src = customImageBase64;
+    }
+  } catch(e) { showSaveStatus('Could not load saved slate. Refresh to retry.', true); }
+}
+
+document.getElementById('slateText').addEventListener('input', scheduleSlateSave);
+document.getElementById('slateColor').addEventListener('input', scheduleSlateSave);
+
 
 slateInput.addEventListener('change', function(e) {
   const file = e.target.files[0];
@@ -4168,6 +4360,8 @@ slateInput.addEventListener('change', function(e) {
       let h = img.height;
       if (w > h) { h = Math.round(64 * (h/w)); w = 64; } else { w = Math.round(64 * (w/h)); h = 64; }
       slateCtx.drawImage(img, (64-w)/2, (64-h)/2, w, h);
+      if (file.type !== 'image/gif') customImageBase64 = slateCanvas.toDataURL('image/png');
+      scheduleSlateSave();
     };
     img.src = customImageBase64;
   };
@@ -4184,17 +4378,20 @@ function addSlateText() {
   slateCtx.textBaseline = "middle";
   slateCtx.fillText(text, 32, 32);
   customImageBase64 = slateCanvas.toDataURL("image/png");
+  scheduleSlateSave();
 }
 
 function clearSlate() {
   slateCtx.clearRect(0, 0, 64, 64);
   customImageBase64 = null;
+  slateInput.value = '';
+  scheduleSlateSave();
 }
 
 async function sendCustomSlate() {
   if (!customImageBase64) return;
   try {
-    const res = await fetch('/api/custom-media', {
+    const res = await apiFetch('/api/custom-media', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ image_base64: customImageBase64 })
@@ -4205,14 +4402,18 @@ async function sendCustomSlate() {
 
 // Live Lyrics
 function toggleLiveLyrics() {
-  lyricsOpen = !lyricsOpen;
-  const c = document.getElementById('liveLyricsCard');
-  c.style.display = lyricsOpen ? 'block' : 'none';
+  setLiveLyricsOpen(!lyricsOpen);
+  savePanelPreferences({lyrics_open: lyricsOpen});
+}
+
+function setLiveLyricsOpen(open) {
+  if (open === lyricsOpen) return;
+  lyricsOpen = open;
+  document.getElementById('liveLyricsCard').style.display = lyricsOpen ? 'block' : 'none';
+  clearInterval(lyricsInterval);
   if (lyricsOpen) {
     fetchLyricsData();
     lyricsInterval = setInterval(updateLiveLyricsScroll, 500);
-  } else {
-    clearInterval(lyricsInterval);
   }
 }
 
@@ -4280,6 +4481,7 @@ function updateLiveLyricsScroll() {
 
 // Fetch loop
 window.lastStateFetchTime = Date.now();
+loadSlateDraft();
 fetchState();
 setInterval(() => {
   window.lastStateFetchTime = Date.now();
@@ -4456,6 +4658,10 @@ def start_control_server(
                 self._send_html(LOGS_PAGE_HTML)
             elif parsed.path == "/api/state":
                 self._send_state()
+            elif parsed.path == "/api/slate-draft":
+                with outer_lock:
+                    data = {"image_base64": outer_state.slate_draft_media}
+                self._send_json(data)
             elif parsed.path == "/api/logs":
                 self._send_json(_log_buffer.get_all())
             elif parsed.path == "/api/frame.png":
@@ -4481,7 +4687,6 @@ def start_control_server(
                     with outer_lock:
                         outer_state.display_mode = mode
                         outer_state.sleeping = False
-                    mark_settings_dirty()
                     log(f"Mode changed to '{mode}' via URL")
                     self._send_json({"ok": True, "mode": mode})
                 else:
@@ -4611,6 +4816,24 @@ def start_control_server(
                     outer_state.sleeping = val
                 self._send_json({"ok": True, "sleeping": val})
 
+            elif parsed.path == "/api/save-settings":
+                self._send_json({"ok": True})
+
+            elif parsed.path == "/api/panel-preferences":
+                try:
+                    preferences = validate_panel_preferences(body)
+                    media = None
+                    if "image_base64" in body:
+                        media = prepare_slate_media(body["image_base64"])[0] if body["image_base64"] else ""
+                except (ValueError, OSError, OverflowError, Image.DecompressionBombError) as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                    return
+                with outer_lock:
+                    outer_state.panel_preferences.update(preferences)
+                    if media is not None:
+                        outer_state.slate_draft_media = media
+                self._send_json({"ok": True})
+
             elif parsed.path == "/api/scroll-font-size":
                 val = self._num(body, outer_state._default_scroll_font_size, 6, 14)
                 if val is None:
@@ -4649,6 +4872,12 @@ def start_control_server(
                     outer_state.progress_ring = True
                     outer_state.art_pan = False
                     outer_state.sleeping = False
+                    defaults = SharedPlaybackState()
+                    outer_state.panel_preferences = defaults.panel_preferences
+                    outer_state.custom_slate_media = ""
+                    outer_state.slate_draft_media = ""
+                    outer_state.custom_slate_frames = []
+                    outer_state.custom_slate_frame_delay = 0.1
                 try:
                     outer_display.set_brightness(outer_state._default_brightness)
                 except Exception:
@@ -4732,52 +4961,21 @@ def start_control_server(
 
             elif parsed.path == "/api/custom-media":
                 try:
-                    img_data = body.get("image_base64", "")
-                    if img_data.startswith("data:image"):
-                        img_data = img_data.split(",")[1]
-                    decoded = base64.b64decode(img_data)
-                    img = Image.open(BytesIO(decoded))
-                    frames = []
-                    delay = 0.1
-                    if getattr(img, "is_animated", False):
-                        # Cap frame count: an unbounded GIF means N LANCZOS
-                        # resizes plus N retained frames, all on the Pi's RAM.
-                        total = img.n_frames
-                        kept = min(total, MAX_SLATE_FRAMES)
-                        if kept < total:
-                            log(
-                                f"Custom slate: GIF has {total} frames, "
-                                f"keeping the first {kept}.",
-                                "warn",
-                            )
-                        for frame_idx in range(kept):
-                            img.seek(frame_idx)
-                            frame_rgb = Image.new("RGB", img.size)
-                            frame_rgb.paste(img)
-                            frames.append(frame_rgb.resize((64, 64), Image.Resampling.LANCZOS))
-                        delay = img.info.get("duration", 100) / 1000.0
-                        if delay <= 0.01:
-                            delay = 0.1
-                    else:
-                        frames.append(img.convert("RGB").resize((64, 64), Image.Resampling.LANCZOS))
+                    media, frames, delay = prepare_slate_media(body.get("image_base64", ""))
                     with outer_lock:
+                        outer_state.custom_slate_media = media
                         outer_state.custom_slate_frames = frames
                         outer_state.custom_slate_frame_delay = delay
                         outer_state.display_mode = "custom"
+                        outer_state.sleeping = False
                     self._send_json({"ok": True})
-                except Exception as e:
-                    self._send_json({"error": str(e)}, 400)
+                except (ValueError, OSError, OverflowError, Image.DecompressionBombError) as exc:
+                    self._send_json({"error": str(exc)}, 400)
             else:
                 self.send_response(404)
                 self.end_headers()
                 self.wfile.write(b"Not Found")
                 return
-
-            # One place to record "a setting changed", rather than a call in
-            # every branch. Validation failures return early and never reach it,
-            # so a rejected request cannot dirty the saved settings.
-            if parsed.path in PERSISTING_ENDPOINTS:
-                mark_settings_dirty()
 
         def _read_body(self) -> dict:
             """Read and parse a JSON request body, refusing oversized payloads.
@@ -4848,6 +5046,17 @@ def start_control_server(
             self.wfile.write(payload)
 
         def _send_json(self, data: Any, status: int = 200) -> None:
+            path = urllib.parse.urlparse(self.path).path
+            if status == 200 and isinstance(data, dict) and data.get("ok") and (
+                path in PERSISTING_ENDPOINTS or path == "/mode"
+            ):
+                if getattr(outer_args, "no_settings", False):
+                    data = {**data, "saved": False}
+                elif save_settings(outer_args.settings, outer_state, outer_lock):
+                    data = {**data, "saved": True}
+                else:
+                    status = 503
+                    data = {"error": "Changes applied but could not be saved on the Pi. Retry Save now.", "saved": False}
             payload = json.dumps(data).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -4920,6 +5129,7 @@ def start_control_server(
                     "art_pan": outer_state.art_pan,
                     "line_width": outer_state.line_width,
                     "sleeping": outer_state.sleeping,
+                    "panel_preferences": dict(outer_state.panel_preferences),
                     "status_message": outer_state.status_message,
                     "status_detail": outer_state.status_detail,
                     "queue_next": outer_state.queue_next,
@@ -5244,6 +5454,35 @@ def _explicit_cli_overrides(args: argparse.Namespace) -> list[tuple[str, Any]]:
     return out
 
 
+def create_playback_state(args: argparse.Namespace) -> SharedPlaybackState:
+    """Restore panel choices, with CLI precedence for interactive runs only."""
+    playback_state = SharedPlaybackState(
+        display_mode="default",
+        spin_speed=args.rpm,
+        text_scroll_speed=args.text_speed,
+        brightness=args.brightness,
+        lyrics_style=args.lyrics_style,
+        line_width=getattr(args, "line_width", 1),
+        _default_brightness=args.brightness,
+        _default_spin_speed=args.rpm,
+        _default_text_scroll_speed=args.text_speed,
+        _default_lyrics_style=args.lyrics_style,
+        _default_line_width=getattr(args, "line_width", 1),
+    )
+    # Service flags are boot defaults; saved web choices take priority there.
+    # Interactive CLI runs can still explicitly override a saved setting.
+    playback_state.idle_mode = args.idle_mode
+    playback_state.cd_duration = args.cd_duration
+    if not args.no_settings:
+        if apply_saved_settings(args.settings, playback_state):
+            log(f"Settings: restored from {args.settings}")
+        if not args.prefer_saved_settings:
+            for dest, value in _explicit_cli_overrides(args):
+                setattr(playback_state, dest, value)
+
+    return playback_state
+
+
 def run(args: argparse.Namespace) -> None:
     _install_signal_handlers()
 
@@ -5324,39 +5563,10 @@ def run(args: argparse.Namespace) -> None:
             display.clear()
         return
 
-    playback_state = SharedPlaybackState(
-        display_mode="default",
-        spin_speed=args.rpm,
-        text_scroll_speed=args.text_speed,
-        brightness=args.brightness,
-        lyrics_style=args.lyrics_style,
-        line_width=getattr(args, "line_width", 1),
-        _default_brightness=args.brightness,
-        _default_spin_speed=args.rpm,
-        _default_text_scroll_speed=args.text_speed,
-        _default_lyrics_style=args.lyrics_style,
-        _default_line_width=getattr(args, "line_width", 1),
-    )
-    # Saved settings load over the CLI defaults, but anything passed explicitly
-    # on the command line wins — otherwise a stale settings file would silently
-    # override a flag you just typed.
-    playback_state.idle_mode = args.idle_mode
-    playback_state.cd_duration = args.cd_duration
-    if not args.no_settings:
-        if apply_saved_settings(args.settings, playback_state):
-            log(f"Settings: restored from {args.settings}")
-        for dest, value in _explicit_cli_overrides(args):
-            setattr(playback_state, dest, value)
+    playback_state = create_playback_state(args)
 
     playback_lock = threading.Lock()
     stop_event = threading.Event()
-
-    if not args.no_settings:
-        threading.Thread(
-            target=settings_saver,
-            args=(args.settings, playback_state, playback_lock, stop_event),
-            daemon=True,
-        ).start()
 
     control_server = start_control_server(
         args.web_port, playback_state, playback_lock, display, args, spotify,
@@ -5836,6 +6046,8 @@ def run(args: argparse.Namespace) -> None:
                 control_server.server_close()
             except Exception:
                 pass
+        if not args.no_settings:
+            save_settings(args.settings, playback_state, playback_lock)
         try:
             poll_thread.join(timeout=1)
         except Exception:
@@ -5964,6 +6176,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--settings", type=Path, default=Path(".cache/settings.json"),
                         help="Where panel settings are persisted so brightness, "
                              "colour and mode survive a restart.")
+    parser.add_argument("--prefer-saved-settings", action="store_true",
+                        help="Use saved panel choices over CLI defaults (for the startup service).")
     parser.add_argument("--no-settings", action="store_true",
                         help="Do not load or save settings — start from CLI "
                              "defaults every time.")
